@@ -1,0 +1,59 @@
+Metadata-Version: 2.4
+Name: tradecraft-ui
+Version: 0.1.0
+Summary: Responsive trading UI with Telegram bridge
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.116.0
+Requires-Dist: uvicorn[standard]>=0.30.0
+Requires-Dist: pydantic>=2.8.0
+Requires-Dist: pydantic-settings>=2.4.0
+Requires-Dist: httpx>=0.27.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.2.0; extra == "dev"
+Requires-Dist: ruff>=0.5.0; extra == "dev"
+
+# TradeCraft UI (Restart)
+
+트레이딩 봇 재시작용 첫 단계 프로젝트입니다.
+
+- 웹 UI 우선: 반응형(PC/모바일)
+- Telegram API 브릿지: Bot Token + Chat ID 저장, 테스트 메시지 발송
+- 백엔드: FastAPI
+
+## Run
+
+```bash
+cd /Users/juhwan/hermes_v2
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+uvicorn tradecraft.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+브라우저에서 [http://127.0.0.1:8000](http://127.0.0.1:8000) 접속.
+
+## Environment
+
+`.env.example` 참고:
+
+- `TRADECRAFT_TELEGRAM_BOT_TOKEN`
+- `TRADECRAFT_TELEGRAM_CHAT_ID`
+- `TRADECRAFT_HOST`
+- `TRADECRAFT_PORT`
+- `TRADECRAFT_ALLOW_ORIGINS`
+
+## API (current)
+
+- `GET /api/health`
+- `GET /api/dashboard`
+- `GET /api/telegram/status`
+- `POST /api/telegram/config`
+- `POST /api/telegram/send-test`
+- `POST /api/telegram/webhook`
+
+## Test
+
+```bash
+pytest
+```
