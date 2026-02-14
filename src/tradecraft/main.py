@@ -6,12 +6,17 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from tradecraft.backtest.data_registry import BacktestDataRegistry
+from tradecraft.backtest.engine import BacktestConfig
+from tradecraft.backtest.live_manager import BacktestLiveManager
+from tradecraft.backtest.scenarios import apply_scenario, list_scenarios
 from tradecraft.config import AppSettings
+from tradecraft.runtime.session_loader import load_runtime_sessions
 from tradecraft.services.binance import BinanceAdapter, BinanceConfig
 from tradecraft.services.bithumb import BithumbAdapter, BithumbConfig
 from tradecraft.services.kis import KISAdapter, KISConfig
@@ -76,6 +81,12 @@ runtime_reader = RuntimeSnapshotReader(
     path=settings.runtime_state_path,
     max_age_sec=settings.runtime_max_age_sec,
 )
+backtest_manager = BacktestLiveManager(
+    state_path=settings.backtest_live_state_path,
+    result_path=settings.backtest_result_path,
+    max_curve_points=settings.backtest_live_max_curve_points,
+)
+backtest_registry = BacktestDataRegistry(".runtime/backtest_data_registry.json")
 logger = logging.getLogger(__name__)
 telegram_poller_task: asyncio.Task[None] | None = None
 telegram_update_offset: int | None = None
@@ -256,6 +267,54 @@ async def _build_dashboard_payload(include_telegram: bool = True) -> dict[str, A
     return data
 
 
+def _as_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed
+
+
+def _normalize_backtest_session_filter(value: Any) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    out = {str(item).strip().lower() for item in value if str(item).strip()}
+    return out
+
+
+def _build_backtest_config(payload: dict[str, Any]) -> BacktestConfig:
+    config = BacktestConfig(
+        cycles=max(_as_int(payload.get("cycles"), settings.backtest_cycles), 1),
+        step_sec=max(_as_int(payload.get("step_sec"), settings.backtest_step_sec), 1),
+        speed=max(_as_float(payload.get("speed"), settings.backtest_speed), 0.01),
+        initial_price=max(
+            _as_float(payload.get("initial_price"), settings.backtest_initial_price),
+            1.0,
+        ),
+        volatility_bps=max(
+            _as_float(payload.get("volatility_bps"), settings.backtest_volatility_bps),
+            0.0,
+        ),
+        drift_bps=_as_float(payload.get("drift_bps"), settings.backtest_drift_bps),
+        fee_rate=max(_as_float(payload.get("fee_rate"), settings.backtest_fee_rate), 0.0),
+        slippage_bps=max(
+            _as_float(payload.get("slippage_bps"), settings.backtest_slippage_bps),
+            0.0,
+        ),
+        seed=_as_int(payload.get("seed"), settings.backtest_seed),
+    )
+    scenario = str(payload.get("scenario") or "baseline").strip().lower()
+    return apply_scenario(config, scenario)
+
+
 async def _process_telegram_text(text: str, chat_id: str) -> dict[str, Any]:
     if text:
         telegram.last_webhook_message = text
@@ -390,6 +449,61 @@ async def telegram_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     chat_id = str((message.get("chat") or {}).get("id") or "").strip()
     result = await _process_telegram_text(text, chat_id)
     return {"ok": True, **result}
+
+
+@app.get("/api/backtest/scenarios")
+async def backtest_scenarios() -> dict[str, Any]:
+    return {"ok": True, "scenarios": list_scenarios()}
+
+
+@app.get("/api/backtest/data-status")
+async def backtest_data_status() -> dict[str, Any]:
+    return {"ok": True, **backtest_registry.status()}
+
+
+@app.get("/api/backtest/status")
+async def backtest_status() -> dict[str, Any]:
+    return backtest_manager.status()
+
+
+@app.post("/api/backtest/start")
+async def backtest_start(payload: dict[str, Any]) -> dict[str, Any]:
+    session_rows, session_source = load_runtime_sessions(settings.runtime_sessions_path)
+    selected_session_ids = _normalize_backtest_session_filter(payload.get("session_ids"))
+    if selected_session_ids:
+        session_rows = [
+            row
+            for row in session_rows
+            if str(row.get("session_id") or "").strip().lower() in selected_session_ids
+        ]
+    if not session_rows:
+        raise HTTPException(status_code=400, detail="selected sessions are empty")
+
+    scenario = str(payload.get("scenario") or "baseline").strip().lower() or "baseline"
+    config = _build_backtest_config(payload)
+    emit_interval = max(
+        _as_int(payload.get("emit_interval"), settings.backtest_live_emit_interval),
+        1,
+    )
+    backtest_registry.observe_sessions(session_rows, source=session_source)
+
+    try:
+        result = backtest_manager.start(
+            session_rows=session_rows,
+            config=config,
+            scenario=scenario,
+            session_source=session_source,
+            emit_interval=emit_interval,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {"ok": True, **result}
+
+
+@app.post("/api/backtest/stop")
+async def backtest_stop() -> dict[str, Any]:
+    return backtest_manager.stop()
 
 
 def run() -> None:

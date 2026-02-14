@@ -4,10 +4,24 @@ const state = {
   dashboard: null,
   activeVenueId: "all",
   theme: "light",
+  view: "dashboard",
+  backtest: {
+    status: null,
+    scenarios: [],
+    selectedSessionIds: [],
+    dataStatus: null,
+    pollTimer: null,
+  },
 };
 
 function qs(id) {
   return document.getElementById(id);
+}
+
+function bindEvent(id, eventName, handler) {
+  const node = qs(id);
+  if (!node) return;
+  node.addEventListener(eventName, handler);
 }
 
 function escapeHTML(value) {
@@ -35,6 +49,11 @@ function fmtNum(value, maxFractionDigits = 4) {
 function fmtMaybeKRW(value) {
   if (value === null || value === undefined) return "-";
   return fmtKRW(value);
+}
+
+function asNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function fmtKST(isoString, withDate = false) {
@@ -78,6 +97,23 @@ function applyTheme(theme) {
 
 function toggleTheme() {
   applyTheme(state.theme === "dark" ? "light" : "dark");
+}
+
+function setActiveView(view) {
+  state.view = view === "backtest" ? "backtest" : "dashboard";
+  const dashboardPane = qs("dashboardPane");
+  const backtestPane = qs("backtestPane");
+  const dashboardBtn = qs("viewDashboardBtn");
+  const backtestBtn = qs("viewBacktestBtn");
+
+  if (dashboardPane && backtestPane) {
+    dashboardPane.classList.toggle("hidden", state.view !== "dashboard");
+    backtestPane.classList.toggle("hidden", state.view !== "backtest");
+  }
+  if (dashboardBtn && backtestBtn) {
+    dashboardBtn.classList.toggle("active", state.view === "dashboard");
+    backtestBtn.classList.toggle("active", state.view === "backtest");
+  }
 }
 
 function setHealth(text, ok = true) {
@@ -125,6 +161,46 @@ function getActiveSessions() {
     return sessions;
   }
   return sessions.filter((item) => item.venue_id === state.activeVenueId);
+}
+
+function renderBacktestSessionOptions() {
+  const list = qs("btSessionList");
+  if (!list) return;
+  const sessions = state.dashboard?.sessions || [];
+  const uniqueRows = [];
+  const seen = new Set();
+  for (const row of sessions) {
+    const id = String(row.session_id || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    uniqueRows.push(row);
+  }
+
+  if (!state.backtest.selectedSessionIds.length) {
+    state.backtest.selectedSessionIds = uniqueRows.map((row) => String(row.session_id));
+  } else {
+    const valid = new Set(uniqueRows.map((row) => String(row.session_id)));
+    state.backtest.selectedSessionIds = state.backtest.selectedSessionIds.filter((id) => valid.has(id));
+    if (!state.backtest.selectedSessionIds.length) {
+      state.backtest.selectedSessionIds = uniqueRows.map((row) => String(row.session_id));
+    }
+  }
+
+  const selected = new Set(state.backtest.selectedSessionIds);
+  list.innerHTML = uniqueRows
+    .map((row) => {
+      const id = String(row.session_id || "-");
+      const checked = selected.has(id) ? "checked" : "";
+      const label = `${row.venue_label || row.venue_id || "-"} · ${row.name || row.mode || "-"}`;
+      return `
+        <label class="bt-session-item">
+          <input class="bt-session-check" type="checkbox" value="${escapeHTML(id)}" ${checked} />
+          <span>${escapeHTML(id)}</span>
+          <span class="session-mode">${escapeHTML(label)}</span>
+        </label>
+      `;
+    })
+    .join("");
 }
 
 function renderTopMetrics() {
@@ -552,6 +628,7 @@ function renderDashboard() {
   renderVenueTabs();
   renderActiveVenue();
   renderSessions(getActiveSessions(), state.dashboard?.clock_utc);
+  renderBacktestSessionOptions();
 
   const telegramFeed = state.dashboard?.telegram?.last_webhook_message
     ? [{ type: "telegram", message: `Webhook: ${state.dashboard.telegram.last_webhook_message}` }]
@@ -585,20 +662,223 @@ async function checkHealth() {
   }
 }
 
+function selectedBacktestSessionIds() {
+  const checks = [...document.querySelectorAll(".bt-session-check:checked")];
+  return checks.map((item) => String(item.value || "").trim()).filter(Boolean);
+}
+
+function renderBacktestCurve(curve) {
+  const line = qs("btCurveLine");
+  if (!line) return;
+  const rows = Array.isArray(curve) ? curve : [];
+  if (rows.length < 2) {
+    line.setAttribute("points", "");
+    return;
+  }
+
+  const width = 1000;
+  const height = 260;
+  const values = rows.map((row) => asNumber(row.net_pnl_krw, 0));
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (min === max) {
+    min -= 1;
+    max += 1;
+  }
+  const span = max - min;
+  const points = rows
+    .map((row, idx) => {
+      const x = (idx / (rows.length - 1)) * width;
+      const y = height - ((asNumber(row.net_pnl_krw, 0) - min) / span) * (height - 12) - 6;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(" ");
+  line.setAttribute("points", points);
+
+  const last = asNumber(values[values.length - 1], 0);
+  line.style.stroke = last >= 0 ? "var(--gain)" : "var(--loss)";
+}
+
+function renderBacktestStatus(payload) {
+  state.backtest.status = payload || {};
+  const job = state.backtest.status.job || {};
+  const progress = state.backtest.status.progress || {};
+  const aggregate = progress.aggregate || {};
+  const curve = progress.equity_curve || [];
+
+  const statusEl = qs("btStatusText");
+  if (statusEl) {
+    statusEl.textContent = job.status || "idle";
+  }
+  const total = asNumber(progress.total_cycles, 0);
+  const done = asNumber(progress.cycle, 0);
+  const pct = asNumber(progress.progress_pct, 0);
+  const progressText = qs("btProgressText");
+  if (progressText) {
+    progressText.textContent = `${done} / ${total} (${fmtNum(pct, 2)}%)`;
+  }
+  const bar = qs("btProgressBar");
+  if (bar) {
+    bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  }
+
+  const net = asNumber(aggregate.net_pnl_krw, 0);
+  const realized = asNumber(aggregate.realized_pnl_krw, 0);
+  const unrealized = asNumber(aggregate.unrealized_pnl_krw, 0);
+  const fees = asNumber(aggregate.fees_krw, 0);
+
+  qs("btNetPnl").textContent = `${fmtKRW(net)} KRW`;
+  qs("btRealized").textContent = `${fmtKRW(realized)} KRW`;
+  qs("btUnrealized").textContent = `${fmtKRW(unrealized)} KRW`;
+  qs("btFees").textContent = `${fmtKRW(fees)} KRW`;
+  qs("btNetPnl").className = net >= 0 ? "gain" : "loss";
+
+  renderBacktestCurve(curve);
+
+  const rows = progress.sessions || [];
+  qs("btSessionBody").innerHTML = rows
+    .map((row) => {
+      const netPnl = asNumber(row.net_pnl_krw, 0);
+      return `
+      <tr>
+        <td>${escapeHTML(row.session_id || "-")}</td>
+        <td>${escapeHTML(row.symbol || "-")}</td>
+        <td>${escapeHTML(row.signals ?? 0)}</td>
+        <td>${escapeHTML(row.fills ?? 0)}</td>
+        <td>${escapeHTML(row.trades ?? 0)}</td>
+        <td class="${netPnl >= 0 ? "gain" : "loss"}">${escapeHTML(fmtKRW(netPnl))}</td>
+      </tr>
+    `;
+    })
+    .join("");
+
+  const scenario = job.scenario || "-";
+  const source = job.session_source || "-";
+  const updated = progress.updated_at ? fmtKST(progress.updated_at, true) : "--";
+  qs("btMeta").textContent = `scenario=${scenario} | session_source=${source} | updated=${updated}`;
+}
+
+async function refreshBacktestStatus() {
+  const payload = await getJSON("/backtest/status");
+  renderBacktestStatus(payload);
+
+  const status = String(payload?.job?.status || "");
+  if (status === "running") {
+    if (!state.backtest.pollTimer) {
+      state.backtest.pollTimer = setInterval(async () => {
+        try {
+          const next = await getJSON("/backtest/status");
+          renderBacktestStatus(next);
+          if (String(next?.job?.status || "") !== "running" && state.backtest.pollTimer) {
+            clearInterval(state.backtest.pollTimer);
+            state.backtest.pollTimer = null;
+          }
+        } catch (_) {}
+      }, 1500);
+    }
+  } else if (state.backtest.pollTimer) {
+    clearInterval(state.backtest.pollTimer);
+    state.backtest.pollTimer = null;
+  }
+}
+
+function renderBacktestScenarios(rows) {
+  const select = qs("btScenario");
+  if (!select) return;
+  const items = Array.isArray(rows) ? rows : [];
+  state.backtest.scenarios = items;
+  select.innerHTML = items
+    .map((row) => {
+      const key = String(row.key || "");
+      const label = String(row.label || key || "-");
+      const desc = String(row.description || "");
+      return `<option value="${escapeHTML(key)}">${escapeHTML(`${label} - ${desc}`)}</option>`;
+    })
+    .join("");
+  if (!items.length) {
+    select.innerHTML = `<option value="baseline">baseline</option>`;
+  }
+}
+
+async function loadBacktestScenarios() {
+  const payload = await getJSON("/backtest/scenarios");
+  renderBacktestScenarios(payload.scenarios || []);
+}
+
+async function loadBacktestDataStatus() {
+  const payload = await getJSON("/backtest/data-status");
+  state.backtest.dataStatus = payload;
+  const statusText = `data cache: ${payload.symbol_count || 0} symbols`;
+  qs("btDataStatus").textContent = statusText;
+}
+
+async function startBacktestFromUI() {
+  const payload = {
+    scenario: qs("btScenario").value || "baseline",
+    cycles: asNumber(qs("btCycles").value, 720),
+    step_sec: asNumber(qs("btStepSec").value, 60),
+    speed: asNumber(qs("btSpeed").value, 120),
+    fee_rate: asNumber(qs("btFeeRate").value, 0.0005),
+    slippage_bps: asNumber(qs("btSlippage").value, 1),
+    session_ids: selectedBacktestSessionIds(),
+  };
+  if (!payload.session_ids.length) {
+    throw new Error("세션을 1개 이상 선택하세요.");
+  }
+  await getJSON("/backtest/start", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  await refreshBacktestStatus();
+  await loadBacktestDataStatus();
+}
+
+async function stopBacktestFromUI() {
+  await getJSON("/backtest/stop", { method: "POST" });
+  await refreshBacktestStatus();
+}
+
 async function init() {
   applyTheme(getInitialTheme());
-  qs("themeToggle").addEventListener("click", toggleTheme);
-  qs("refreshBtn").addEventListener("click", refreshDashboard);
-  qs("venueTabs").addEventListener("click", (event) => {
+  bindEvent("themeToggle", "click", toggleTheme);
+  bindEvent("refreshBtn", "click", refreshDashboard);
+  bindEvent("viewDashboardBtn", "click", () => setActiveView("dashboard"));
+  bindEvent("viewBacktestBtn", "click", () => setActiveView("backtest"));
+  bindEvent("venueTabs", "click", (event) => {
     const button = event.target.closest("[data-venue]");
     if (!button || !state.dashboard) return;
     state.activeVenueId = button.dataset.venue;
     renderDashboard();
   });
+  bindEvent("btSessionList", "change", () => {
+    state.backtest.selectedSessionIds = selectedBacktestSessionIds();
+  });
+  bindEvent("btRefreshBtn", "click", async () => {
+    await refreshBacktestStatus();
+    await loadBacktestDataStatus();
+  });
+  bindEvent("btStartBtn", "click", async () => {
+    try {
+      await startBacktestFromUI();
+    } catch (error) {
+      alert(error.message || "backtest start failed");
+    }
+  });
+  bindEvent("btStopBtn", "click", async () => {
+    try {
+      await stopBacktestFromUI();
+    } catch (error) {
+      alert(error.message || "backtest stop failed");
+    }
+  });
+  setActiveView("dashboard");
 
   await checkHealth();
   await loadTelegramStatus();
   await refreshDashboard();
+  await loadBacktestScenarios();
+  await refreshBacktestStatus();
+  await loadBacktestDataStatus();
 }
 
 init();

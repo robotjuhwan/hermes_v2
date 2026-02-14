@@ -1,2 +1,5 @@
 [console_scripts]
+tradecraft-backtest = tradecraft.backtest.runner:run
+tradecraft-control = tradecraft.main:run
+tradecraft-runtime = tradecraft.runtime.runner:run
 tradecraft-ui = tradecraft.main:run

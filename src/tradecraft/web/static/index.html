@@ -25,6 +25,12 @@
       </div>
     </header>
 
+    <section class="view-switch card">
+      <button id="viewDashboardBtn" class="view-tab active" type="button" data-view="dashboard">운영 대시보드</button>
+      <button id="viewBacktestBtn" class="view-tab" type="button" data-view="backtest">백테스트 랩</button>
+    </section>
+
+    <div id="dashboardPane">
     <section class="metrics">
       <article class="metric card">
         <p>전체 자산 합계</p>
@@ -140,8 +146,88 @@
         </div>
       </div>
     </section>
+    </div>
+
+    <section id="backtestPane" class="backtest-shell card hidden">
+      <div class="panel-head">
+        <h3>백테스트 시나리오 랩</h3>
+        <div class="panel-actions">
+          <span id="btStatusText" class="pill">idle</span>
+          <button id="btRefreshBtn" class="btn ghost" type="button">상태 갱신</button>
+          <button id="btStopBtn" class="btn ghost" type="button">중지</button>
+          <button id="btStartBtn" class="btn warm" type="button">START</button>
+        </div>
+      </div>
+
+      <div class="bt-form-grid">
+        <label>시나리오
+          <select id="btScenario"></select>
+        </label>
+        <label>Cycles
+          <input id="btCycles" type="number" min="1" value="720" />
+        </label>
+        <label>Step(sec)
+          <input id="btStepSec" type="number" min="1" value="60" />
+        </label>
+        <label>Speed(x)
+          <input id="btSpeed" type="number" min="0.01" step="0.01" value="120" />
+        </label>
+        <label>Fee Rate
+          <input id="btFeeRate" type="number" min="0" step="0.0001" value="0.0005" />
+        </label>
+        <label>Slippage(bps)
+          <input id="btSlippage" type="number" min="0" step="0.1" value="1" />
+        </label>
+      </div>
+
+      <div class="bt-session-box">
+        <h4>세션 선택 (체크한 세션만 실행)</h4>
+        <div id="btSessionList" class="bt-session-list"></div>
+      </div>
+
+      <div class="bt-progress-wrap">
+        <div id="btProgressText" class="mono">0 / 0 (0%)</div>
+        <div class="bt-progress-track">
+          <div id="btProgressBar" class="bt-progress-bar"></div>
+        </div>
+      </div>
+
+      <div class="bt-kpi-grid">
+        <article class="mini-card"><p>순손익</p><h4 id="btNetPnl">0 KRW</h4></article>
+        <article class="mini-card"><p>실현 손익</p><h4 id="btRealized">0 KRW</h4></article>
+        <article class="mini-card"><p>미실현 손익</p><h4 id="btUnrealized">0 KRW</h4></article>
+        <article class="mini-card"><p>수수료</p><h4 id="btFees">0 KRW</h4></article>
+      </div>
+
+      <div class="bt-chart-shell">
+        <svg id="btCurve" viewBox="0 0 1000 260" preserveAspectRatio="none" aria-label="backtest equity curve">
+          <polyline id="btCurveLine" fill="none" stroke-width="2" points=""></polyline>
+        </svg>
+      </div>
+
+      <div class="bt-meta">
+        <span id="btMeta" class="mono">-</span>
+        <span id="btDataStatus" class="mono">data cache: -</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>SESSION</th>
+              <th>SYMBOL</th>
+              <th>SIGNALS</th>
+              <th>FILLS</th>
+              <th>TRADES</th>
+              <th>NET PNL</th>
+            </tr>
+          </thead>
+          <tbody id="btSessionBody"></tbody>
+        </table>
+      </div>
+    </section>
   </main>
 
-  <script src="/static/app.js?v=20260214_10"></script>
+  <script src="/static/app.js?v=20260215_02"></script>
 </body>
 </html>

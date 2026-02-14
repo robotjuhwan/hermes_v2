@@ -41,8 +41,31 @@ class AppSettings(BaseSettings):
     kis_secondary_account_no: str = Field(default="", alias="KIS_SECONDARY_ACCOUNT_NO")
     kis_secondary_product_code: str = Field(default="", alias="KIS_SECONDARY_PRODUCT_CODE")
     runtime_state_path: str = Field(default=".runtime/state.json", alias="TRADECRAFT_RUNTIME_STATE_PATH")
+    runtime_sessions_path: str = Field(default="", alias="TRADECRAFT_RUNTIME_SESSIONS_PATH")
     runtime_max_age_sec: int = Field(default=90, alias="TRADECRAFT_RUNTIME_MAX_AGE_SEC")
     runtime_write_interval_sec: int = Field(default=5, alias="TRADECRAFT_RUNTIME_WRITE_INTERVAL_SEC")
+    backtest_result_path: str = Field(
+        default=".runtime/backtest_result.json",
+        alias="TRADECRAFT_BACKTEST_RESULT_PATH",
+    )
+    backtest_cycles: int = Field(default=720, alias="TRADECRAFT_BACKTEST_CYCLES")
+    backtest_step_sec: int = Field(default=60, alias="TRADECRAFT_BACKTEST_STEP_SEC")
+    backtest_speed: float = Field(default=120.0, alias="TRADECRAFT_BACKTEST_SPEED")
+    backtest_initial_price: float = Field(default=100_000_000.0, alias="TRADECRAFT_BACKTEST_INITIAL_PRICE")
+    backtest_volatility_bps: float = Field(default=18.0, alias="TRADECRAFT_BACKTEST_VOLATILITY_BPS")
+    backtest_drift_bps: float = Field(default=0.2, alias="TRADECRAFT_BACKTEST_DRIFT_BPS")
+    backtest_fee_rate: float = Field(default=0.0005, alias="TRADECRAFT_BACKTEST_FEE_RATE")
+    backtest_slippage_bps: float = Field(default=1.0, alias="TRADECRAFT_BACKTEST_SLIPPAGE_BPS")
+    backtest_seed: int = Field(default=7, alias="TRADECRAFT_BACKTEST_SEED")
+    backtest_live_state_path: str = Field(
+        default=".runtime/backtest_live.json",
+        alias="TRADECRAFT_BACKTEST_LIVE_STATE_PATH",
+    )
+    backtest_live_emit_interval: int = Field(default=2, alias="TRADECRAFT_BACKTEST_LIVE_EMIT_INTERVAL")
+    backtest_live_max_curve_points: int = Field(
+        default=4000,
+        alias="TRADECRAFT_BACKTEST_LIVE_MAX_CURVE_POINTS",
+    )
     host: str = Field(default="0.0.0.0", alias="TRADECRAFT_HOST")
     port: int = Field(default=8000, alias="TRADECRAFT_PORT")
     allow_origins: str = Field(default="*", alias="TRADECRAFT_ALLOW_ORIGINS")

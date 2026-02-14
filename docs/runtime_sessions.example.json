@@ -1,0 +1,27 @@
+{
+  "sessions": [
+    {
+      "session_id": "upbit_scalper",
+      "venue_id": "upbit",
+      "venue_label": "업비트",
+      "mode": "short_term",
+      "cycle_sec": 20,
+      "trade_symbol": "BTC/KRW",
+      "strategy_id": "noop_short_term",
+      "enabled": true
+    },
+    {
+      "session_id": "upbit_balance",
+      "venue_id": "upbit",
+      "venue_label": "업비트",
+      "mode": "mid_long_term",
+      "cycle_sec": 1800,
+      "strategy_id": "noop_balance",
+      "targets": [
+        {"symbol": "BTC", "target_weight_pct": 60},
+        {"symbol": "ETH", "target_weight_pct": 40}
+      ],
+      "enabled": true
+    }
+  ]
+}
