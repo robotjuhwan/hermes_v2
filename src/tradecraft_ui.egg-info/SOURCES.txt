@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+src/tradecraft/__init__.py
+src/tradecraft/config.py
+src/tradecraft/main.py
+src/tradecraft/services/__init__.py
+src/tradecraft/services/market.py
+src/tradecraft/services/telegram.py
+src/tradecraft_ui.egg-info/PKG-INFO
+src/tradecraft_ui.egg-info/SOURCES.txt
+src/tradecraft_ui.egg-info/dependency_links.txt
+src/tradecraft_ui.egg-info/entry_points.txt
+src/tradecraft_ui.egg-info/requires.txt
+src/tradecraft_ui.egg-info/top_level.txt
+tests/test_api_smoke.py

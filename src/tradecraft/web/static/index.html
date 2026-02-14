@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HERMES BOT</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="bg-mesh"></div>
+  <main class="app">
+    <header class="hero card">
+      <div>
+        <p class="eyebrow">HERMES</p>
+        <h1>HERMES BOT</h1>
+        <p class="sub">시세/주문보다 먼저, 거래소/시장별 잔고를 체계적으로 확인하는 반응형 운영 화면</p>
+      </div>
+      <div class="pillbox">
+        <span id="healthPill" class="pill">API checking...</span>
+        <span id="clockPill" class="pill mono">--</span>
+        <button id="themeToggle" class="btn ghost theme-btn" type="button">다크 모드</button>
+      </div>
+    </header>
+
+    <section class="metrics">
+      <article class="metric card">
+        <p>전체 자산 합계</p>
+        <h2 id="totalAssetValue">-</h2>
+      </article>
+      <article class="metric card">
+        <p>현금성 자산</p>
+        <h2 id="cashAssetValue">-</h2>
+      </article>
+      <article class="metric card">
+        <p>투자 중 자산</p>
+        <h2 id="investedAssetValue">-</h2>
+      </article>
+      <article class="metric card">
+        <p>평가 손익</p>
+        <h2 id="unrealizedPnlValue">-</h2>
+      </article>
+      <article class="metric card spouse">
+        <p>와이프 계좌 분리</p>
+        <h2 id="spouseAssetValue">-</h2>
+        <small id="spouseAssetDetail" class="metric-sub">-</small>
+      </article>
+      <article class="panel card">
+        <p>연동 시장 수</p>
+        <h2 id="venueCountValue">-</h2>
+      </article>
+    </section>
+
+    <section class="balance-shell card">
+      <div class="panel-head">
+        <h3>거래소/시장별 잔고 탭</h3>
+        <div class="panel-actions">
+          <span id="activeMarketBadge" class="pill">전체</span>
+          <button id="refreshBtn" class="btn ghost" type="button">Refresh</button>
+        </div>
+      </div>
+      <div id="venueTabs" class="tab-row"></div>
+
+      <div class="mini-metrics">
+        <article class="mini-card">
+          <p>선택 탭 자산</p>
+          <h4 id="activeTotalValue">-</h4>
+        </article>
+        <article class="mini-card">
+          <p>선택 탭 현금</p>
+          <h4 id="activeCashValue">-</h4>
+        </article>
+        <article class="mini-card">
+          <p>선택 탭 투자금</p>
+          <h4 id="activeInvestedValue">-</h4>
+        </article>
+        <article class="mini-card">
+          <p>선택 탭 평가손익</p>
+          <h4 id="activePnlValue">-</h4>
+        </article>
+      </div>
+
+      <div class="balance-grid">
+        <article class="panel card">
+          <div class="panel-head">
+            <h3>자산 상세 (현금 + 보유자산 통합)</h3>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>자산</th>
+                  <th>유형</th>
+                  <th>수량</th>
+                  <th>가용</th>
+                  <th>락</th>
+                  <th>평단</th>
+                  <th>현재가</th>
+                  <th>평가금액</th>
+                  <th>평가손익</th>
+                </tr>
+              </thead>
+              <tbody id="assetsBody"></tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="layout">
+      <article class="panel card">
+        <div class="panel-head">
+          <h3>봇 세션 상태 (요약)</h3>
+          <span id="sessionUpdatedAt" class="pill mono">--</span>
+        </div>
+        <div id="sessionCards" class="session-grid"></div>
+      </article>
+
+      <article class="panel card">
+        <div class="panel-head">
+          <h3>Live Event Feed</h3>
+        </div>
+        <ul id="eventList" class="event-list"></ul>
+      </article>
+    </section>
+
+    <section class="telegram-shell card">
+      <div class="panel-head">
+        <h3>Integration Status</h3>
+      </div>
+      <div class="integration-stack">
+        <div id="telegramStatus" class="notice">Telegram 상태 불러오는 중...</div>
+        <div class="notice">
+          보안 정책: Telegram 설정은 UI에서 변경하지 않습니다. <br />
+          <span class="mono">.env</span>의
+          <span class="mono">TRADECRAFT_TELEGRAM_BOT_TOKEN</span>,
+          <span class="mono">TRADECRAFT_TELEGRAM_CHAT_ID</span> 값을 수정 후 서버를 재시작하세요.
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=20260214_10"></script>
+</body>
+</html>
