@@ -35,6 +35,10 @@ def _fmt_pct(value: float | int | None, digits: int = 2) -> str:
     return f"{float(value or 0):.{digits}f}%"
 
 
+def _fmt_rate(value: float | int | None) -> str:
+    return f"{float(value or 0):,.2f}"
+
+
 def _fmt_kst(iso: str | None) -> str:
     if not iso:
         return "-"
@@ -168,17 +172,31 @@ class TelegramCLI:
         )
 
     def _status_text(self, dashboard: dict[str, Any]) -> str:
-        text = "\n".join(
-            [
-                "HERMES BOT 상태",
-                f"기준시각(KST): {_fmt_kst(str(dashboard.get('clock_utc') or ''))}",
-                f"전체 자산: {_fmt_krw(dashboard.get('portfolio_total_krw'))}",
-                f"현금 자산: {_fmt_krw(dashboard.get('cash_total_krw'))}",
-                f"투자 자산: {_fmt_krw(dashboard.get('invested_total_krw'))}",
-                f"평가 손익: {_fmt_signed_krw(dashboard.get('unrealized_pnl_krw'))}",
-                f"연동 시장 수: {int(dashboard.get('venue_count') or 0)}",
-            ]
-        )
+        lines = [
+            "HERMES BOT 상태",
+            f"기준시각(KST): {_fmt_kst(str(dashboard.get('clock_utc') or ''))}",
+            f"전체 자산: {_fmt_krw(dashboard.get('portfolio_total_krw'))}",
+            f"현금 자산: {_fmt_krw(dashboard.get('cash_total_krw'))}",
+            f"투자 자산: {_fmt_krw(dashboard.get('invested_total_krw'))}",
+            f"평가 손익: {_fmt_signed_krw(dashboard.get('unrealized_pnl_krw'))}",
+            f"연동 시장 수: {int(dashboard.get('venue_count') or 0)}",
+        ]
+
+        fx = dashboard.get("fx")
+        if isinstance(fx, dict):
+            usdt_source = str(fx.get("usdt_source") or "-")
+            usd_source = str(fx.get("usd_source") or "-")
+            fx_status_raw = str(fx.get("status") or "").lower()
+            fx_status = "주의" if fx_status_raw == "warn" else "정상"
+            lines.extend(
+                [
+                    f"USDT/KRW: {_fmt_rate(fx.get('usdt_krw'))} ({usdt_source})",
+                    f"USD/KRW: {_fmt_rate(fx.get('usd_krw'))} ({usd_source})",
+                    f"FX 상태: {fx_status} · 갱신 {_fmt_kst(str(fx.get('fetched_at') or ''))}",
+                ]
+            )
+
+        text = "\n".join(lines)
         return self._html_pre(text)
 
     def _venues_text(self, dashboard: dict[str, Any], args: list[str]) -> str:

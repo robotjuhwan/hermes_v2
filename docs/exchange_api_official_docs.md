@@ -1,10 +1,22 @@
-# Exchange API Official Docs (HERMES BOT)
+# Exchange API Official Docs (Tradecraft + Freqtrade)
 
 Last verified: 2026-02-14 (KST)
 
+## 0) Execution architecture (current)
+
+- 자동매매 실행 엔진: **Freqtrade** (Spot/Futures)
+- Tradecraft 역할: UI/Telegram/통합 대시보드 + Freqtrade REST 상태 연동
+- 거래소/브로커 공식 문서는 Tradecraft 계정 조회 및 운영 검증 기준으로 유지
+
 ## 1) Current integration targets (now)
 
-### 1.1 Crypto (active targets)
+### 1.0 Trading engine (active)
+
+| Component | Scope | Official docs | Auth | Note |
+|---|---|---|---|---|
+| Freqtrade REST API | Spot/Futures bot status + open positions | https://www.freqtrade.io/en/stable/rest-api/ | Username/Password (basic auth) | Tradecraft가 세션/포지션 모니터링에 사용 |
+
+### 1.1 Crypto venues (active targets)
 
 | Venue | Scope | Official docs | Auth | Test/Sandbox |
 |---|---|---|---|---|
@@ -40,12 +52,14 @@ Status: not in current implementation. Keep as references for later.
 Kiwoom was added earlier as an **optional fallback**, not as a mandatory target.
 
 Reason:
-- 한국 주식 자동매매에서 사용 사례가 많은 브로커 대안이라 비교군으로 넣어둠
+- 국내 주식 API 생태계에서 사용 사례가 많은 브로커 대안이라 비교군으로 넣어둠
 - 브로커 단일 의존 리스크(장애/정책 변경)를 줄이기 위한 백업 후보
 - 계좌/권한/서비스 정책에 따라 특정 기능 가능 여부가 달라질 수 있음
 
 Current project direction:
-- **Primary: KIS only** for KR/US stocks
+- **Crypto auto-trading execution: Freqtrade**
+- Tradecraft는 Freqtrade/거래소 상태를 통합해 모니터링/제어
+- **Primary stock provider: KIS only** for KR/US stocks
 - Kiwoom: later optional expansion (not in current build scope)
 
 ## 4) Next implementation order (pragmatic)

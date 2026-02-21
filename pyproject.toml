@@ -14,6 +14,7 @@ dependencies = [
   "pydantic>=2.8.0",
   "pydantic-settings>=2.4.0",
   "httpx>=0.27.0",
+  "pypdf>=5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +30,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
 
@@ -36,4 +38,6 @@ addopts = "-q"
 tradecraft-ui = "tradecraft.main:run"
 tradecraft-control = "tradecraft.main:run"
 tradecraft-runtime = "tradecraft.runtime.runner:run"
-tradecraft-backtest = "tradecraft.backtest.runner:run"
+tradecraft-research = "tradecraft.runtime.research_runner:run"
+tradecraft-kis-trader = "tradecraft.runtime.kis_trader_runner:run"
+tradecraft-naver-reports = "tradecraft.runtime.naver_reports_runner:run"

@@ -98,3 +98,26 @@ def test_binance_futures_assets_mapping(monkeypatch) -> None:
     assert pos["kind"] == "position"
     assert pos["value_krw"] == pytest.approx(1_300_000.0)
     assert pos["pnl_krw"] == pytest.approx(26000.0)
+
+
+def test_binance_uses_runtime_fx_override(monkeypatch) -> None:
+    adapter = BinanceAdapter(
+        BinanceConfig(
+            spot_api_key="k",
+            spot_api_secret="s",
+            usdt_krw_rate=1000.0,
+        )
+    )
+
+    async def fake_signed_get_spot(_: str, __: dict) -> dict:
+        return {"balances": [{"asset": "USDT", "free": "1", "locked": "0"}]}
+
+    async def fake_get_spot_prices() -> dict[str, float]:
+        return {}
+
+    monkeypatch.setattr(adapter, "_signed_get_spot", fake_signed_get_spot)
+    monkeypatch.setattr(adapter, "_get_spot_prices", fake_get_spot_prices)
+
+    assets = asyncio.run(adapter.fetch_spot_assets(usdt_krw_rate=1500.0))
+    usdt = next(a for a in assets if a["asset"] == "USDT")
+    assert usdt["mark_price"] == pytest.approx(1500.0)
