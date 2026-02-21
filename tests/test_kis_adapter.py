@@ -129,3 +129,37 @@ def test_kis_select_usd_cash_value_falls_back_to_krw_summary() -> None:
     usd, krw = adapter._select_usd_cash_value({"tot_dncl_amt": "260000"}, 1300.0)
     assert usd == pytest.approx(200.0)
     assert krw == pytest.approx(260_000.0)
+
+
+def test_kis_to_us_assets_uses_runtime_fx_override() -> None:
+    adapter = KISAdapter(
+        KISConfig(
+            app_key="app",
+            app_secret="secret",
+            account_no="12345678",
+            product_code="01",
+        )
+    )
+    rows = [
+        {
+            "pdno": "AAPL",
+            "ovrs_item_name": "Apple",
+            "cblc_qty13": "2",
+            "ord_psbl_qty1": "2",
+            "avg_unpr3": "100",
+            "ovrs_now_pric1": "110",
+            "frcr_evlu_amt2": "220",
+            "evlu_pfls_amt2": "20",
+            "bass_exrt": "1300",
+        },
+    ]
+    summary = {
+        "frcr_dncl_amt_2": "10",
+        "frst_bltn_exrt": "1300",
+    }
+
+    assets = adapter._to_us_assets(rows, summary, usd_krw_rate=1500.0)
+    usd = next(item for item in assets if item["asset"] == "USD")
+    aapl = next(item for item in assets if item["asset"] == "AAPL")
+    assert usd["mark_price"] == pytest.approx(1500.0)
+    assert aapl["mark_price"] == pytest.approx(165000.0)

@@ -49,7 +49,7 @@ class BinanceAdapter:
     def __init__(self, config: BinanceConfig) -> None:
         self.config = config
 
-    async def fetch_spot_assets(self) -> list[dict[str, Any]]:
+    async def fetch_spot_assets(self, usdt_krw_rate: float | None = None) -> list[dict[str, Any]]:
         if not self.config.spot_ready:
             raise BinanceAPIError("binance spot config missing")
 
@@ -60,9 +60,7 @@ class BinanceAdapter:
             raise BinanceAPIError("binance spot balances malformed")
 
         assets: list[dict[str, Any]] = []
-        fx = float(self.config.usdt_krw_rate or 0.0)
-        if fx <= 0:
-            fx = 1387.0
+        fx = self._resolve_usdt_krw_rate(usdt_krw_rate)
 
         for row in balances:
             if not isinstance(row, dict):
@@ -122,14 +120,12 @@ class BinanceAdapter:
         assets.sort(key=lambda item: (item["kind"] != "cash", str(item["asset"])))
         return assets
 
-    async def fetch_futures_assets(self) -> list[dict[str, Any]]:
+    async def fetch_futures_assets(self, usdt_krw_rate: float | None = None) -> list[dict[str, Any]]:
         if not self.config.futures_ready:
             raise BinanceAPIError("binance futures config missing")
 
         account = await self._signed_get_futures("/fapi/v2/account", {})
-        fx = float(self.config.usdt_krw_rate or 0.0)
-        if fx <= 0:
-            fx = 1387.0
+        fx = self._resolve_usdt_krw_rate(usdt_krw_rate)
 
         assets: list[dict[str, Any]] = []
         wallet_assets = account.get("assets")
@@ -279,6 +275,14 @@ class BinanceAdapter:
             return float(text)
         except ValueError:
             return 0.0
+
+    def _resolve_usdt_krw_rate(self, override: float | None = None) -> float:
+        if override is not None and override > 0:
+            return float(override)
+        fx = float(self.config.usdt_krw_rate or 0.0)
+        if fx > 0:
+            return fx
+        return 1387.0
 
     @staticmethod
     def _parse_json(response: httpx.Response) -> Any:

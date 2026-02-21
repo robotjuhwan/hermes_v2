@@ -21,11 +21,15 @@
       <div class="pillbox">
         <span id="healthPill" class="pill">API checking...</span>
         <span id="clockPill" class="pill mono">--</span>
+        <span id="fxUsdtPill" class="pill mono">USDT/KRW --</span>
+        <span id="fxUsdPill" class="pill mono">USD/KRW --</span>
+        <span id="fxUpdatedPill" class="pill mono">FX --</span>
+        <button id="helperNavBtn" class="btn ghost" type="button">투자 도움 에이전트</button>
         <button id="themeToggle" class="btn ghost theme-btn" type="button">다크 모드</button>
       </div>
     </header>
 
-    <section class="metrics">
+    <section id="mainMetricsSection" class="metrics">
       <article class="metric card">
         <p>전체 자산 합계</p>
         <h2 id="totalAssetValue">-</h2>
@@ -53,7 +57,7 @@
       </article>
     </section>
 
-    <section class="balance-shell card">
+    <section id="mainBalanceSection" class="balance-shell card">
       <div class="panel-head">
         <h3>거래소/시장별 잔고 탭</h3>
         <div class="panel-actions">
@@ -109,7 +113,7 @@
       </div>
     </section>
 
-    <section class="layout">
+    <section id="mainLayoutSection" class="layout">
       <article class="panel card">
         <div class="panel-head">
           <h3>봇 세션 상태 (요약)</h3>
@@ -126,7 +130,40 @@
       </article>
     </section>
 
-    <section class="telegram-shell card">
+    <section id="helperAgentSection" class="helper-shell card" hidden>
+      <div class="panel-head">
+        <h3>투자 도움 에이전트</h3>
+        <div class="panel-actions">
+          <button id="helperBackBtn" class="btn ghost" type="button">메인으로 돌아가기</button>
+          <span id="helperScorePill" class="pill mono">현재 역량 --/100</span>
+          <span id="helperUpdatedAt" class="pill mono">--</span>
+        </div>
+      </div>
+      <div id="helperTabs" class="tab-row">
+        <button type="button" class="tab-button active" data-helper-tab="research">리서치 요약</button>
+        <button type="button" class="tab-button" data-helper-tab="runtime">실행 상태</button>
+        <button type="button" class="tab-button" data-helper-tab="kis_trader">KIS 트레이더</button>
+        <button type="button" class="tab-button" data-helper-tab="reports">리포트 수집</button>
+      </div>
+      <div id="helperContent" class="helper-content">
+        <div class="notice">투자 도움 에이전트 상태를 불러오는 중입니다.</div>
+      </div>
+    </section>
+
+    <section id="mainStrategySection" class="strategy-shell card">
+      <div class="panel-head">
+        <h3>전략 실행 제어</h3>
+        <div class="panel-actions">
+          <span id="strategyUpdatedAt" class="pill mono">--</span>
+          <button id="strategyRefreshBtn" class="btn ghost" type="button">Status</button>
+          <button id="strategyStartAllBtn" class="btn" type="button">Start All</button>
+          <button id="strategyStopAllBtn" class="btn warm" type="button">Stop All</button>
+        </div>
+      </div>
+      <div id="strategyList" class="strategy-list"></div>
+    </section>
+
+    <section id="mainTelegramSection" class="telegram-shell card">
       <div class="panel-head">
         <h3>Integration Status</h3>
       </div>
@@ -142,6 +179,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=20260214_10"></script>
+  <script src="/static/app.js?v=20260218_06"></script>
 </body>
 </html>

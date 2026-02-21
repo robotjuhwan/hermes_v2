@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from tradecraft.main import app, settings, telegram, upbit
+from tradecraft.main import app, freqtrade_bridge, fx_rates, settings, telegram, upbit
 from tradecraft.services.telegram_cli import TelegramCLI
 
 
@@ -25,6 +25,24 @@ def disable_upbit_network_for_telegram_tests(monkeypatch) -> None:
     monkeypatch.setattr(settings, "kis_secondary_app_secret", "")
     monkeypatch.setattr(settings, "kis_secondary_account_no", "")
     monkeypatch.setattr(settings, "kis_secondary_product_code", "")
+
+    async def fake_get_snapshot() -> dict:
+        return {
+            "usdt_krw": 1480.0,
+            "usd_krw": 1443.0,
+            "usdt_source": "upbit",
+            "usd_source": "manana",
+            "status": "ok",
+            "fetched_at": "2026-02-15T09:00:00+00:00",
+        }
+
+    monkeypatch.setattr(fx_rates, "get_snapshot", fake_get_snapshot)
+
+    async def fake_fetch_sessions(usdt_krw_rate: float) -> dict:
+        _ = usdt_krw_rate
+        return {"bots": [], "sessions": []}
+
+    monkeypatch.setattr(freqtrade_bridge, "fetch_sessions", fake_fetch_sessions)
 
 
 def test_webhook_help_command_dispatches_reply(monkeypatch) -> None:
@@ -95,6 +113,31 @@ def test_webhook_replies_to_request_chat_id(monkeypatch) -> None:
     assert res.json()["sent"] is True
     assert sent_messages
     assert sent_messages[0][2] == "999999"
+
+
+def test_webhook_status_contains_fx_summary(monkeypatch) -> None:
+    sent_messages: list[tuple[str, str | None, str | None]] = []
+
+    async def fake_send_message(
+        text: str,
+        parse_mode: str | None = None,
+        chat_id: str | None = None,
+    ) -> dict:
+        sent_messages.append((text, parse_mode, chat_id))
+        return {"ok": True}
+
+    monkeypatch.setattr(telegram, "send_message", fake_send_message)
+
+    with TestClient(app) as client:
+        payload = {"message": {"text": "/status", "chat": {"id": telegram.config.chat_id or "test"}}}
+        res = client.post("/api/telegram/webhook", json=payload)
+
+    assert res.status_code == 200
+    assert sent_messages
+    assert "USDT/KRW:" in sent_messages[0][0]
+    assert "USD/KRW:" in sent_messages[0][0]
+    assert "FX 상태:" in sent_messages[0][0]
+    assert sent_messages[0][1] == "HTML"
 
 
 def test_webhook_balance_command_renders_table(monkeypatch) -> None:

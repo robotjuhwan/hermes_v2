@@ -23,11 +23,16 @@ class KISConfig:
     base_url: str = "https://openapi.koreainvestment.com:9443"
     tr_id_balance: str = "TTTC8434R"
     tr_id_us_present_balance: str = "CTRP6504R"
+    tr_id_quote: str = "FHKST01010100"
+    tr_id_order_buy: str = "TTTC0802U"
+    tr_id_order_sell: str = "TTTC0801U"
     cust_type: str = "P"
 
     @property
     def ready(self) -> bool:
-        return bool(self.app_key and self.app_secret and self.account_no and self.product_code)
+        return bool(
+            self.app_key and self.app_secret and self.account_no and self.product_code
+        )
 
 
 class KISAdapter:
@@ -41,9 +46,133 @@ class KISAdapter:
         rows, summary = await self._fetch_balance_rows()
         return self._to_assets(rows, summary)
 
-    async def fetch_us_balance_assets(self) -> list[dict[str, Any]]:
+    async def fetch_us_balance_assets(
+        self, usd_krw_rate: float | None = None
+    ) -> list[dict[str, Any]]:
         rows, summary = await self._fetch_us_balance_rows()
-        return self._to_us_assets(rows, summary)
+        return self._to_us_assets(rows, summary, usd_krw_rate=usd_krw_rate)
+
+    async def fetch_domestic_quote(self, symbol: str) -> dict[str, Any]:
+        if not self.config.ready:
+            raise KISAPIError("kis config missing")
+
+        code = str(symbol or "").strip()
+        if len(code) != 6 or not code.isdigit():
+            raise KISAPIError("invalid domestic symbol")
+
+        token = await self._get_access_token()
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": code,
+        }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "appkey": self.config.app_key,
+            "appsecret": self.config.app_secret,
+            "tr_id": self.config.tr_id_quote,
+            "custtype": self.config.cust_type,
+            "Accept": "application/json",
+        }
+        url = f"{self.config.base_url.rstrip('/')}/uapi/domestic-stock/v1/quotations/inquire-price"
+        timeout = httpx.Timeout(10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(url, params=params, headers=headers)
+
+        payload = self._parse_json(response)
+        if response.status_code >= 400:
+            raise KISAPIError(f"kis quote request failed: {payload}")
+        if str(payload.get("rt_cd")) != "0":
+            msg = str(payload.get("msg1") or payload.get("msg_cd") or payload)
+            raise KISAPIError(f"kis quote request rejected: {msg}")
+
+        output = payload.get("output")
+        if not isinstance(output, dict):
+            raise KISAPIError("kis quote malformed response")
+
+        price = self._to_float(output.get("stck_prpr"))
+        if price <= 0:
+            price = self._to_float(output.get("askp1"))
+        if price <= 0:
+            raise KISAPIError("kis quote has no valid price")
+
+        return {
+            "symbol": code,
+            "name": str(output.get("hts_kor_isnm") or code),
+            "price": price,
+            "raw": output,
+        }
+
+    async def submit_domestic_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        price: int = 0,
+        order_type: str = "01",
+    ) -> dict[str, Any]:
+        if not self.config.ready:
+            raise KISAPIError("kis config missing")
+
+        code = str(symbol or "").strip()
+        if len(code) != 6 or not code.isdigit():
+            raise KISAPIError("invalid domestic symbol")
+        qty = int(quantity)
+        if qty <= 0:
+            raise KISAPIError("quantity must be positive")
+
+        norm_side = str(side or "").strip().lower()
+        if norm_side not in {"buy", "sell"}:
+            raise KISAPIError("side must be buy or sell")
+
+        token = await self._get_access_token()
+        cano, product_code = self._account_parts()
+        payload = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": product_code,
+            "PDNO": code,
+            "ORD_DVSN": str(order_type or "01"),
+            "ORD_QTY": str(qty),
+            "ORD_UNPR": str(max(int(price), 0)),
+        }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "appkey": self.config.app_key,
+            "appsecret": self.config.app_secret,
+            "tr_id": (
+                self.config.tr_id_order_buy
+                if norm_side == "buy"
+                else self.config.tr_id_order_sell
+            ),
+            "custtype": self.config.cust_type,
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=UTF-8",
+        }
+
+        url = f"{self.config.base_url.rstrip('/')}/uapi/domestic-stock/v1/trading/order-cash"
+        timeout = httpx.Timeout(10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                url, content=json.dumps(payload), headers=headers
+            )
+
+        body = self._parse_json(response)
+        if response.status_code >= 400:
+            raise KISAPIError(f"kis order request failed: {body}")
+        if str(body.get("rt_cd")) != "0":
+            msg = str(body.get("msg1") or body.get("msg_cd") or body)
+            raise KISAPIError(f"kis order request rejected: {msg}")
+
+        out = body.get("output")
+        output = out if isinstance(out, dict) else {}
+        return {
+            "symbol": code,
+            "side": norm_side,
+            "quantity": qty,
+            "price": int(max(price, 0)),
+            "order_type": str(order_type or "01"),
+            "order_no": str(output.get("ODNO") or output.get("odno") or ""),
+            "response": body,
+        }
 
     async def _fetch_balance_rows(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if not self.config.ready:
@@ -133,7 +262,9 @@ class KISAdapter:
         next_tr_cont = str(response.headers.get("tr_cont") or "").upper().strip()
         return payload, next_tr_cont
 
-    async def _fetch_us_balance_rows(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    async def _fetch_us_balance_rows(
+        self,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if not self.config.ready:
             raise KISAPIError("kis config missing")
 
@@ -142,7 +273,9 @@ class KISAdapter:
 
         tr_cont = ""
         for _ in range(12):
-            payload, next_tr_cont = await self._inquire_us_present_balance_page(tr_cont=tr_cont)
+            payload, next_tr_cont = await self._inquire_us_present_balance_page(
+                tr_cont=tr_cont
+            )
 
             output1 = payload.get("output1")
             if isinstance(output1, list):
@@ -163,7 +296,9 @@ class KISAdapter:
 
         return all_rows, summary
 
-    async def _inquire_us_present_balance_page(self, tr_cont: str = "") -> tuple[dict[str, Any], str]:
+    async def _inquire_us_present_balance_page(
+        self, tr_cont: str = ""
+    ) -> tuple[dict[str, Any], str]:
         token = await self._get_access_token()
         cano, product_code = self._account_parts()
         params = {
@@ -222,7 +357,9 @@ class KISAdapter:
             url = f"{self.config.base_url.rstrip('/')}/oauth2/tokenP"
             timeout = httpx.Timeout(10.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(url, content=json.dumps(payload), headers=headers)
+                response = await client.post(
+                    url, content=json.dumps(payload), headers=headers
+                )
 
             body = self._parse_json(response)
             if response.status_code >= 400:
@@ -238,7 +375,9 @@ class KISAdapter:
             self._token_expiry = expiry - timedelta(seconds=90)
             return token
 
-    def _to_assets(self, rows: list[dict[str, Any]], summary: dict[str, Any]) -> list[dict[str, Any]]:
+    def _to_assets(
+        self, rows: list[dict[str, Any]], summary: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         assets: list[dict[str, Any]] = []
 
         cash_krw = self._select_cash_value(summary)
@@ -262,7 +401,10 @@ class KISAdapter:
             symbol = str(row.get("pdno") or row.get("mksc_shrn_iscd") or "").strip()
             if not symbol:
                 continue
-            symbol_name = str(row.get("prdt_name") or row.get("prdt_abrv_name") or "").strip() or symbol
+            symbol_name = (
+                str(row.get("prdt_name") or row.get("prdt_abrv_name") or "").strip()
+                or symbol
+            )
 
             qty = self._to_float(row.get("hldg_qty"))
             if qty <= 0:
@@ -305,13 +447,21 @@ class KISAdapter:
         assets.sort(key=lambda item: (item["kind"] != "cash", str(item["asset"])))
         return assets
 
-    def _to_us_assets(self, rows: list[dict[str, Any]], summary: dict[str, Any]) -> list[dict[str, Any]]:
+    def _to_us_assets(
+        self,
+        rows: list[dict[str, Any]],
+        summary: dict[str, Any],
+        usd_krw_rate: float | None = None,
+    ) -> list[dict[str, Any]]:
         assets: list[dict[str, Any]] = []
 
-        usd_krw_rate = self._select_usd_krw_rate(rows, summary)
-        cash_usd, cash_krw = self._select_usd_cash_value(summary, usd_krw_rate)
+        resolved_usd_krw_rate = float(usd_krw_rate or 0.0)
+        if resolved_usd_krw_rate <= 0:
+            resolved_usd_krw_rate = self._select_usd_krw_rate(rows, summary)
+
+        cash_usd, cash_krw = self._select_usd_cash_value(summary, resolved_usd_krw_rate)
         if cash_krw > 0:
-            avg_price = usd_krw_rate if usd_krw_rate > 0 else 1.0
+            avg_price = resolved_usd_krw_rate if resolved_usd_krw_rate > 0 else 1.0
             assets.append(
                 {
                     "asset": "USD",
@@ -328,7 +478,9 @@ class KISAdapter:
             )
 
         for row in rows:
-            symbol = str(row.get("pdno") or row.get("ovrs_pdno") or row.get("std_pdno") or "").strip()
+            symbol = str(
+                row.get("pdno") or row.get("ovrs_pdno") or row.get("std_pdno") or ""
+            ).strip()
             if not symbol:
                 continue
             symbol_name = (
@@ -364,9 +516,11 @@ class KISAdapter:
             if mark_usd <= 0:
                 mark_usd = self._to_float(row.get("now_pric2"))
 
-            row_fx = self._to_float(row.get("bass_exrt"))
+            row_fx = float(usd_krw_rate or 0.0)
             if row_fx <= 0:
-                row_fx = usd_krw_rate
+                row_fx = self._to_float(row.get("bass_exrt"))
+            if row_fx <= 0:
+                row_fx = resolved_usd_krw_rate
 
             value_foreign = self._to_float(row.get("frcr_evlu_amt2"))
             if value_foreign <= 0:
@@ -431,7 +585,9 @@ class KISAdapter:
                     return value
         return 0.0
 
-    def _select_usd_krw_rate(self, rows: list[dict[str, Any]], summary: dict[str, Any]) -> float:
+    def _select_usd_krw_rate(
+        self, rows: list[dict[str, Any]], summary: dict[str, Any]
+    ) -> float:
         for row in rows:
             rate = self._to_float(row.get("bass_exrt"))
             if rate > 0:
@@ -442,7 +598,9 @@ class KISAdapter:
                 return rate
         return 0.0
 
-    def _select_usd_cash_value(self, summary: dict[str, Any], usd_krw_rate: float) -> tuple[float, float]:
+    def _select_usd_cash_value(
+        self, summary: dict[str, Any], usd_krw_rate: float
+    ) -> tuple[float, float]:
         if not isinstance(summary, dict):
             return 0.0, 0.0
 
@@ -491,7 +649,11 @@ class KISAdapter:
 
         text = str(body.get("access_token_token_expired") or "").strip()
         if text:
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S",
+            ):
                 try:
                     parsed = datetime.strptime(text, fmt)
                     if parsed.tzinfo is None:

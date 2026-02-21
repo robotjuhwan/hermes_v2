@@ -2,8 +2,18 @@ const API = "/api";
 const THEME_KEY = "hermes_theme";
 const state = {
   dashboard: null,
+  strategyControl: null,
   activeVenueId: "all",
+  activePage: "main",
+  activeHelperTab: "research",
+  kisTraderStatus: null,
+  kisTraderError: "",
+  reportsStatus: null,
+  reportsError: "",
+  healthStatus: null,
+  healthError: "",
   theme: "light",
+  lastRenderedWebhookMessage: "",
 };
 
 function qs(id) {
@@ -162,6 +172,45 @@ function renderTopMetrics() {
     : "국장(2번) 미연동";
 
   qs("venueCountValue").textContent = `${ownVenues.length} markets`;
+  renderFxPills(data.fx);
+}
+
+function isFxWarnSource(source) {
+  const normalized = String(source || "").toLowerCase().trim();
+  if (!normalized) return true;
+  return normalized.startsWith("fallback") || normalized.endsWith("_proxy");
+}
+
+function renderFxPills(fx) {
+  const usdtPill = qs("fxUsdtPill");
+  const usdPill = qs("fxUsdPill");
+  const updatedPill = qs("fxUpdatedPill");
+  if (!usdtPill || !usdPill || !updatedPill) return;
+
+  if (!fx) {
+    usdtPill.className = "pill mono";
+    usdPill.className = "pill mono";
+    updatedPill.className = "pill mono";
+    usdtPill.textContent = "USDT/KRW --";
+    usdPill.textContent = "USD/KRW --";
+    updatedPill.textContent = "FX --";
+    return;
+  }
+
+  const usdtRate = Number(fx.usdt_krw || 0);
+  const usdRate = Number(fx.usd_krw || 0);
+  const usdtSource = String(fx.usdt_source || "-");
+  const usdSource = String(fx.usd_source || "-");
+  const fxWarn = String(fx.status || "").toLowerCase() === "warn";
+  const usdtWarn = isFxWarnSource(usdtSource);
+  const usdWarn = isFxWarnSource(usdSource);
+
+  usdtPill.className = `pill mono ${usdtWarn ? "pill-warn" : "pill-ok"}`;
+  usdPill.className = `pill mono ${usdWarn ? "pill-warn" : "pill-ok"}`;
+  updatedPill.className = `pill mono ${fxWarn ? "pill-warn" : "pill-ok"}`;
+  usdtPill.textContent = `USDT/KRW ${fmtNum(usdtRate, 2)} (${usdtSource})`;
+  usdPill.textContent = `USD/KRW ${fmtNum(usdRate, 2)} (${usdSource})`;
+  updatedPill.textContent = `FX ${fxWarn ? "WARN" : "OK"} ${fmtKST(fx.fetched_at)}`;
 }
 
 function renderVenueTabs() {
@@ -532,6 +581,519 @@ function renderEvents(rows) {
     .join("");
 }
 
+function getErrorMessage(reason) {
+  if (reason instanceof Error && reason.message) {
+    return reason.message;
+  }
+  return "요청 실패";
+}
+
+function pickUpdatedAt(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  const keys = ["updated_at", "fetched_at", "generated_at", "collected_at", "last_updated_at", "clock_utc"];
+  for (const key of keys) {
+    const value = payload[key];
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function truncateWithEllipsis(value, maxChars = 180) {
+  const compact = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!compact) return "-";
+  const limit = Math.max(Number(maxChars) || 0, 8);
+  if (compact.length <= limit) return compact;
+  return `${compact.slice(0, limit - 3)}...`;
+}
+
+function normalizeScore100(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const score = Number(value);
+  if (!Number.isFinite(score)) return null;
+  const rounded = Math.round(score);
+  return Math.min(100, Math.max(0, rounded));
+}
+
+function normalizeNonNegativeInt(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, Math.round(parsed));
+}
+
+function helperSourceLabel(value) {
+  const source = String(value || "").trim().toLowerCase();
+  if (!source) return "기타";
+  if (source.includes("codex")) return "AI 리서치";
+  if (source.includes("naver_report_db")) return "리포트 DB";
+  if (source.includes("report_crawl")) return "직접 수집";
+  return truncateWithEllipsis(source, 28);
+}
+
+function helperStateChip(value) {
+  const text = String(value ?? "").trim() || "-";
+  const lower = text.toLowerCase();
+  const okTokens = ["ok", "online", "running", "connected", "ready", "up", "enabled", "true"];
+  const warnTokens = [
+    "warn",
+    "stale",
+    "offline",
+    "error",
+    "failed",
+    "down",
+    "missing",
+    "invalid",
+    "disabled",
+    "false",
+  ];
+  const isWarn = warnTokens.some((token) => lower === token || lower.includes(token));
+  const isOk = okTokens.some((token) => lower === token || lower.includes(token));
+  return {
+    text,
+    cls: isOk && !isWarn ? "ok" : "warn",
+  };
+}
+
+function renderPageMode() {
+  const isHelper = state.activePage === "helper";
+  const mainIds = [
+    "mainMetricsSection",
+    "mainBalanceSection",
+    "mainLayoutSection",
+    "mainStrategySection",
+    "mainTelegramSection",
+  ];
+  for (const id of mainIds) {
+    const node = qs(id);
+    if (node) {
+      node.hidden = isHelper;
+    }
+  }
+
+  const helperSection = qs("helperAgentSection");
+  if (helperSection) {
+    helperSection.hidden = !isHelper;
+  }
+
+  const helperNavBtn = qs("helperNavBtn");
+  if (helperNavBtn) {
+    helperNavBtn.hidden = isHelper;
+  }
+}
+
+function openHelperPage(tab = "research") {
+  state.activePage = "helper";
+  state.activeHelperTab = tab;
+  renderPageMode();
+  renderHelperAgent();
+  const section = qs("helperAgentSection");
+  if (section) {
+    section.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
+function openMainPage() {
+  state.activePage = "main";
+  renderPageMode();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function stringifySafe(value, pretty = false) {
+  try {
+    return JSON.stringify(value, null, pretty ? 2 : 0);
+  } catch (_) {
+    return String(value ?? "");
+  }
+}
+
+function formatHelperValue(value) {
+  if (value === null || value === undefined || value === "") {
+    return "-";
+  }
+  if (typeof value === "number") {
+    return fmtNum(value, Number.isInteger(value) ? 0 : 4);
+  }
+  if (typeof value === "boolean") {
+    return value ? "예" : "아니오";
+  }
+  if (Array.isArray(value)) {
+    if (!value.length) return "-";
+    return value
+      .slice(0, 8)
+      .map((item) => (typeof item === "object" ? stringifySafe(item) : String(item)))
+      .join(", ");
+  }
+  if (typeof value === "object") {
+    return stringifySafe(value);
+  }
+  return String(value);
+}
+
+function normalizeResearchItems(research) {
+  if (Array.isArray(research)) return research;
+  if (!research || typeof research !== "object") return [];
+  const keys = ["items", "rows", "results", "entries", "reports", "summaries"];
+  for (const key of keys) {
+    if (Array.isArray(research[key])) {
+      return research[key];
+    }
+  }
+  return [research];
+}
+
+function renderResearchHelperTab() {
+  const research = state.dashboard?.research;
+  const rows = normalizeResearchItems(research);
+  if (!rows.length) {
+    return '<div class="notice">리서치 요약 데이터가 없습니다.</div>';
+  }
+
+  const grouped = new Map();
+  rows.slice(0, 18).forEach((row, index) => {
+    if (!row || typeof row !== "object") {
+      const label = "기타";
+      const list = grouped.get(label) || [];
+      list.push({ title: `리서치 ${index + 1}`, summary: formatHelperValue(row), status: "ok", picks: [] });
+      grouped.set(label, list);
+      return;
+    }
+
+    const label = helperSourceLabel(row.source || row.provider);
+    const list = grouped.get(label) || [];
+    list.push(row);
+    grouped.set(label, list);
+  });
+
+  const score = normalizeScore100(research?.agent_self_score_100);
+  const learningTotalCount = normalizeNonNegativeInt(research?.learning_total_count);
+  const note = truncateWithEllipsis(research?.agent_self_score_note || "", 120);
+  const overview = `전체 ${rows.length}건 · 누적 학습 ${learningTotalCount === null ? "--" : learningTotalCount}회 · 점수 ${score === null ? "--" : score}/100`;
+
+  const sections = [...grouped.entries()].map(([groupLabel, entries]) => {
+    const itemsHtml = entries
+      .map((row, index) => {
+        const title = truncateWithEllipsis(
+          row.title || row.name || row.symbol || row.code || row.topic || `리서치 ${index + 1}`,
+          84
+        );
+        const summaryText = truncateWithEllipsis(
+          row.summary || row.thesis || row.note || row.reason || row.description || row.content || "요약 정보 없음",
+          220
+        );
+        const status = String(row.status || "ok").toLowerCase();
+        const statusLabel = status === "ok" ? "OK" : truncateWithEllipsis(status.toUpperCase(), 18);
+        const statusClass = status === "ok" ? "ok" : "warn";
+        const picks = Array.isArray(row.picks)
+          ? row.picks
+              .map((code) => String(code || "").trim())
+              .filter((code) => code)
+              .slice(0, 4)
+          : [];
+        const picksText = picks.length ? `후보: ${picks.join(", ")}` : "후보: 없음";
+        const queryText = truncateWithEllipsis(row.query || research?.query || "일반", 34);
+        return `
+          <li class="helper-row-item">
+            <div class="helper-row-head">
+              <h4>${escapeHTML(title)}</h4>
+              <span class="helper-row-status ${statusClass}">${escapeHTML(statusLabel)}</span>
+            </div>
+            <p class="helper-row-summary">${escapeHTML(summaryText)}</p>
+            <div class="helper-row-meta">
+              <span>${escapeHTML(picksText)}</span>
+              <span>${escapeHTML(`쿼리: ${queryText}`)}</span>
+            </div>
+          </li>
+        `;
+      })
+      .join("");
+
+    return `
+      <section class="helper-group-section">
+        <header class="helper-group-head">
+          <h4>${escapeHTML(groupLabel)}</h4>
+          <span class="pill mono">${escapeHTML(`${entries.length}건`)}</span>
+        </header>
+        <ul class="helper-row-list">
+          ${itemsHtml}
+        </ul>
+      </section>
+    `;
+  });
+
+  return `
+    <div class="helper-research-shell">
+      <div class="helper-research-overview">
+        <strong>${escapeHTML(overview)}</strong>
+        <span>${escapeHTML(note === "-" ? "자가평가 코멘트 없음" : note)}</span>
+      </div>
+      <div class="helper-group-grid">
+        ${sections.join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderRuntimeHelperTab() {
+  const health = state.healthStatus;
+  const healthError = state.healthError;
+  const reports = state.reportsStatus;
+  const bots = Array.isArray(state.strategyControl?.items) ? state.strategyControl.items : [];
+
+  const systemRows = [
+    { label: "API 상태", value: health?.status || (healthError ? "offline" : "-") },
+    { label: "Runtime 데이터 상태", value: health?.runtime_status || "-" },
+    { label: "Research 데이터 상태", value: health?.research_status || "-" },
+    { label: "Naver Reports", value: health?.naver_reports_enabled ? "enabled" : "disabled" },
+    { label: "KIS Trader", value: health?.kis_trader_enabled ? "enabled" : "disabled" },
+  ];
+
+  const botRows = bots.length
+    ? bots.map((row) => ({
+        label: row.label || row.bot_id || "bot",
+        value: `${row.running ? "RUNNING" : "STOPPED"} · ${row.api_reachable ? "API UP" : "API DOWN"}`,
+      }))
+    : [{ label: "Freqtrade", value: "no data" }];
+
+  const runnerLabel = (value) => {
+    if (value === true) {
+      return "running";
+    }
+    if (value === false) {
+      return "stopped";
+    }
+    return "unknown";
+  };
+  const runnerRows = [
+    { label: "runtime runner 프로세스", value: runnerLabel(health?.runtime_runner_alive) },
+    { label: "research runner 프로세스", value: runnerLabel(health?.research_runner_alive) },
+    { label: "kis trader runner 프로세스", value: runnerLabel(health?.kis_trader_runner_alive) },
+    { label: "reports crawler 프로세스", value: runnerLabel(health?.naver_reports_runner_alive) },
+  ];
+
+  const reportTotal = Number(reports?.repository?.total_reports || 0);
+  const learningTotalCount = normalizeNonNegativeInt(state.dashboard?.research?.learning_total_count);
+  const reportUpdated = reports?.repository?.last_updated_at
+    ? fmtKST(reports.repository.last_updated_at, true)
+    : "--";
+  const ragAvailable = reports?.rag?.available ? "available" : "unavailable";
+  const ragCount = Number(reports?.rag?.count || 0);
+  const dataRows = [
+    { label: "reports db", value: String(reportTotal) },
+    { label: "reports updated", value: reportUpdated },
+    { label: "rag status", value: ragAvailable },
+    { label: "rag chunks", value: String(ragCount) },
+    { label: "누적 학습 횟수", value: learningTotalCount === null ? "-" : String(learningTotalCount) },
+  ];
+
+  const renderRows = (rows) =>
+    rows
+      .map((row) => {
+        const chip = helperStateChip(row.value);
+        return `
+          <li>
+            <span>${escapeHTML(row.label)}</span>
+            <strong class="helper-runtime-chip ${chip.cls}">${escapeHTML(chip.text)}</strong>
+          </li>
+        `;
+      })
+      .join("");
+
+  return `
+    <div class="helper-grid helper-runtime-grid">
+      <article class="helper-card">
+        <h4>시스템 상태</h4>
+        <ul class="helper-runtime-list">
+          ${renderRows(systemRows)}
+        </ul>
+      </article>
+      <article class="helper-card">
+        <h4>Freqtrade 실행</h4>
+        <ul class="helper-runtime-list">
+          ${renderRows(botRows)}
+        </ul>
+      </article>
+      <article class="helper-card">
+        <h4>러너 상태</h4>
+        <ul class="helper-runtime-list">
+          ${renderRows(runnerRows)}
+        </ul>
+      </article>
+      <article class="helper-card">
+        <h4>리포트/RAG</h4>
+        <ul class="helper-runtime-list">
+          ${renderRows(dataRows)}
+        </ul>
+      </article>
+    </div>
+  `;
+}
+
+function renderStatusHelperTab(payload, errorMessage, loadingLabel) {
+  if (errorMessage) {
+    return `<div class="notice">${escapeHTML(loadingLabel)} 상태 조회 실패: ${escapeHTML(errorMessage)}</div>`;
+  }
+  if (!payload) {
+    return `<div class="notice">${escapeHTML(loadingLabel)} 상태를 불러오는 중입니다.</div>`;
+  }
+
+  if (typeof payload !== "object") {
+    return `
+      <div class="helper-grid">
+        <article class="helper-card">
+          <h4>${escapeHTML(loadingLabel)}</h4>
+          <p class="helper-text">${escapeHTML(formatHelperValue(payload))}</p>
+        </article>
+      </div>
+    `;
+  }
+
+  const scalarRows = Object.entries(payload)
+    .filter(([, value]) => value === null || ["string", "number", "boolean"].includes(typeof value) || Array.isArray(value))
+    .slice(0, 10)
+    .map(
+      ([key, value]) => `
+        <article class="helper-card">
+          <h4>${escapeHTML(key)}</h4>
+          <p class="helper-text">${escapeHTML(formatHelperValue(value))}</p>
+        </article>
+      `
+    );
+
+  const nestedRows = Object.entries(payload)
+    .filter(([, value]) => value && typeof value === "object" && !Array.isArray(value))
+    .slice(0, 4)
+    .map(
+      ([key, value]) => `
+        <article class="helper-card">
+          <h4>${escapeHTML(key)}</h4>
+          <pre class="helper-json mono">${escapeHTML(stringifySafe(value, true))}</pre>
+        </article>
+      `
+    );
+
+  const cards = [...scalarRows, ...nestedRows];
+  if (!cards.length) {
+    return '<div class="notice">표시할 상태 데이터가 없습니다.</div>';
+  }
+  return `<div class="helper-grid">${cards.join("")}</div>`;
+}
+
+function renderHelperAgent() {
+  const tabsRoot = qs("helperTabs");
+  const contentRoot = qs("helperContent");
+  const updatedRoot = qs("helperUpdatedAt");
+  const scoreRoot = qs("helperScorePill");
+  if (!tabsRoot || !contentRoot || !updatedRoot || !scoreRoot) return;
+
+  const validTabs = new Set(["research", "runtime", "kis_trader", "reports"]);
+  if (!validTabs.has(state.activeHelperTab)) {
+    state.activeHelperTab = "research";
+  }
+
+  tabsRoot.querySelectorAll("[data-helper-tab]").forEach((button) => {
+    const active = button.dataset.helperTab === state.activeHelperTab;
+    button.classList.toggle("active", active);
+  });
+
+  let updatedAt = state.dashboard?.clock_utc || "";
+  const score = normalizeScore100(state.dashboard?.research?.agent_self_score_100);
+  scoreRoot.textContent = score === null ? "현재 역량 --/100" : `현재 역량 ${score}/100`;
+  if (state.activeHelperTab === "runtime") {
+    contentRoot.innerHTML = renderRuntimeHelperTab();
+    updatedAt = pickUpdatedAt(state.strategyControl) || pickUpdatedAt(state.reportsStatus) || updatedAt;
+  } else if (state.activeHelperTab === "kis_trader") {
+    contentRoot.innerHTML = renderStatusHelperTab(state.kisTraderStatus, state.kisTraderError, "KIS 트레이더");
+    updatedAt = pickUpdatedAt(state.kisTraderStatus) || updatedAt;
+  } else if (state.activeHelperTab === "reports") {
+    contentRoot.innerHTML = renderStatusHelperTab(state.reportsStatus, state.reportsError, "리포트 수집");
+    updatedAt = pickUpdatedAt(state.reportsStatus) || updatedAt;
+  } else {
+    contentRoot.innerHTML = renderResearchHelperTab();
+    updatedAt = pickUpdatedAt(state.dashboard?.research) || updatedAt;
+  }
+
+  updatedRoot.textContent = updatedAt ? `업데이트 KST ${fmtKST(updatedAt, true)}` : "업데이트 --";
+}
+
+function renderStrategyControl() {
+  const payload = state.strategyControl;
+  const rows = payload?.items || [];
+  const updatedAt = payload?.updated_at || "";
+  qs("strategyUpdatedAt").textContent = updatedAt
+    ? `KST ${fmtKST(updatedAt, true)}`
+    : "--";
+
+  if (!rows.length) {
+    qs("strategyList").innerHTML = `
+      <article class="strategy-row">
+        <div class="strategy-footnote">전략 정보가 없습니다.</div>
+      </article>
+    `;
+    return;
+  }
+
+  qs("strategyList").innerHTML = rows
+    .map((row) => {
+      const running = Boolean(row.running);
+      const reachable = Boolean(row.api_reachable);
+      const pidText = row.pid ? `PID ${row.pid}` : "PID -";
+      const apiText = row.api_url || "API URL -";
+      const limitCurrency = String(row.bot_id || "") === "kis" ? "KRW" : "USDT";
+      const limitLabel = `${limitCurrency} LIMIT`;
+      const usdtLimit = Number(row.usdt_limit || 0);
+      const usdtLimitText = usdtLimit > 0 ? fmtNum(usdtLimit, 2) : "";
+      return `
+      <article class="strategy-row">
+        <div class="strategy-row-head">
+          <h4 class="strategy-title">${escapeHTML(row.label || row.bot_id)}</h4>
+          <div class="strategy-actions">
+            <button class="btn" type="button" data-strategy-action="start" data-bot-id="${escapeHTML(row.bot_id)}" ${running ? "disabled" : ""}>Start</button>
+            <button class="btn warm" type="button" data-strategy-action="stop" data-bot-id="${escapeHTML(row.bot_id)}" ${running ? "" : "disabled"}>Stop</button>
+          </div>
+        </div>
+        <div class="strategy-meta">
+          <span class="strategy-pill ${running ? "running" : "stopped"}">${running ? "RUNNING" : "STOPPED"}</span>
+          <span class="strategy-pill ${reachable ? "reachable" : "unreachable"}">${reachable ? "API UP" : "API DOWN"}</span>
+          <span class="strategy-pill mono">${escapeHTML(pidText)}</span>
+          <span class="strategy-pill mono">${escapeHTML(limitLabel)} ${escapeHTML(usdtLimitText || "-")}</span>
+        </div>
+        <div class="strategy-actions">
+          <input class="strategy-limit-input" type="number" min="0.01" step="0.01" data-limit-bot-id="${escapeHTML(row.bot_id)}" value="${escapeHTML(usdtLimitText)}" placeholder="${escapeHTML(limitCurrency)} limit" />
+          <button class="btn ghost" type="button" data-strategy-action="set-limit" data-bot-id="${escapeHTML(row.bot_id)}">Set Limit</button>
+        </div>
+        <div class="strategy-footnote mono">${escapeHTML(apiText)}</div>
+      </article>
+    `;
+    })
+    .join("");
+}
+
+async function refreshStrategyControl() {
+  state.strategyControl = await getJSON("/freqtrade/strategies");
+  renderStrategyControl();
+  renderHelperAgent();
+}
+
+async function runStrategyAction(path) {
+  state.strategyControl = await getJSON(path, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  renderStrategyControl();
+  await refreshDashboard();
+}
+
+async function runStrategyActionWithBody(path, body) {
+  state.strategyControl = await getJSON(path, {
+    method: "POST",
+    body: JSON.stringify(body || {}),
+  });
+  renderStrategyControl();
+  await refreshDashboard();
+}
+
 async function getJSON(path, options = {}) {
   const response = await fetch(`${API}${path}`, {
     ...options,
@@ -553,14 +1115,60 @@ function renderDashboard() {
   renderActiveVenue();
   renderSessions(getActiveSessions(), state.dashboard?.clock_utc);
 
-  const telegramFeed = state.dashboard?.telegram?.last_webhook_message
-    ? [{ type: "telegram", message: `Webhook: ${state.dashboard.telegram.last_webhook_message}` }]
-    : [];
+  const webhookMessage = String(
+    state.dashboard?.telegram?.last_webhook_message || ""
+  ).trim();
+  const telegramFeed =
+    webhookMessage && webhookMessage !== state.lastRenderedWebhookMessage
+      ? [{ type: "telegram", message: `Webhook: ${webhookMessage}` }]
+      : [];
+  if (webhookMessage) {
+    state.lastRenderedWebhookMessage = webhookMessage;
+  }
   renderEvents([...(state.dashboard?.events || []), ...telegramFeed]);
+  renderHelperAgent();
+  renderPageMode();
 }
 
 async function refreshDashboard() {
-  state.dashboard = await getJSON("/dashboard");
+  const [dashboardResult, kisResult, reportsResult, healthResult] = await Promise.allSettled([
+    getJSON("/dashboard"),
+    getJSON("/kis/trader/status"),
+    getJSON("/reports/status"),
+    getJSON("/health"),
+  ]);
+
+  if (dashboardResult.status !== "fulfilled") {
+    throw dashboardResult.reason;
+  }
+
+  state.dashboard = dashboardResult.value;
+  if (kisResult.status === "fulfilled") {
+    state.kisTraderStatus = kisResult.value;
+    state.kisTraderError = "";
+  } else {
+    state.kisTraderStatus = null;
+    state.kisTraderError = getErrorMessage(kisResult.reason);
+  }
+
+  if (reportsResult.status === "fulfilled") {
+    state.reportsStatus = reportsResult.value;
+    state.reportsError = "";
+  } else {
+    state.reportsStatus = null;
+    state.reportsError = getErrorMessage(reportsResult.reason);
+  }
+
+  if (healthResult.status === "fulfilled") {
+    state.healthStatus = healthResult.value;
+    state.healthError = "";
+    setHealth("API online", healthResult.value?.status === "ok");
+  } else {
+    state.healthStatus = null;
+    state.healthError = getErrorMessage(healthResult.reason);
+    setHealth("API offline", false);
+  }
+
   renderDashboard();
 }
 
@@ -588,17 +1196,63 @@ async function checkHealth() {
 async function init() {
   applyTheme(getInitialTheme());
   qs("themeToggle").addEventListener("click", toggleTheme);
-  qs("refreshBtn").addEventListener("click", refreshDashboard);
+  qs("helperNavBtn").addEventListener("click", () => {
+    openHelperPage("research");
+  });
+  qs("helperBackBtn").addEventListener("click", openMainPage);
+  qs("refreshBtn").addEventListener("click", async () => {
+    await Promise.all([refreshDashboard(), refreshStrategyControl()]);
+  });
+  qs("strategyRefreshBtn").addEventListener("click", refreshStrategyControl);
+  qs("strategyStartAllBtn").addEventListener("click", async () => {
+    await runStrategyAction("/freqtrade/strategies/start-all");
+  });
+  qs("strategyStopAllBtn").addEventListener("click", async () => {
+    await runStrategyAction("/freqtrade/strategies/stop-all");
+  });
+  qs("strategyList").addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-strategy-action]");
+    if (!button) return;
+    const action = String(button.dataset.strategyAction || "").trim();
+    const botId = String(button.dataset.botId || "").trim();
+    if (!action || !botId) return;
+    if (action === "set-limit") {
+      const input = qs("strategyList").querySelector(
+        `[data-limit-bot-id="${botId.replace(/"/g, '\\"')}"]`
+      );
+      const value = Number(input?.value || 0);
+      if (!Number.isFinite(value) || value <= 0) {
+        return;
+      }
+      await runStrategyActionWithBody(
+        `/freqtrade/strategies/${encodeURIComponent(botId)}/usdt-limit`,
+        { usdt_limit: value }
+      );
+      return;
+    }
+    const path =
+      action === "start"
+        ? `/freqtrade/strategies/${encodeURIComponent(botId)}/start`
+        : `/freqtrade/strategies/${encodeURIComponent(botId)}/stop`;
+    await runStrategyAction(path);
+  });
   qs("venueTabs").addEventListener("click", (event) => {
     const button = event.target.closest("[data-venue]");
     if (!button || !state.dashboard) return;
     state.activeVenueId = button.dataset.venue;
     renderDashboard();
   });
+  qs("helperTabs").addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const button = target ? target.closest("[data-helper-tab]") : null;
+    if (!button) return;
+    state.activeHelperTab = String(button.dataset.helperTab || "research");
+    renderHelperAgent();
+  });
 
-  await checkHealth();
   await loadTelegramStatus();
-  await refreshDashboard();
+  renderPageMode();
+  await Promise.all([refreshDashboard(), refreshStrategyControl()]);
 }
 
 init();
