@@ -430,8 +430,9 @@ class NaverReportRepository:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.path))
+        conn = sqlite3.connect(str(self.path), timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def _init_db(self) -> None:
@@ -770,10 +771,28 @@ class NaverReportRepository:
                     ),
                 )
             if isinstance(structured_facts, dict):
-                self.upsert_report_facts(report_id=report_id, facts=structured_facts)
+                self._upsert_report_facts_with_conn(
+                    conn=conn,
+                    report_id=report_id,
+                    facts=structured_facts,
+                )
             return report_id
 
     def upsert_report_facts(self, report_id: int, facts: dict[str, Any]) -> None:
+        with self._connect() as conn:
+            self._upsert_report_facts_with_conn(
+                conn=conn,
+                report_id=report_id,
+                facts=facts,
+            )
+
+    def _upsert_report_facts_with_conn(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        report_id: int,
+        facts: dict[str, Any],
+    ) -> None:
         rid = int(report_id)
         if rid <= 0:
             return
@@ -792,76 +811,73 @@ class NaverReportRepository:
         )
 
         now = utc_now_iso()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO report_facts (
-                    report_id,
-                    rating,
-                    target_price_value,
-                    target_price_currency,
-                    target_price_changed,
-                    valuation_method,
-                    valuation_value,
-                    valuation_basis,
-                    valuation_notes,
-                    summary_bullets_json,
-                    investment_thesis_json,
-                    risks_json,
-                    earnings_outlook_json,
-                    catalysts_json,
-                    evidence_quotes_json,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(report_id) DO UPDATE SET
-                    rating=excluded.rating,
-                    target_price_value=excluded.target_price_value,
-                    target_price_currency=excluded.target_price_currency,
-                    target_price_changed=excluded.target_price_changed,
-                    valuation_method=excluded.valuation_method,
-                    valuation_value=excluded.valuation_value,
-                    valuation_basis=excluded.valuation_basis,
-                    valuation_notes=excluded.valuation_notes,
-                    summary_bullets_json=excluded.summary_bullets_json,
-                    investment_thesis_json=excluded.investment_thesis_json,
-                    risks_json=excluded.risks_json,
-                    earnings_outlook_json=excluded.earnings_outlook_json,
-                    catalysts_json=excluded.catalysts_json,
-                    evidence_quotes_json=excluded.evidence_quotes_json,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    rid,
-                    str(facts.get("rating") or "UNKNOWN")[:24],
-                    _safe_non_negative_int(target.get("value")),
-                    str(target.get("currency") or "KRW")[:12],
-                    str(target.get("changed") or "UNKNOWN")[:24],
-                    str(valuation.get("method") or "UNKNOWN")[:24],
-                    valuation_value if valuation_value > 0 else None,
-                    str(valuation.get("basis") or "")[:32],
-                    str(valuation.get("notes") or "")[:400],
-                    json.dumps(
-                        list(facts.get("summary_bullets") or [])[:8], ensure_ascii=False
-                    ),
-                    json.dumps(
-                        list(facts.get("investment_thesis") or [])[:8],
-                        ensure_ascii=False,
-                    ),
-                    json.dumps(list(facts.get("risks") or [])[:8], ensure_ascii=False),
-                    json.dumps(
-                        list(facts.get("earnings_outlook") or [])[:8],
-                        ensure_ascii=False,
-                    ),
-                    json.dumps(
-                        list(facts.get("catalysts") or [])[:8], ensure_ascii=False
-                    ),
-                    json.dumps(
-                        list(facts.get("evidence_quotes") or [])[:12],
-                        ensure_ascii=False,
-                    ),
-                    now,
+        conn.execute(
+            """
+            INSERT INTO report_facts (
+                report_id,
+                rating,
+                target_price_value,
+                target_price_currency,
+                target_price_changed,
+                valuation_method,
+                valuation_value,
+                valuation_basis,
+                valuation_notes,
+                summary_bullets_json,
+                investment_thesis_json,
+                risks_json,
+                earnings_outlook_json,
+                catalysts_json,
+                evidence_quotes_json,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(report_id) DO UPDATE SET
+                rating=excluded.rating,
+                target_price_value=excluded.target_price_value,
+                target_price_currency=excluded.target_price_currency,
+                target_price_changed=excluded.target_price_changed,
+                valuation_method=excluded.valuation_method,
+                valuation_value=excluded.valuation_value,
+                valuation_basis=excluded.valuation_basis,
+                valuation_notes=excluded.valuation_notes,
+                summary_bullets_json=excluded.summary_bullets_json,
+                investment_thesis_json=excluded.investment_thesis_json,
+                risks_json=excluded.risks_json,
+                earnings_outlook_json=excluded.earnings_outlook_json,
+                catalysts_json=excluded.catalysts_json,
+                evidence_quotes_json=excluded.evidence_quotes_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                rid,
+                str(facts.get("rating") or "UNKNOWN")[:24],
+                _safe_non_negative_int(target.get("value")),
+                str(target.get("currency") or "KRW")[:12],
+                str(target.get("changed") or "UNKNOWN")[:24],
+                str(valuation.get("method") or "UNKNOWN")[:24],
+                valuation_value if valuation_value > 0 else None,
+                str(valuation.get("basis") or "")[:32],
+                str(valuation.get("notes") or "")[:400],
+                json.dumps(
+                    list(facts.get("summary_bullets") or [])[:8], ensure_ascii=False
                 ),
-            )
+                json.dumps(
+                    list(facts.get("investment_thesis") or [])[:8],
+                    ensure_ascii=False,
+                ),
+                json.dumps(list(facts.get("risks") or [])[:8], ensure_ascii=False),
+                json.dumps(
+                    list(facts.get("earnings_outlook") or [])[:8],
+                    ensure_ascii=False,
+                ),
+                json.dumps(list(facts.get("catalysts") or [])[:8], ensure_ascii=False),
+                json.dumps(
+                    list(facts.get("evidence_quotes") or [])[:12],
+                    ensure_ascii=False,
+                ),
+                now,
+            ),
+        )
 
     def get_report_facts(self, report_id: int) -> dict[str, Any] | None:
         rid = int(report_id)

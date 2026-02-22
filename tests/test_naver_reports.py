@@ -86,3 +86,48 @@ def test_is_research_detail_url_accepts_read_pages_only() -> None:
         "https://finance.naver.com/research/company_list.naver?page=1"
     )
     assert not _is_research_detail_url("https://finance.naver.com/research/")
+
+
+def test_naver_report_repository_upsert_with_structured_facts(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+
+    report_id = repo.upsert_report(
+        category="market_info",
+        source_url="https://finance.naver.com/research/market_info_list.naver",
+        detail_url="https://finance.naver.com/research/market_info_read.naver?nid=2",
+        pdf_url="https://stock.pstatic.net/stock-research/market/2.pdf",
+        pdf_sha256="def456",
+        pdf_archived_path=".runtime/naver_reports/pdfs/de/f4/def456.pdf",
+        title="코스피 시황",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2025-01-11",
+        crawled_at="2026-01-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="코스피 수급 흐름과 매크로 이벤트 점검",
+        chunk_size=200,
+        max_chunks_per_report=10,
+        structured_facts={
+            "rating": "BUY",
+            "target_price": {"value": 120000, "currency": "KRW", "changed": "UP"},
+            "summary_bullets": ["핵심 포인트"],
+            "investment_thesis": ["매크로 개선"],
+            "risks": ["변동성"],
+            "earnings_outlook": [],
+            "valuation": {
+                "method": "PER",
+                "value": 10.0,
+                "basis": "2026E",
+                "notes": "",
+            },
+            "catalysts": ["정책 모멘텀"],
+            "evidence_quotes": [{"page": 1, "tag": "summary", "text": "핵심"}],
+        },
+    )
+
+    facts = repo.get_report_facts(report_id)
+    assert facts is not None
+    assert facts.get("rating") == "BUY"
+    assert int((facts.get("target_price") or {}).get("value") or 0) == 120000

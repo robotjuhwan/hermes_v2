@@ -79,6 +79,39 @@ def test_freqtrade_process_manager_set_usdt_limit_override(tmp_path: Path) -> No
     assert payload["spot"] == 250.0
 
 
+def test_freqtrade_process_manager_preserves_existing_override_payload(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manager = _build_manager(tmp_path)
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    override_path = runtime_dir / "spot.override.json"
+    override_path.write_text(
+        json.dumps({"exchange": {"pair_whitelist": ["005930/KRW"]}}),
+        encoding="utf-8",
+    )
+
+    class DummyProc:
+        pid = 54321
+
+    calls: list[list[str]] = []
+
+    def fake_popen(*args, **kwargs):
+        calls.append(list(args[0]))
+        _ = kwargs
+        return DummyProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(manager, "_is_pid_alive", lambda pid: pid == 54321)
+
+    action = manager.start("spot")
+    assert action["action"] == "started"
+    assert calls
+    payload = json.loads(override_path.read_text(encoding="utf-8"))
+    assert payload.get("exchange", {}).get("pair_whitelist") == ["005930/KRW"]
+    assert payload.get("available_capital") == 100.0
+
+
 def test_freqtrade_process_manager_stop_running_process(
     monkeypatch, tmp_path: Path
 ) -> None:

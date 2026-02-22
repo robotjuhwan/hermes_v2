@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 from tradecraft.services.portfolio_coach import (
+    KISHoldingsProvider,
     PortfolioCoachConfig,
     PortfolioCoachService,
 )
@@ -433,3 +434,25 @@ def test_portfolio_coach_name_format_uses_company_name_first_label(
     payload = asyncio.run(service.build_advice())
     message = str(payload["message"])
     assert "UNKNOWN_NAME(033790)" in message
+
+
+def test_kis_holdings_provider_weight_uses_total_assets_with_cash() -> None:
+    class _KisBalance:
+        async def fetch_balance_assets(self) -> list[dict]:
+            return [
+                {"asset": "KRW", "kind": "cash", "value_krw": 100000},
+                {
+                    "asset": "033790",
+                    "asset_name": "피노",
+                    "kind": "position",
+                    "qty": 10,
+                    "avg_price": 10000,
+                    "value_krw": 100000,
+                },
+            ]
+
+    provider = KISHoldingsProvider(_KisBalance())
+    snapshot = asyncio.run(provider.get_snapshot("u1"))
+    positions = list(snapshot.get("positions") or [])
+    assert len(positions) == 1
+    assert positions[0].get("weight") == 0.5
