@@ -827,7 +827,8 @@ class KISHoldingsProvider:
             positions.append(position)
             total_position_value += market_value
 
-        denominator = total_position_value if total_position_value > 0 else 1.0
+        total_asset_value = total_position_value + max(cash, 0.0)
+        denominator = total_asset_value if total_asset_value > 0 else 1.0
         for row in positions:
             value = _safe_float(row.get("market_value"))
             row["weight"] = value / denominator if denominator > 0 else 0.0

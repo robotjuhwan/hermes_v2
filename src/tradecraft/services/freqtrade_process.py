@@ -129,6 +129,15 @@ class FreqtradeProcessManager:
         runtime_dir.mkdir(parents=True, exist_ok=True)
         log_path = self._log_path(bot.bot_id)
         usdt_limit = self.get_effective_usdt_limit(bot.bot_id)
+        override_path = self._override_config_path(bot.bot_id)
+        override_payload: dict[str, Any] = {}
+        if override_path.exists():
+            try:
+                loaded = json.loads(override_path.read_text(encoding="utf-8"))
+            except Exception:
+                loaded = {}
+            if isinstance(loaded, dict):
+                override_payload = loaded
 
         cmd = [
             str(executable),
@@ -137,9 +146,10 @@ class FreqtradeProcessManager:
             str(config_path),
         ]
         if usdt_limit is not None and usdt_limit > 0:
-            override_path = self._override_config_path(bot.bot_id)
+            override_payload["available_capital"] = usdt_limit
+        if override_payload:
             override_path.write_text(
-                json.dumps({"available_capital": usdt_limit}, ensure_ascii=True),
+                json.dumps(override_payload, ensure_ascii=True),
                 encoding="utf-8",
             )
             cmd.extend(["-c", str(override_path)])

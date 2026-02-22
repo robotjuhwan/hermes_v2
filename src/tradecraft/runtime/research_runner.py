@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
 from datetime import datetime, timedelta
 from datetime import date as date_type
+from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -13,6 +15,11 @@ import httpx
 
 from tradecraft.config import AppSettings
 from tradecraft.runtime.state_store import RuntimeStateStore, utc_now_iso
+from tradecraft.services.freqtrade import FreqtradeBotConfig
+from tradecraft.services.freqtrade_process import (
+    FreqtradeProcessManager,
+    FreqtradeProcessManagerConfig,
+)
 from tradecraft.services.kis import KISAdapter, KISConfig
 from tradecraft.services.portfolio_coach import (
     KISHoldingsProvider,
@@ -128,6 +135,13 @@ def _report_db_last_updated_at(repository: NaverReportRepository) -> str | None:
     except Exception:
         return None
     return str(status.get("last_updated_at") or "").strip()
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
 
 
 def _extract_pick_codes(snapshot: dict, limit: int = 6) -> list[str]:
@@ -345,6 +359,7 @@ def _sync_kis_trader_targets_from_morning_advice(
     scheduled_at: datetime,
     trader_state_path: str,
     max_symbols: int,
+    freqtrade_runtime_dir: str = "",
 ) -> list[str]:
     if str(label).strip() != "장전":
         return []
@@ -379,7 +394,142 @@ def _sync_kis_trader_targets_from_morning_advice(
         "%Y-%m-%d %H:%M KST"
     )
     store.write_snapshot(payload)
+
+    runtime_dir = str(freqtrade_runtime_dir or "").strip()
+    if runtime_dir:
+        override_path = Path(runtime_dir) / "kis.override.json"
+        override_payload: dict[str, Any] = {}
+        try:
+            if override_path.exists():
+                loaded = json.loads(override_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    override_payload = loaded
+        except Exception:
+            override_payload = {}
+
+        exchange_payload = override_payload.get("exchange")
+        if not isinstance(exchange_payload, dict):
+            exchange_payload = {}
+        exchange_payload["pair_whitelist"] = [f"{code}/KRW" for code in picks]
+        override_payload["exchange"] = exchange_payload
+        override_path.parent.mkdir(parents=True, exist_ok=True)
+        override_path.write_text(
+            json.dumps(override_payload, ensure_ascii=True),
+            encoding="utf-8",
+        )
     return picks
+
+
+def _extract_rebalance_target_weights_from_payload(
+    payload: dict[str, Any] | None,
+    *,
+    max_symbols: int,
+) -> dict[str, float]:
+    if not isinstance(payload, dict):
+        return {}
+    pack = payload.get("pack")
+    if not isinstance(pack, dict):
+        return {}
+    seed = pack.get("advice_seed_json")
+    if not isinstance(seed, dict):
+        return {}
+
+    model = seed.get("model_portfolio")
+    rows = []
+    if isinstance(model, dict):
+        rows = [
+            item for item in list(model.get("targets") or []) if isinstance(item, dict)
+        ]
+
+    if not rows:
+        action_plan = seed.get("action_plan")
+        if isinstance(action_plan, dict):
+            rows = [
+                item
+                for item in list(action_plan.get("rebalance_table_rows") or [])
+                if isinstance(item, dict)
+            ]
+
+    out: dict[str, float] = {}
+    for row in rows:
+        ticker = str(row.get("ticker") or "").strip()
+        if not re.fullmatch(r"\d{6}", ticker):
+            continue
+        target = _safe_float(row.get("target_weight"))
+        if target <= 0:
+            continue
+        out[ticker] = max(min(target, 1.0), 0.0)
+        if len(out) >= max(max_symbols, 1):
+            break
+    return out
+
+
+def _sync_kis_rebalance_targets_to_freqtrade_override(
+    *,
+    payload: dict[str, Any] | None,
+    runtime_dir: str,
+    max_symbols: int,
+) -> dict[str, float]:
+    targets = _extract_rebalance_target_weights_from_payload(
+        payload,
+        max_symbols=max_symbols,
+    )
+    if not targets:
+        return {}
+
+    path = str(runtime_dir or "").strip()
+    if not path:
+        return {}
+
+    override_path = Path(path) / "kis.override.json"
+    override_payload: dict[str, Any] = {}
+    try:
+        if override_path.exists():
+            loaded = json.loads(override_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                override_payload = loaded
+    except Exception:
+        override_payload = {}
+
+    override_payload["tradecraft_target_weights"] = {
+        ticker: round(weight, 6) for ticker, weight in targets.items()
+    }
+    override_payload["tradecraft_target_weights_updated_at"] = utc_now_iso()
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.write_text(
+        json.dumps(override_payload, ensure_ascii=True),
+        encoding="utf-8",
+    )
+    return targets
+
+
+def _restart_kis_freqtrade_if_running(settings: AppSettings) -> dict[str, Any]:
+    manager = FreqtradeProcessManager(
+        FreqtradeProcessManagerConfig(
+            executable_path=settings.freqtrade_executable_path,
+            workdir=settings.freqtrade_workdir,
+            runtime_dir=settings.freqtrade_runtime_dir,
+            stop_timeout_sec=settings.freqtrade_stop_timeout_sec,
+        ),
+        bots=[
+            FreqtradeBotConfig(
+                bot_id="kis",
+                label="Freqtrade KIS",
+                config_path="third_party/freqtrade/user_data/config_kis_jurobot.json",
+            )
+        ],
+    )
+    status = manager.list_statuses()[0]
+    if not bool(status.get("running")):
+        return {"status": "skipped", "reason": "kis_bot_not_running"}
+    stop_action = manager.stop("kis")
+    start_action = manager.start("kis")
+    return {
+        "status": "ok",
+        "stop_action": stop_action.get("action"),
+        "start_action": start_action.get("action"),
+        "pid": start_action.get("pid"),
+    }
 
 
 def run() -> None:
@@ -550,7 +700,9 @@ def run() -> None:
                             reason,
                         )
                         if status == "pending_review":
-                            message = ""
+                            logger.info(
+                                "portfolio coach pending_review auto-approved for scheduled send"
+                            )
                     if not message:
                         pick_name_map = _resolve_pick_name_map(
                             snapshot=snapshot,
@@ -570,6 +722,8 @@ def run() -> None:
                     if message:
                         sent = asyncio.run(telegram.send_message(message))
                         sent_ok = bool(sent.get("ok"))
+                        did_symbol_sync = False
+                        rebalance_targets: dict[str, float] = {}
                         if sent_ok:
                             synced = _sync_kis_trader_targets_from_morning_advice(
                                 snapshot=snapshot,
@@ -577,11 +731,42 @@ def run() -> None:
                                 scheduled_at=next_advice_at,
                                 trader_state_path=settings.kis_trader_state_path,
                                 max_symbols=settings.kis_trader_max_candidate_codes,
+                                freqtrade_runtime_dir=settings.freqtrade_runtime_dir,
                             )
                             if synced:
+                                did_symbol_sync = True
                                 logger.info(
                                     "kis trader target symbols synced from morning advice: %s",
                                     ",".join(synced),
+                                )
+                            rebalance_targets = (
+                                _sync_kis_rebalance_targets_to_freqtrade_override(
+                                    payload=payload,
+                                    runtime_dir=settings.freqtrade_runtime_dir,
+                                    max_symbols=settings.kis_trader_max_candidate_codes,
+                                )
+                            )
+                            if rebalance_targets:
+                                logger.info(
+                                    "kis rebalance targets synced: %s",
+                                    ",".join(
+                                        f"{ticker}:{weight:.3f}"
+                                        for ticker, weight in rebalance_targets.items()
+                                    ),
+                                )
+                        if sent_ok and (did_symbol_sync or rebalance_targets):
+                            try:
+                                restart_result = _restart_kis_freqtrade_if_running(
+                                    settings
+                                )
+                                logger.info(
+                                    "kis freqtrade refresh after target sync: %s",
+                                    restart_result,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "kis freqtrade refresh after target sync failed: %s",
+                                    exc,
                                 )
                         if portfolio_coach is not None and payload is not None:
                             portfolio_coach.mark_sent(
