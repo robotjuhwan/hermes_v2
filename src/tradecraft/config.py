@@ -190,6 +190,10 @@ class AppSettings(BaseSettings):
         default="",
         alias="TRADECRAFT_PORTFOLIO_COACH_FACTOR_WEIGHTS_JSON",
     )
+    portfolio_coach_ticker_name_map_json: str = Field(
+        default="",
+        alias="TRADECRAFT_PORTFOLIO_COACH_TICKER_NAME_MAP_JSON",
+    )
     portfolio_coach_review_queue_enabled: bool = Field(
         default=True,
         alias="TRADECRAFT_PORTFOLIO_COACH_REVIEW_QUEUE_ENABLED",

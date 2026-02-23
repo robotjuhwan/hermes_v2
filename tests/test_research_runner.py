@@ -263,3 +263,61 @@ def test_sync_kis_rebalance_targets_to_freqtrade_override(tmp_path) -> None:
         "005930": 0.2,
         "000660": 0.15,
     }
+    assert saved.get("exchange", {}).get("pair_whitelist") == [
+        "005930/KRW",
+        "000660/KRW",
+    ]
+
+
+def test_sync_kis_rebalance_targets_to_freqtrade_override_adds_snapshot_picks(
+    tmp_path,
+) -> None:
+    runtime_dir = tmp_path / "freqtrade"
+    out = _sync_kis_rebalance_targets_to_freqtrade_override(
+        payload={
+            "pack": {
+                "advice_seed_json": {
+                    "model_portfolio": {
+                        "targets": [
+                            {"ticker": "005930", "target_weight": 0.2},
+                        ]
+                    }
+                }
+            }
+        },
+        snapshot={
+            "items": [
+                {"picks": ["005930", "000660", "012450"]},
+            ]
+        },
+        runtime_dir=str(runtime_dir),
+        max_symbols=6,
+    )
+    saved = json.loads((runtime_dir / "kis.override.json").read_text(encoding="utf-8"))
+    assert out.get("005930") == 0.2
+    assert out.get("000660") == 0.08
+    assert out.get("012450") == 0.08
+    assert saved.get("exchange", {}).get("pair_whitelist") == [
+        "005930/KRW",
+        "000660/KRW",
+        "012450/KRW",
+    ]
+
+
+def test_sync_kis_rebalance_targets_to_freqtrade_override_uses_snapshot_when_no_targets(
+    tmp_path,
+) -> None:
+    runtime_dir = tmp_path / "freqtrade"
+    out = _sync_kis_rebalance_targets_to_freqtrade_override(
+        payload={"pack": {"advice_seed_json": {"model_portfolio": {"targets": []}}}},
+        snapshot={
+            "items": [
+                {"picks": ["005930", "000660"]},
+            ]
+        },
+        runtime_dir=str(runtime_dir),
+        max_symbols=6,
+    )
+    saved = json.loads((runtime_dir / "kis.override.json").read_text(encoding="utf-8"))
+    assert out == {"005930": 0.5, "000660": 0.5}
+    assert saved.get("tradecraft_target_weights") == {"005930": 0.5, "000660": 0.5}

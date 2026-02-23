@@ -467,6 +467,7 @@ def _extract_rebalance_target_weights_from_payload(
 def _sync_kis_rebalance_targets_to_freqtrade_override(
     *,
     payload: dict[str, Any] | None,
+    snapshot: dict[str, Any] | None = None,
     runtime_dir: str,
     max_symbols: int,
 ) -> dict[str, float]:
@@ -474,6 +475,33 @@ def _sync_kis_rebalance_targets_to_freqtrade_override(
         payload,
         max_symbols=max_symbols,
     )
+
+    pick_limit = max(max_symbols, 1)
+    if isinstance(snapshot, dict):
+        pick_codes = _extract_pick_codes(snapshot, limit=pick_limit)
+        if pick_codes:
+            missing = [code for code in pick_codes if code not in targets]
+            if missing:
+                if targets:
+                    base_weight = min(max(min(targets.values()) * 0.5, 0.03), 0.08)
+                    for code in missing:
+                        targets[code] = base_weight
+                else:
+                    equal_weight = 1.0 / float(len(missing))
+                    for code in missing:
+                        targets[code] = equal_weight
+
+    if targets:
+        sorted_targets = sorted(targets.items(), key=lambda item: item[1], reverse=True)
+        targets = dict(sorted_targets[:pick_limit])
+        total_weight = sum(float(weight) for weight in targets.values())
+        if total_weight > 1.0:
+            scale = 1.0 / total_weight
+            targets = {
+                ticker: round(float(weight) * scale, 6)
+                for ticker, weight in targets.items()
+            }
+
     if not targets:
         return {}
 
@@ -495,6 +523,20 @@ def _sync_kis_rebalance_targets_to_freqtrade_override(
         ticker: round(weight, 6) for ticker, weight in targets.items()
     }
     override_payload["tradecraft_target_weights_updated_at"] = utc_now_iso()
+
+    exchange_payload = override_payload.get("exchange")
+    if not isinstance(exchange_payload, dict):
+        exchange_payload = {}
+    target_pairs = [f"{ticker}/KRW" for ticker in targets.keys()]
+    existing_pairs = [
+        str(pair).strip()
+        for pair in list(exchange_payload.get("pair_whitelist") or [])
+        if str(pair).strip()
+    ]
+    merged_pairs = list(dict.fromkeys(target_pairs + existing_pairs))
+    exchange_payload["pair_whitelist"] = merged_pairs[:pick_limit]
+    override_payload["exchange"] = exchange_payload
+
     override_path.parent.mkdir(parents=True, exist_ok=True)
     override_path.write_text(
         json.dumps(override_payload, ensure_ascii=True),
@@ -576,6 +618,7 @@ def run() -> None:
                 risk_budget=settings.portfolio_coach_risk_budget,
                 idea_filters=settings.portfolio_coach_idea_filters,
                 factor_weights_json=settings.portfolio_coach_factor_weights_json,
+                ticker_name_map_json=settings.portfolio_coach_ticker_name_map_json,
                 review_queue_enabled=settings.portfolio_coach_review_queue_enabled,
                 llm_bridge_command=settings.llm_bridge_command,
                 llm_bridge_args=settings.llm_bridge_args,
@@ -742,6 +785,7 @@ def run() -> None:
                             rebalance_targets = (
                                 _sync_kis_rebalance_targets_to_freqtrade_override(
                                     payload=payload,
+                                    snapshot=snapshot,
                                     runtime_dir=settings.freqtrade_runtime_dir,
                                     max_symbols=settings.kis_trader_max_candidate_codes,
                                 )

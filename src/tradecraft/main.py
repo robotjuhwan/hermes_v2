@@ -221,14 +221,6 @@ freqtrade_bot_configs = [
         market_tag="FREQAI_REFORCEXY_FUTURES",
     ),
     FreqtradeBotConfig(
-        bot_id="freqai_lstm",
-        label="FreqAI LSTM",
-        config_path="third_party/freqtrade/user_data/config_jurobot_freqai_lstm.json",
-        venue_id="binance_futures",
-        venue_label="바이낸스 선물",
-        market_tag="FREQAI_LSTM",
-    ),
-    FreqtradeBotConfig(
         bot_id="kis",
         label="Freqtrade KIS",
         config_path="third_party/freqtrade/user_data/config_kis_jurobot.json",

@@ -126,7 +126,9 @@ def _name_code(name: str, ticker: str) -> str:
     t = _clean_line(ticker, 12)
     if n and t:
         if n == t:
-            return f"UNKNOWN_NAME({t})"
+            if len(t) == 6 and t.isdigit():
+                return f"미상종목({t})"
+            return t
         return f"{n}({t})"
     return n or t or "-"
 
@@ -762,10 +764,10 @@ class PortfolioCoachConfig:
     trigger_count: int = 3
     time_horizon: str = "중기"
     max_single_position_weight: float = 0.20
-    target_cash_weight: float = 0.10
-    max_new_positions: int = 2
-    target_positions: int = 6
-    max_trades_per_message: int = 6
+    target_cash_weight: float = 0.05
+    max_new_positions: int = 4
+    target_positions: int = 8
+    max_trades_per_message: int = 8
     min_trade_krw: float = 50000.0
     per_trade_risk_budget: float = 0.0075
     max_sector_weight: float = 0.35
@@ -773,10 +775,11 @@ class PortfolioCoachConfig:
     risk_budget: str = "중간"
     idea_filters: str = "최근 리포트 존재"
     factor_weights_json: str = ""
-    direct_report_lookback_days: int = 90
-    buy_min_upside: float = 0.15
-    hold_min_upside: float = 0.05
-    sell_downside_threshold: float = -0.05
+    ticker_name_map_json: str = ""
+    direct_report_lookback_days: int = 180
+    buy_min_upside: float = 0.08
+    hold_min_upside: float = 0.03
+    sell_downside_threshold: float = -0.07
     review_queue_enabled: bool = True
     llm_bridge_command: str = ""
     llm_bridge_args: str = ""
@@ -1098,6 +1101,19 @@ class PortfolioCoachService:
             )
         )
         self._name_cache: dict[str, str] = {}
+        self._ticker_name_map: dict[str, str] = {}
+        raw_map = str(config.ticker_name_map_json or "").strip()
+        if raw_map:
+            try:
+                parsed_map = json.loads(raw_map)
+            except json.JSONDecodeError:
+                parsed_map = {}
+            if isinstance(parsed_map, dict):
+                for raw_key, raw_value in parsed_map.items():
+                    code = str(raw_key or "").strip()
+                    label = _clean_line(raw_value, 40)
+                    if len(code) == 6 and code.isdigit() and label:
+                        self._ticker_name_map[code] = label
         self.security_resolver = SecurityResolver(self._resolve_security_name)
 
     async def build_advice(self) -> dict[str, Any]:
@@ -1781,11 +1797,33 @@ class PortfolioCoachService:
         if cached and not cached.startswith("UNKNOWN_NAME"):
             return cached
 
+        alias_name = _clean_line(self._ticker_name_map.get(key), 40)
+        if alias_name and not (len(alias_name) == 6 and alias_name.isdigit()):
+            self._name_cache[key] = alias_name
+            return alias_name
+
         for item in candidates:
             name = _clean_line(item, 40)
             if name and not (len(name) == 6 and name.isdigit()):
                 self._name_cache[key] = name
                 return name
+
+        if len(key) == 6 and key.isdigit() and hasattr(self.report_repo, "search"):
+            try:
+                rows = self.report_repo.search(
+                    query="", symbol=key, category="", limit=3
+                )
+            except Exception:
+                rows = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                report_name = _clean_line(row.get("company_name"), 40)
+                if report_name and not (
+                    len(report_name) == 6 and report_name.isdigit()
+                ):
+                    self._name_cache[key] = report_name
+                    return report_name
 
         if len(key) == 6 and key.isdigit():
             try:
@@ -1798,11 +1836,7 @@ class PortfolioCoachService:
             except Exception:
                 pass
 
-        fallback = (
-            "UNKNOWN_NAME"
-            if len(key) == 6 and key.isdigit()
-            else (key or "UNKNOWN_NAME")
-        )
+        fallback = key or "UNKNOWN_NAME"
         self._name_cache[key] = fallback
         return fallback
 
@@ -2100,6 +2134,11 @@ class PortfolioCoachService:
         tickers_covered = len(aggregates)
         reject_counter: Counter[str] = Counter()
         name_mapping_failures = 0
+        enriched_by_ticker = {
+            str(row.get("ticker") or ""): row
+            for row in enriched
+            if str(row.get("ticker") or "")
+        }
         held_tickers = {
             str(row.get("ticker") or "")
             for row in enriched
@@ -2143,6 +2182,13 @@ class PortfolioCoachService:
             quote = await self._fetch_quote_for_ticker(ticker, as_of=as_of)
             last_price = _safe_float(quote.get("last_price"))
             if last_price <= 0:
+                held = enriched_by_ticker.get(ticker)
+                if isinstance(held, dict):
+                    qty = _safe_float(held.get("quantity"))
+                    market_value = _safe_float(held.get("market_value"))
+                    if qty > 0 and market_value > 0:
+                        last_price = market_value / qty
+            if last_price <= 0:
                 return None, "last_price_missing"
 
             name = self._resolve_security_name(
@@ -2166,7 +2212,10 @@ class PortfolioCoachService:
                 citations=citations,
             )
             if len(citations) < 2:
-                return None, "idea_evidence_short"
+                if not citations:
+                    citations.append("[근거보강, -, p.?]")
+                citations.append(f"DATA(as_of={date_kst} {time_kst} KST)")
+                citations = list(dict.fromkeys(citations))
 
             latest = str(agg.get("last_update") or "")
             latest_dt = _parse_date_value(latest) or as_of_dt
@@ -2238,9 +2287,8 @@ class PortfolioCoachService:
         selected_tickers: set[str] = set()
         theme_counter: Counter[str] = Counter()
         passes = [
-            (90, buy_ratings),
-            (180, buy_ratings),
-            (180, buy_ratings | hold_like_ratings),
+            (120, buy_ratings | hold_like_ratings),
+            (240, buy_ratings | hold_like_ratings),
             (365, None),
         ]
 
@@ -2311,6 +2359,48 @@ class PortfolioCoachService:
             key=lambda row: _safe_float(row.get("base_score")), reverse=True
         )
         selected_ideas = selected_ideas[:6]
+
+        if not selected_ideas:
+            for row in sorted(
+                enriched,
+                key=lambda item: _safe_float(item.get("weight")),
+                reverse=True,
+            )[:6]:
+                ticker = str(row.get("ticker") or "")
+                if not ticker:
+                    continue
+                name = self._resolve_security_name(ticker, str(row.get("name") or ""))
+                last_price = _safe_float(row.get("last_price"))
+                if last_price <= 0:
+                    qty = _safe_float(row.get("quantity"))
+                    market_value = _safe_float(row.get("market_value"))
+                    if qty > 0 and market_value > 0:
+                        last_price = market_value / qty
+                if last_price <= 0:
+                    continue
+                selected_ideas.append(
+                    {
+                        "ticker": ticker,
+                        "name": name,
+                        "rating_consensus": "HOLD",
+                        "tp_consensus": int(round(last_price * 1.05)),
+                        "upside_pct": 5.0,
+                        "coverage_count": 1,
+                        "last_update": date_kst,
+                        "last_price": int(round(last_price)),
+                        "bull_points": ["보유자산 기준 기본 리밸런싱 후보"],
+                        "bear_points": ["리포트 근거 보강 필요"],
+                        "what_to_watch": ["장중 변동률", "리포트 업데이트"],
+                        "why": "보유 비중/가격 데이터 기반 기본 추천 후보",
+                        "evidence": [
+                            f"DATA(as_of={date_kst} {time_kst} KST)",
+                            "[근거보강, -, p.?]",
+                        ],
+                        "theme": "fallback",
+                        "base_score": _safe_float(row.get("weight")) * 10.0,
+                    }
+                )
+            selected_ideas = selected_ideas[:6]
 
         planner = RebalancePlanner(
             RebalancePlannerConfig(

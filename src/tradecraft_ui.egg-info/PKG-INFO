@@ -9,22 +9,24 @@ Requires-Dist: uvicorn[standard]>=0.30.0
 Requires-Dist: pydantic>=2.8.0
 Requires-Dist: pydantic-settings>=2.4.0
 Requires-Dist: httpx>=0.27.0
+Requires-Dist: pypdf>=5.0.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.2.0; extra == "dev"
 Requires-Dist: ruff>=0.5.0; extra == "dev"
 
-# TradeCraft UI (Restart)
+# TradeCraft Control Plane
 
-트레이딩 봇 재시작용 첫 단계 프로젝트입니다.
+Freqtrade 기반 자동매매를 모니터링/제어하기 위한 Control Plane 프로젝트입니다.
 
 - 웹 UI 우선: 반응형(PC/모바일)
 - 거래소/시장 탭: 전체, 업비트, 바이낸스, 국장, 미장 잔고 조회
 - 전체 자산 총합 + 탭별 자산/현금/평가손익 요약
 - 자산 상세: 계좌현금(KRW/USDT/USD)과 보유 포지션을 단일 테이블로 통합
-- 봇 세션 패널: 단기 세션 + 중/장기 밸런스 세션 상태 모니터링
+- 봇 세션 패널: Freqtrade Spot/Futures 오픈 포지션 + 런타임 세션 상태 모니터링
 - 단기 세션 지표: 실현/미실현/수수료/순손익(실시간) 분리 표시
 - 밸런스 세션 원칙: 드리프트, 턴오버, 벤치마크, 트래킹에러, 리밸런스 기준 표시
 - Telegram API 브릿지: 상태 조회 + webhook 수신 + getUpdates 폴링
+- Freqtrade API 브릿지: Spot/Futures 오픈 포지션/PNL/세션 연동
 - Upbit API 연동(초기): 키 설정 시 대시보드 업비트 잔고 실조회
 - Telegram CLI:
   - `/help`
@@ -34,7 +36,7 @@ Requires-Dist: ruff>=0.5.0; extra == "dev"
   - `/upbit` `/binance` `/krx` `/kr2` `/us`
   - `/sessions`
   - `/session <id>`
-- Control Plane(UI + Telegram) / Bot Runtime 분리 구조
+- Tradecraft는 UI/제어 계층, 자동매매 실행은 외부 Freqtrade 인스턴스가 담당
 - 백엔드: FastAPI
 
 Telegram 설정은 UI에서 변경하지 않고 `.env`로만 관리합니다.
@@ -48,25 +50,31 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-Control Plane(UI + Telegram):
+Tradecraft Control Plane(UI + Telegram + Integrations):
 
 ```bash
 tradecraft-control
 ```
 
-Bot Runtime(매매 모듈, 별도 프로세스):
+KRX 리서치 스케줄러(Codex CLI + 리포트 URL 수집):
 
 ```bash
-python -m tradecraft.runtime.runner
+tradecraft-research
 ```
 
-Backtest Runtime(가상시간 가속, 별도 프로세스):
+KIS LLM 트레이더 러너(리서치 기반 종목선정 + 주문 실행):
 
 ```bash
-tradecraft-backtest --cycles 1440 --speed 240
+tradecraft-kis-trader
 ```
 
-웹 UI에서 `백테스트 랩` 탭으로 시나리오 실행/진행률/PNL 곡선을 실시간으로 확인할 수 있습니다.
+네이버 증권 리포트 크롤러(DB 저장):
+
+```bash
+tradecraft-naver-reports
+```
+
+Freqtrade Spot/Futures는 외부 프로세스로 실행되며, Tradecraft에서 `/api/freqtrade/strategies` 제어 API를 통해 전략 시작/중지/상태 확인이 가능합니다.
 
 브라우저에서 [http://127.0.0.1:8000](http://127.0.0.1:8000) 접속.
 
@@ -89,6 +97,22 @@ tradecraft-backtest --cycles 1440 --speed 240
 - `BINANCE_FUTURES_API_SECRET`
 - `BINANCE_FUTURES_BASE_URL`
 - `BINANCE_USDT_KRW`
+- `USD_KRW`
+- `FX_CACHE_TTL_SEC`
+- `FREQTRADE_SPOT_API_URL`
+- `FREQTRADE_SPOT_USERNAME`
+- `FREQTRADE_SPOT_PASSWORD`
+- `FREQTRADE_SPOT_CONFIG_PATH`
+- `FREQTRADE_FUTURES_API_URL`
+- `FREQTRADE_FUTURES_USERNAME`
+- `FREQTRADE_FUTURES_PASSWORD`
+- `FREQTRADE_FUTURES_CONFIG_PATH`
+- `FREQTRADE_BOT_API_URLS`
+- `FREQTRADE_EXECUTABLE_PATH`
+- `FREQTRADE_WORKDIR`
+- `FREQTRADE_RUNTIME_DIR`
+- `FREQTRADE_STOP_TIMEOUT_SEC`
+- `FREQTRADE_TIMEOUT_SEC`
 - `KIS_BASE_URL`
 - `KIS_PRIMARY_APP_KEY`
 - `KIS_PRIMARY_APP_SECRET`
@@ -102,22 +126,52 @@ tradecraft-backtest --cycles 1440 --speed 240
 - `TRADECRAFT_RUNTIME_SESSIONS_PATH`
 - `TRADECRAFT_RUNTIME_MAX_AGE_SEC`
 - `TRADECRAFT_RUNTIME_WRITE_INTERVAL_SEC`
-- `TRADECRAFT_BACKTEST_RESULT_PATH`
-- `TRADECRAFT_BACKTEST_CYCLES`
-- `TRADECRAFT_BACKTEST_STEP_SEC`
-- `TRADECRAFT_BACKTEST_SPEED`
-- `TRADECRAFT_BACKTEST_INITIAL_PRICE`
-- `TRADECRAFT_BACKTEST_VOLATILITY_BPS`
-- `TRADECRAFT_BACKTEST_DRIFT_BPS`
-- `TRADECRAFT_BACKTEST_FEE_RATE`
-- `TRADECRAFT_BACKTEST_SLIPPAGE_BPS`
-- `TRADECRAFT_BACKTEST_SEED`
-- `TRADECRAFT_BACKTEST_LIVE_STATE_PATH`
-- `TRADECRAFT_BACKTEST_LIVE_EMIT_INTERVAL`
-- `TRADECRAFT_BACKTEST_LIVE_MAX_CURVE_POINTS`
+- `TRADECRAFT_RESEARCH_STATE_PATH`
+- `TRADECRAFT_RESEARCH_MAX_AGE_SEC`
+- `TRADECRAFT_RESEARCH_ENABLED`
+- `TRADECRAFT_RESEARCH_RUN_INTERVAL_SEC`
+- `TRADECRAFT_RESEARCH_MAX_ITEMS`
+- `TRADECRAFT_RESEARCH_MARKET_SCOPE`
+- `TRADECRAFT_RESEARCH_CODEX_COMMAND`
+- `TRADECRAFT_RESEARCH_CODEX_QUERY`
+- `TRADECRAFT_RESEARCH_CODEX_TIMEOUT_SEC`
+- `TRADECRAFT_RESEARCH_REPORT_URLS`
+- `TRADECRAFT_RESEARCH_STRATEGY_MD_PATH`
+- `TRADECRAFT_KIS_TRADER_ENABLED`
+- `TRADECRAFT_KIS_TRADER_STATE_PATH`
+- `TRADECRAFT_KIS_TRADER_INTERVAL_SEC`
+- `TRADECRAFT_KIS_TRADER_LLM_COMMAND`
+- `TRADECRAFT_KIS_TRADER_PERSONA`
+- `TRADECRAFT_KIS_TRADER_MAX_ORDERS_PER_CYCLE`
+- `TRADECRAFT_KIS_TRADER_MAX_BUDGET_PER_ORDER_KRW`
+- `TRADECRAFT_KIS_TRADER_MIN_CONFIDENCE`
+- `TRADECRAFT_KIS_TRADER_DEFAULT_ORDER_TYPE`
+- `TRADECRAFT_KIS_TRADER_ALLOW_SELL`
+- `TRADECRAFT_KIS_TRADER_MAX_CANDIDATE_CODES`
+- `TRADECRAFT_KIS_TRADER_REPORT_CONTEXT_TOP_K`
+- `TRADECRAFT_NAVER_REPORTS_ENABLED`
+- `TRADECRAFT_NAVER_REPORTS_DB_PATH`
+- `TRADECRAFT_NAVER_REPORTS_SEED_URL`
+- `TRADECRAFT_NAVER_REPORTS_SEED_URLS`
+- `TRADECRAFT_NAVER_REPORTS_INTERVAL_SEC`
+- `TRADECRAFT_NAVER_REPORTS_MAX_PAGES`
+- `TRADECRAFT_NAVER_REPORTS_SINCE_DATE`
+- `TRADECRAFT_NAVER_REPORTS_REQUEST_DELAY_SEC`
+- `TRADECRAFT_RAG_ENABLED`
+- `TRADECRAFT_RAG_PERSIST_PATH`
+- `TRADECRAFT_RAG_COLLECTION_NAME`
+- `TRADECRAFT_RAG_SYNC_CHUNK_LIMIT`
+- `TRADECRAFT_RAG_QUERY_TOP_K`
 - `TRADECRAFT_HOST`
 - `TRADECRAFT_PORT`
 - `TRADECRAFT_ALLOW_ORIGINS`
+
+RAG is optional. If `chromadb` is not installed, RAG endpoints stay available but return `available=false`.
+
+운영 기준:
+- 자동매매 세션/오픈 포지션 연동은 `FREQTRADE_*` 설정을 사용합니다.
+- 전략별 포트 분리가 필요하면 `FREQTRADE_BOT_API_URLS`(`bot_id=url,bot_id=url`)로 봇별 API URL을 지정할 수 있습니다.
+- `TRADECRAFT_RUNTIME_*`는 로컬 런타임 스냅샷 호환용(옵션)입니다.
 
 ## Reference Docs
 
@@ -130,15 +184,28 @@ tradecraft-backtest --cycles 1440 --speed 240
 - `GET /api/dashboard`
 - `GET /api/telegram/status`
 - `POST /api/telegram/webhook`
-- `GET /api/backtest/scenarios`
-- `GET /api/backtest/data-status`
-- `GET /api/backtest/status`
-- `POST /api/backtest/start`
-- `POST /api/backtest/stop`
+- `GET /api/freqtrade/strategies`
+- `POST /api/freqtrade/strategies/start-all`
+- `POST /api/freqtrade/strategies/stop-all`
+- `POST /api/freqtrade/strategies/{bot_id}/start`
+- `POST /api/freqtrade/strategies/{bot_id}/stop`
+- `POST /api/freqtrade/strategies/{bot_id}/usdt-limit`
+- `GET /api/kis/trader/status`
+- `POST /api/kis/trader/run-once`
+- `GET /api/reports/status`
+- `POST /api/reports/crawl-once`
+- `GET /api/reports/search`
+- `GET /api/rag/status`
+- `POST /api/rag/sync`
+- `GET /api/rag/search`
 
 웹훅 URL이 비어 있어도 서버가 `getUpdates` 폴링으로 명령을 처리합니다.
 
 Upbit 키가 설정되면 `GET /api/dashboard`의 업비트 자산이 실계정 잔고로 대체됩니다.
+
+Freqtrade Spot/Futures API 정보가 설정되면 `GET /api/dashboard`의 세션 목록에 Freqtrade 오픈 포지션이 반영됩니다.
+
+전략 중지 API는 정지 전에 해당 봇의 `/forceexit all`을 호출해 오픈 포지션 정리를 시도한 후 프로세스를 중지합니다.
 
 `POST /api/telegram/webhook`로 들어온 텔레그램 명령어는 아래를 지원합니다.
 

@@ -433,7 +433,7 @@ def test_portfolio_coach_name_format_uses_company_name_first_label(
 
     payload = asyncio.run(service.build_advice())
     message = str(payload["message"])
-    assert "UNKNOWN_NAME(033790)" in message
+    assert "033790" in message
 
 
 def test_kis_holdings_provider_weight_uses_total_assets_with_cash() -> None:
