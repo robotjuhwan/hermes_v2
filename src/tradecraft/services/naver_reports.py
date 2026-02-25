@@ -18,6 +18,20 @@ from tradecraft.runtime.state_store import utc_now_iso
 from tradecraft.services.llm_bridge import LLMBridge, LLMBridgeConfig
 
 
+def _is_six_digit_symbol(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(re.fullmatch(r"\d{6}", text))
+
+
+def _clean_company_name(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    if _is_six_digit_symbol(text):
+        return ""
+    return text[:80]
+
+
 def _to_text(raw: str) -> str:
     text = re.sub(r"<script[\s\S]*?</script>", " ", raw, flags=re.IGNORECASE)
     text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
@@ -504,6 +518,24 @@ class NaverReportRepository:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_reports_symbol_date ON reports(symbol, published_at)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS symbol_directory (
+                    symbol TEXT PRIMARY KEY,
+                    company_name TEXT NOT NULL,
+                    market TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    source TEXT NOT NULL DEFAULT 'unknown',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    first_seen_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_verified_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbol_directory_name ON symbol_directory(company_name)"
+            )
             self._ensure_column(
                 conn=conn,
                 table="reports",
@@ -577,6 +609,48 @@ class NaverReportRepository:
                 table="report_chunks",
                 column="section_title",
                 definition="TEXT NOT NULL DEFAULT 'unknown'",
+            )
+            self._ensure_column(
+                conn=conn,
+                table="symbol_directory",
+                column="market",
+                definition="TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                conn=conn,
+                table="symbol_directory",
+                column="status",
+                definition="TEXT NOT NULL DEFAULT 'active'",
+            )
+            self._ensure_column(
+                conn=conn,
+                table="symbol_directory",
+                column="source",
+                definition="TEXT NOT NULL DEFAULT 'unknown'",
+            )
+            self._ensure_column(
+                conn=conn,
+                table="symbol_directory",
+                column="confidence",
+                definition="REAL NOT NULL DEFAULT 1.0",
+            )
+            self._ensure_column(
+                conn=conn,
+                table="symbol_directory",
+                column="first_seen_at",
+                definition="TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                conn=conn,
+                table="symbol_directory",
+                column="updated_at",
+                definition="TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                conn=conn,
+                table="symbol_directory",
+                column="last_verified_at",
+                definition="TEXT NOT NULL DEFAULT ''",
             )
 
     @staticmethod
@@ -750,6 +824,17 @@ class NaverReportRepository:
                     "DELETE FROM report_chunks WHERE report_id = ?", (report_id,)
                 )
 
+            self._upsert_symbol_directory_with_conn(
+                conn=conn,
+                symbol=symbol,
+                company_name=company_name,
+                market="",
+                source="naver_reports",
+                confidence=0.8,
+                status="active",
+                verified_at=now,
+            )
+
             for idx, row_payload in enumerate(chunk_rows):
                 chunk_text = str(row_payload.get("content") or "").strip()
                 if not chunk_text:
@@ -777,6 +862,221 @@ class NaverReportRepository:
                     facts=structured_facts,
                 )
             return report_id
+
+    def _upsert_symbol_directory_with_conn(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        symbol: str,
+        company_name: str,
+        market: str,
+        source: str,
+        confidence: float,
+        status: str,
+        verified_at: str,
+    ) -> None:
+        code = str(symbol or "").strip()
+        name = _clean_company_name(company_name)
+        if not _is_six_digit_symbol(code) or not name:
+            return
+        now = str(verified_at or utc_now_iso())
+        conn.execute(
+            """
+            INSERT INTO symbol_directory(
+                symbol,
+                company_name,
+                market,
+                status,
+                source,
+                confidence,
+                first_seen_at,
+                updated_at,
+                last_verified_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                company_name=CASE
+                    WHEN excluded.company_name <> '' THEN excluded.company_name
+                    ELSE symbol_directory.company_name
+                END,
+                market=CASE
+                    WHEN excluded.market <> '' THEN excluded.market
+                    ELSE symbol_directory.market
+                END,
+                status=CASE
+                    WHEN excluded.status <> '' THEN excluded.status
+                    ELSE symbol_directory.status
+                END,
+                source=CASE
+                    WHEN excluded.source <> '' THEN excluded.source
+                    ELSE symbol_directory.source
+                END,
+                confidence=CASE
+                    WHEN excluded.confidence > symbol_directory.confidence
+                        THEN excluded.confidence
+                    ELSE symbol_directory.confidence
+                END,
+                updated_at=excluded.updated_at,
+                last_verified_at=excluded.last_verified_at
+            """,
+            (
+                code,
+                name,
+                str(market or "").strip()[:24],
+                str(status or "active").strip()[:24],
+                str(source or "unknown").strip()[:40],
+                max(min(float(confidence), 1.0), 0.0),
+                now,
+                now,
+                now,
+            ),
+        )
+
+    def upsert_symbol_directory(
+        self,
+        *,
+        symbol: str,
+        company_name: str,
+        market: str = "",
+        source: str = "manual",
+        confidence: float = 1.0,
+        status: str = "active",
+        verified_at: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            self._upsert_symbol_directory_with_conn(
+                conn=conn,
+                symbol=symbol,
+                company_name=company_name,
+                market=market,
+                source=source,
+                confidence=confidence,
+                status=status,
+                verified_at=verified_at or utc_now_iso(),
+            )
+
+    def resolve_symbol_names(self, symbols: list[str]) -> dict[str, str]:
+        codes = [
+            str(symbol or "").strip()
+            for symbol in symbols
+            if _is_six_digit_symbol(symbol)
+        ]
+        unique_codes = list(dict.fromkeys(codes))
+        if not unique_codes:
+            return {}
+        placeholders = ",".join("?" for _ in unique_codes)
+        sql = f"SELECT symbol, company_name FROM symbol_directory WHERE symbol IN ({placeholders})"
+        with self._connect() as conn:
+            rows = conn.execute(sql, unique_codes).fetchall()
+        out: dict[str, str] = {}
+        for row in rows:
+            code = str(row["symbol"] or "").strip()
+            name = _clean_company_name(row["company_name"])
+            if _is_six_digit_symbol(code) and name:
+                out[code] = name
+        return out
+
+    def get_symbol_name(self, symbol: str) -> str:
+        return str(
+            self.resolve_symbol_names([symbol]).get(str(symbol or "").strip()) or ""
+        )
+
+    def refresh_symbol_directory_from_krx(self, as_of: str = "") -> dict[str, Any]:
+        as_of_date = str(as_of or date.today().isoformat())
+        now = utc_now_iso()
+        rows: list[tuple[str, str, str]] = []
+        errors: list[str] = []
+
+        try:
+            from pykrx import stock  # type: ignore
+
+            market_labels = {
+                "KOSPI": "KOSPI",
+                "KOSDAQ": "KOSDAQ",
+                "KONEX": "KONEX",
+            }
+            for market, label in market_labels.items():
+                try:
+                    tickers = list(
+                        stock.get_market_ticker_list(as_of_date, market=market)
+                    )
+                except Exception as exc:
+                    errors.append(f"{market}: {exc}")
+                    continue
+                for ticker in tickers:
+                    code = str(ticker or "").strip()
+                    if not _is_six_digit_symbol(code):
+                        continue
+                    try:
+                        name = _clean_company_name(stock.get_market_ticker_name(code))
+                    except Exception:
+                        name = ""
+                    if name:
+                        rows.append((code, name, label))
+
+            for getter, label in (
+                ("get_etf_ticker_list", "ETF"),
+                ("get_etn_ticker_list", "ETN"),
+            ):
+                fn = getattr(stock, getter, None)
+                if fn is None:
+                    continue
+                try:
+                    tickers = list(fn(as_of_date))
+                except Exception as exc:
+                    errors.append(f"{label}: {exc}")
+                    continue
+                for ticker in tickers:
+                    code = str(ticker or "").strip()
+                    if not _is_six_digit_symbol(code):
+                        continue
+                    try:
+                        name = _clean_company_name(stock.get_market_ticker_name(code))
+                    except Exception:
+                        name = ""
+                    if name:
+                        rows.append((code, name, label))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": "pykrx_unavailable",
+                "detail": str(exc),
+                "updated": 0,
+            }
+
+        merged: dict[str, tuple[str, str]] = {}
+        for code, name, market in rows:
+            if not _is_six_digit_symbol(code) or not name:
+                continue
+            merged[code] = (name, market)
+
+        if not merged:
+            return {
+                "ok": False,
+                "reason": "empty_snapshot",
+                "detail": "; ".join(errors)[:300],
+                "updated": 0,
+            }
+
+        with self._connect() as conn:
+            for code, (name, market) in merged.items():
+                self._upsert_symbol_directory_with_conn(
+                    conn=conn,
+                    symbol=code,
+                    company_name=name,
+                    market=market,
+                    source="pykrx",
+                    confidence=1.0,
+                    status="active",
+                    verified_at=now,
+                )
+
+        return {
+            "ok": True,
+            "updated": len(merged),
+            "errors": errors[:12],
+            "as_of": as_of_date,
+            "updated_at": now,
+        }
 
     def upsert_report_facts(self, report_id: int, facts: dict[str, Any]) -> None:
         with self._connect() as conn:
@@ -962,6 +1262,9 @@ class NaverReportRepository:
             cat_rows = conn.execute(
                 "SELECT category, COUNT(*) AS cnt FROM reports GROUP BY category ORDER BY cnt DESC"
             ).fetchall()
+            symbol_row = conn.execute(
+                "SELECT COUNT(*) AS cnt, MAX(updated_at) AS last_updated_at FROM symbol_directory"
+            ).fetchone()
             category_counts = {
                 str(item["category"] or "unknown"): int(item["cnt"] or 0)
                 for item in cat_rows
@@ -971,6 +1274,8 @@ class NaverReportRepository:
                 "last_updated_at": str(row["last_updated_at"] or ""),
                 "last_published_at": str(row["last_published_at"] or ""),
                 "category_counts": category_counts,
+                "total_symbols": int(symbol_row["cnt"] or 0),
+                "symbol_last_updated_at": str(symbol_row["last_updated_at"] or ""),
                 "db_path": str(self.path),
             }
 
@@ -1312,9 +1617,10 @@ class NaverSecuritiesCrawler:
                         )
                         detail_date = _parse_date(detail_html) or _parse_date(label)
                         detail_symbol = (
-                            _parse_symbol(detail_html)
+                            self._symbol_from_query(link_url)
+                            or self._symbol_from_links(detail_links)
+                            or _parse_symbol(detail_title)
                             or _parse_symbol(label)
-                            or self._symbol_from_query(link_url)
                         )
                         detail_broker = self._extract_broker(detail_html)
 
@@ -1734,6 +2040,23 @@ class NaverSecuritiesCrawler:
             val = str((query.get(key) or [""])[0]).strip()
             if len(val) == 6 and val.isdigit():
                 return val
+        return ""
+
+    @staticmethod
+    def _symbol_from_links(links: list[tuple[str, str]]) -> str:
+        for link_url, link_label in links:
+            query = parse_qs(urlparse(str(link_url or "")).query)
+            from_query = ""
+            for key in ("code", "symbol", "item_code"):
+                val = str((query.get(key) or [""])[0]).strip()
+                if len(val) == 6 and val.isdigit():
+                    from_query = val
+                    break
+            if from_query:
+                return from_query
+            from_label = _parse_symbol(str(link_label or ""))
+            if from_label:
+                return from_label
         return ""
 
     @staticmethod

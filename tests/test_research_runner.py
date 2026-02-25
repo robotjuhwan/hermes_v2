@@ -7,9 +7,15 @@ from zoneinfo import ZoneInfo
 
 from tradecraft.runtime.research_runner import (
     _build_advice_message,
+    _extract_balance_totals,
+    _extract_reduce_tickers_from_payload,
     _extract_rebalance_target_weights_from_payload,
+    _extract_total_value_krw_from_payload,
+    _extract_target_cash_weight_from_payload,
     _next_advice_slot,
+    _parse_krw_amount,
     _restart_kis_freqtrade_if_running,
+    _sum_open_stake_amount,
     _sync_kis_rebalance_targets_to_freqtrade_override,
     _sync_kis_trader_targets_from_morning_advice,
     _should_run_learning,
@@ -218,8 +224,11 @@ def test_restart_kis_freqtrade_if_running_skips_when_stopped(monkeypatch) -> Non
     )
     out = _restart_kis_freqtrade_if_running(settings)  # type: ignore[arg-type]
 
-    assert out == {"status": "skipped", "reason": "kis_bot_not_running"}
-    assert calls == []
+    assert out.get("status") == "ok"
+    assert out.get("stop_action") == "stopped"
+    assert out.get("start_action") == "started"
+    assert out.get("pid") == 10101
+    assert calls == [("stop", "kis"), ("start", "kis")]
 
 
 def test_extract_rebalance_target_weights_from_payload() -> None:
@@ -237,6 +246,71 @@ def test_extract_rebalance_target_weights_from_payload() -> None:
     }
     out = _extract_rebalance_target_weights_from_payload(payload, max_symbols=5)
     assert out == {"005930": 0.2, "000660": 0.15}
+
+
+def test_extract_target_cash_weight_from_payload() -> None:
+    payload = {
+        "pack": {
+            "advice_seed_json": {
+                "model_portfolio": {
+                    "targets": [{"ticker": "005930", "target_weight": 0.2}],
+                    "target_cash_weight": 0.12,
+                }
+            }
+        }
+    }
+    out = _extract_target_cash_weight_from_payload(payload)
+    assert out == 0.12
+
+
+def test_extract_target_cash_weight_prefers_strategy_spec() -> None:
+    payload = {
+        "pack": {
+            "advice_seed_json": {
+                "strategy_spec": {"target_cash_weight": 0.2},
+                "model_portfolio": {"target_cash_weight": 0.1},
+            }
+        }
+    }
+    out = _extract_target_cash_weight_from_payload(payload)
+    assert out == 0.2
+
+
+def test_parse_krw_amount_parses_currency_text() -> None:
+    assert _parse_krw_amount("2,330,000원") == 2330000.0
+
+
+def test_extract_total_value_krw_from_payload_uses_total_krw_text() -> None:
+    payload = {
+        "pack": {
+            "advice_seed_json": {
+                "portfolio": {
+                    "total_krw": "2,330,000원",
+                }
+            }
+        }
+    }
+    assert _extract_total_value_krw_from_payload(payload) == 2330000.0
+
+
+def test_extract_balance_totals_and_sum_open_stake() -> None:
+    balance_payload = {
+        "total": 1200000,
+        "currencies": [
+            {"currency": "KRW", "free": 900000, "balance": 900000},
+            {"currency": "005930", "free": 1, "balance": 1},
+        ],
+    }
+    status_rows = [
+        {"pair": "005930/KRW", "is_open": True, "stake_amount": 120000},
+        {"pair": "000660/KRW", "is_open": True, "stake_amount": 80000},
+    ]
+    total_krw, krw_free = _extract_balance_totals(balance_payload)
+    open_stake = _sum_open_stake_amount(status_rows)
+
+    assert total_krw == 1200000.0
+    assert krw_free == 900000.0
+    assert open_stake == 200000.0
 
 
 def test_sync_kis_rebalance_targets_to_freqtrade_override(tmp_path) -> None:
@@ -263,10 +337,38 @@ def test_sync_kis_rebalance_targets_to_freqtrade_override(tmp_path) -> None:
         "005930": 0.2,
         "000660": 0.15,
     }
+    assert saved.get("force_entry_enable") is True
     assert saved.get("exchange", {}).get("pair_whitelist") == [
         "005930/KRW",
         "000660/KRW",
     ]
+
+
+def test_sync_kis_rebalance_targets_to_freqtrade_override_writes_cash_weight(
+    tmp_path,
+) -> None:
+    runtime_dir = tmp_path / "freqtrade"
+    out = _sync_kis_rebalance_targets_to_freqtrade_override(
+        payload={
+            "pack": {
+                "advice_seed_json": {
+                    "strategy_spec": {"target_cash_weight": 0.25},
+                    "model_portfolio": {
+                        "targets": [
+                            {"ticker": "005930", "target_weight": 0.6},
+                            {"ticker": "000660", "target_weight": 0.4},
+                        ]
+                    },
+                }
+            }
+        },
+        runtime_dir=str(runtime_dir),
+        max_symbols=6,
+    )
+    saved = json.loads((runtime_dir / "kis.override.json").read_text(encoding="utf-8"))
+    assert round(sum(out.values()), 6) == 0.75
+    assert saved.get("tradecraft_target_cash_weight") == 0.25
+    assert round(sum(saved.get("tradecraft_target_weights", {}).values()), 6) == 0.75
 
 
 def test_sync_kis_rebalance_targets_to_freqtrade_override_adds_snapshot_picks(
@@ -321,3 +423,22 @@ def test_sync_kis_rebalance_targets_to_freqtrade_override_uses_snapshot_when_no_
     saved = json.loads((runtime_dir / "kis.override.json").read_text(encoding="utf-8"))
     assert out == {"005930": 0.5, "000660": 0.5}
     assert saved.get("tradecraft_target_weights") == {"005930": 0.5, "000660": 0.5}
+
+
+def test_extract_reduce_tickers_from_payload() -> None:
+    payload = {
+        "pack": {
+            "advice_seed_json": {
+                "action_plan": {
+                    "rebalance_table_rows": [
+                        {"ticker": "033790", "action": "REDUCE"},
+                        {"ticker": "005930", "action": "BUY"},
+                        {"ticker": "000660", "action": "SELL"},
+                        {"ticker": "bad", "action": "REDUCE"},
+                    ]
+                }
+            }
+        }
+    }
+    out = _extract_reduce_tickers_from_payload(payload)
+    assert out == {"033790", "000660"}

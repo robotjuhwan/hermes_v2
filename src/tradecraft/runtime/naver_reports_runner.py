@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 import time
 
@@ -13,6 +14,22 @@ from tradecraft.services.naver_reports import (
 from tradecraft.services.rag_store import RAGStore, RAGStoreConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _is_symbol_directory_stale(last_updated_at: str, *, min_age_sec: int) -> bool:
+    raw = str(last_updated_at or "").strip()
+    if not raw:
+        return True
+    try:
+        updated_dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    if updated_dt.tzinfo is None:
+        updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+    age_sec = (
+        datetime.now(timezone.utc) - updated_dt.astimezone(timezone.utc)
+    ).total_seconds()
+    return age_sec >= max(int(min_age_sec), 1)
 
 
 def _build_crawler(settings: AppSettings) -> NaverSecuritiesCrawler:
@@ -68,10 +85,33 @@ def run() -> None:
     )
 
     cycle = 0
+    symbol_refresh_min_age_sec = 60 * 60 * 12
     while True:
         cycle += 1
         try:
             snapshot = asyncio.run(crawler.crawl_once())
+            try:
+                status = repository.status()
+                symbol_last_updated_at = str(status.get("symbol_last_updated_at") or "")
+                if _is_symbol_directory_stale(
+                    symbol_last_updated_at,
+                    min_age_sec=symbol_refresh_min_age_sec,
+                ):
+                    symbol_refresh = repository.refresh_symbol_directory_from_krx()
+                    if bool(symbol_refresh.get("ok")):
+                        logger.info(
+                            "symbol directory refreshed: updated=%s as_of=%s",
+                            int(symbol_refresh.get("updated") or 0),
+                            str(symbol_refresh.get("as_of") or ""),
+                        )
+                    else:
+                        logger.warning(
+                            "symbol directory refresh skipped/failed: reason=%s detail=%s",
+                            str(symbol_refresh.get("reason") or "unknown"),
+                            str(symbol_refresh.get("detail") or "")[:200],
+                        )
+            except Exception as exc:
+                logger.warning("symbol directory refresh check failed: %s", exc)
             if settings.rag_enabled and rag is not None:
                 docs = repository.list_chunks_for_rag(
                     limit=settings.rag_sync_chunk_limit

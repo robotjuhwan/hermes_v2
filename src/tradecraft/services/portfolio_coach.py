@@ -1473,7 +1473,11 @@ class PortfolioCoachService:
     ) -> list[dict[str, Any]]:
         return list(candidates[: max(int(top_n), 1)])
 
-    def _build_strategy_spec(self) -> dict[str, Any]:
+    def _build_strategy_spec(
+        self,
+        *,
+        target_cash_weight: float | None = None,
+    ) -> dict[str, Any]:
         factor_weights: dict[str, float] = {
             "value": 0.33,
             "momentum": 0.34,
@@ -1494,10 +1498,16 @@ class PortfolioCoachService:
                     normalized[label] = max(_safe_float(value), 0.0)
                 if normalized:
                     factor_weights = normalized
+        resolved_target_cash_weight = float(self.config.target_cash_weight)
+        if target_cash_weight is not None:
+            resolved_target_cash_weight = max(
+                min(_safe_float(target_cash_weight), 0.9), 0.0
+            )
+
         return {
             "time_horizon": self.config.time_horizon,
             "max_single_position_weight": float(self.config.max_single_position_weight),
-            "target_cash_weight": float(self.config.target_cash_weight),
+            "target_cash_weight": round(resolved_target_cash_weight, 4),
             "max_new_positions": int(self.config.max_new_positions),
             "target_positions": int(self.config.target_positions),
             "max_trades_per_message": int(self.config.max_trades_per_message),
@@ -1509,6 +1519,46 @@ class PortfolioCoachService:
             "idea_filters": self.config.idea_filters,
             "factor_weights": factor_weights,
         }
+
+    def _decide_target_cash_weight(
+        self,
+        *,
+        selected_ideas: list[dict[str, Any]],
+        reports_covered: int,
+        tickers_covered: int,
+    ) -> float:
+        base = max(min(float(self.config.target_cash_weight), 0.9), 0.0)
+        if not selected_ideas:
+            return min(max(base + 0.10, 0.03), 0.35)
+
+        buy_like = {"BUY", "OUTPERFORM", "STRONG_BUY", "OVERWEIGHT"}
+        avg_upside = sum(
+            _safe_float(row.get("upside_pct")) for row in selected_ideas
+        ) / float(len(selected_ideas))
+        avg_coverage = sum(
+            _safe_float(row.get("coverage_count")) for row in selected_ideas
+        ) / float(len(selected_ideas))
+        buy_like_ratio = sum(
+            1
+            for row in selected_ideas
+            if str(row.get("rating_consensus") or "").upper() in buy_like
+        ) / float(len(selected_ideas))
+
+        adjust = 0.0
+        if reports_covered < 40 or tickers_covered < 10:
+            adjust += 0.08
+        elif reports_covered < 80 or tickers_covered < 20:
+            adjust += 0.04
+
+        if avg_upside >= 15.0 and buy_like_ratio >= 0.65 and avg_coverage >= 2.5:
+            adjust -= 0.03
+        if avg_upside <= 7.0 or buy_like_ratio < 0.45:
+            adjust += 0.04
+        if avg_coverage < 1.5:
+            adjust += 0.03
+
+        decided = base + adjust
+        return min(max(decided, 0.03), 0.35)
 
     def _build_rebalance_options(
         self,
@@ -1802,6 +1852,19 @@ class PortfolioCoachService:
             self._name_cache[key] = alias_name
             return alias_name
 
+        if (
+            len(key) == 6
+            and key.isdigit()
+            and hasattr(self.report_repo, "get_symbol_name")
+        ):
+            try:
+                db_name = _clean_line(self.report_repo.get_symbol_name(key), 40)
+            except Exception:
+                db_name = ""
+            if db_name and not (len(db_name) == 6 and db_name.isdigit()):
+                self._name_cache[key] = db_name
+                return db_name
+
         for item in candidates:
             name = _clean_line(item, 40)
             if name and not (len(name) == 6 and name.isdigit()):
@@ -1822,6 +1885,17 @@ class PortfolioCoachService:
                 if report_name and not (
                     len(report_name) == 6 and report_name.isdigit()
                 ):
+                    if hasattr(self.report_repo, "upsert_symbol_directory"):
+                        try:
+                            self.report_repo.upsert_symbol_directory(
+                                symbol=key,
+                                company_name=report_name,
+                                source="portfolio_coach_report_repo",
+                                confidence=0.9,
+                                status="active",
+                            )
+                        except Exception:
+                            pass
                     self._name_cache[key] = report_name
                     return report_name
 
@@ -1831,6 +1905,17 @@ class PortfolioCoachService:
 
                 resolved = _clean_line(stock.get_market_ticker_name(key), 40)
                 if resolved and not (len(resolved) == 6 and resolved.isdigit()):
+                    if hasattr(self.report_repo, "upsert_symbol_directory"):
+                        try:
+                            self.report_repo.upsert_symbol_directory(
+                                symbol=key,
+                                company_name=resolved,
+                                source="portfolio_coach_pykrx",
+                                confidence=1.0,
+                                status="active",
+                            )
+                        except Exception:
+                            pass
                     self._name_cache[key] = resolved
                     return resolved
             except Exception:
@@ -2361,13 +2446,69 @@ class PortfolioCoachService:
         selected_ideas = selected_ideas[:6]
 
         if not selected_ideas:
+            fallback_tickers: list[str] = []
+            for ticker, agg in sorted(
+                aggregates.items(),
+                key=lambda item: len(list(item[1].get("rows") or [])),
+                reverse=True,
+            ):
+                text = str(ticker or "").strip()
+                if len(text) != 6 or not text.isdigit():
+                    continue
+                if text in held_tickers or text in fallback_tickers:
+                    continue
+                fallback_tickers.append(text)
+                if len(fallback_tickers) >= 6:
+                    break
+
+            for ticker in fallback_tickers:
+                quote = await self._fetch_quote_for_ticker(ticker, as_of=as_of)
+                last_price = _safe_float(quote.get("last_price"))
+                if last_price <= 0:
+                    continue
+                selected_ideas.append(
+                    {
+                        "ticker": ticker,
+                        "name": self._resolve_security_name(
+                            ticker,
+                            str(quote.get("name") or ""),
+                        ),
+                        "rating_consensus": "HOLD",
+                        "tp_consensus": int(round(last_price * 1.03)),
+                        "upside_pct": 3.0,
+                        "coverage_count": len(
+                            list((aggregates.get(ticker) or {}).get("rows") or [])
+                        ),
+                        "last_update": date_kst,
+                        "last_price": int(round(last_price)),
+                        "bull_points": ["리포트/시세 결합 기반 신규 후보"],
+                        "bear_points": ["목표주가/리포트 근거 추가 점검 필요"],
+                        "what_to_watch": ["장중 변동률", "시세 안정성"],
+                        "why": "리포트 다건+실시간 시세 확인된 기본 후보",
+                        "evidence": [
+                            f"DATA(as_of={date_kst} {time_kst} KST)",
+                            "[근거보강, -, p.?]",
+                        ],
+                        "theme": "fallback",
+                        "base_score": float(
+                            len(list((aggregates.get(ticker) or {}).get("rows") or []))
+                        ),
+                    }
+                )
+
             for row in sorted(
                 enriched,
                 key=lambda item: _safe_float(item.get("weight")),
                 reverse=True,
             )[:6]:
+                if len(selected_ideas) >= 6:
+                    break
                 ticker = str(row.get("ticker") or "")
                 if not ticker:
+                    continue
+                if any(
+                    str(item.get("ticker") or "") == ticker for item in selected_ideas
+                ):
                     continue
                 name = self._resolve_security_name(ticker, str(row.get("name") or ""))
                 last_price = _safe_float(row.get("last_price"))
@@ -2402,9 +2543,15 @@ class PortfolioCoachService:
                 )
             selected_ideas = selected_ideas[:6]
 
+        decided_target_cash_weight = self._decide_target_cash_weight(
+            selected_ideas=selected_ideas,
+            reports_covered=reports_covered,
+            tickers_covered=tickers_covered,
+        )
+
         planner = RebalancePlanner(
             RebalancePlannerConfig(
-                target_cash_weight=float(self.config.target_cash_weight),
+                target_cash_weight=decided_target_cash_weight,
                 max_single_weight=float(self.config.max_single_position_weight),
                 target_positions=int(self.config.target_positions),
                 max_trades_per_message=int(self.config.max_trades_per_message),
@@ -2526,7 +2673,7 @@ class PortfolioCoachService:
                         f"변동 절대폭 {abs(_safe_float(top_row.get('delta_weight')))*100:.1f}%p 우선 조정",
                     ],
                     "key_numbers": [
-                        f"target_cash_weight {float(self.config.target_cash_weight)*100:.1f}%",
+                        f"target_cash_weight {decided_target_cash_weight*100:.1f}%",
                         f"max_single_weight {float(self.config.max_single_position_weight)*100:.1f}%",
                     ],
                     "risks": ["수수료/세금 추정 미반영"],
@@ -2649,10 +2796,14 @@ class PortfolioCoachService:
                     _clean_line(item, 120)
                     for item in list(rebalance.get("notes") or [])
                     if _clean_line(item, 120)
-                ][:6],
+                ][:5]
+                + [
+                    f"target_cash_weight {decided_target_cash_weight*100:.1f}% (research_adaptive)"
+                ],
             },
             "model_portfolio": {
                 "targets": model_targets,
+                "target_cash_weight": round(decided_target_cash_weight, 4),
             },
             "evidence_coverage": {
                 "reports_used_count": reports_covered,
@@ -2699,7 +2850,9 @@ class PortfolioCoachService:
         }
 
         return {
-            "strategy_spec": self._build_strategy_spec(),
+            "strategy_spec": self._build_strategy_spec(
+                target_cash_weight=decided_target_cash_weight
+            ),
             "top_n": int(self.config.top_n),
             "options_count": int(self.config.option_count),
             "triggers_count": int(self.config.trigger_count),

@@ -740,7 +740,9 @@ def _build_backtest_config(payload: dict[str, Any]) -> BacktestConfig:
             0.0,
         ),
         drift_bps=_as_float(payload.get("drift_bps"), settings.backtest_drift_bps),
-        fee_rate=max(_as_float(payload.get("fee_rate"), settings.backtest_fee_rate), 0.0),
+        fee_rate=max(
+            _as_float(payload.get("fee_rate"), settings.backtest_fee_rate), 0.0
+        ),
         slippage_bps=max(
             _as_float(payload.get("slippage_bps"), settings.backtest_slippage_bps),
             0.0,
@@ -886,6 +888,359 @@ def _build_strategy_control_payload(
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "items": items,
         "actions": list(actions or []),
+    }
+
+
+async def _build_kis_rebalance_status_payload() -> dict[str, Any]:
+    updated_at = datetime.now(timezone.utc).isoformat()
+    override_path = (
+        Path(settings.freqtrade_runtime_dir).expanduser().resolve()
+        / "kis.override.json"
+    )
+
+    override_payload: dict[str, Any] = {}
+    if override_path.exists():
+        try:
+            loaded = json.loads(override_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                override_payload = loaded
+        except Exception:
+            override_payload = {}
+
+    target_weights_raw = override_payload.get("tradecraft_target_weights")
+    target_weights: dict[str, float] = {}
+    if isinstance(target_weights_raw, dict):
+        for raw_ticker, raw_weight in target_weights_raw.items():
+            ticker = str(raw_ticker or "").strip()
+            if len(ticker) != 6 or not ticker.isdigit():
+                continue
+            try:
+                weight = float(raw_weight)
+            except Exception:
+                continue
+            if weight > 0:
+                target_weights[ticker] = weight
+
+    target_ticker_order = [
+        ticker
+        for ticker, _ in sorted(
+            target_weights.items(), key=lambda item: item[1], reverse=True
+        )
+    ]
+
+    target_cash_weight = float(
+        override_payload.get("tradecraft_target_cash_weight") or 0.0
+    )
+    target_invested_ratio = max(0.0, min(1.0, 1.0 - target_cash_weight))
+    target_total_value_krw = float(
+        override_payload.get("tradecraft_portfolio_total_krw") or 0.0
+    )
+    strategy_config: dict[str, Any] = {
+        "source": "freqtrade_show_config+override",
+        "bot_id": "kis",
+        "api_connected": False,
+        "show_config": {},
+        "override": {
+            "target_weights_updated_at": str(
+                override_payload.get("tradecraft_target_weights_updated_at") or ""
+            ),
+            "target_cash_weight": float(
+                override_payload.get("tradecraft_target_cash_weight") or 0.0
+            ),
+            "portfolio_total_krw": float(
+                override_payload.get("tradecraft_portfolio_total_krw") or 0.0
+            ),
+            "force_entry_enable": bool(override_payload.get("force_entry_enable")),
+            "pair_whitelist_count": len(
+                list(
+                    (override_payload.get("exchange") or {}).get("pair_whitelist") or []
+                )
+            ),
+        },
+        "errors": [],
+    }
+
+    execution: dict[str, Any] = {
+        "open_trade_count": 0,
+        "open_pairs": [],
+        "open_stake_total_krw": 0.0,
+        "total_value_krw": target_total_value_krw,
+        "actual_invested_ratio": 0.0,
+        "errors": [],
+    }
+    open_stake_by_ticker: dict[str, float] = {}
+    balance_qty_by_ticker: dict[str, float] = {}
+    balance_value_by_ticker: dict[str, float] = {}
+    krw_cash_balance = 0.0
+
+    kis_bot = next((row for row in freqtrade_bot_configs if row.bot_id == "kis"), None)
+    if kis_bot is not None:
+        resolved = freqtrade_bridge._resolve_bot_config(kis_bot)
+        if resolved is not None:
+            strategy_config["api_connected"] = True
+            auth = freqtrade_bridge._auth_tuple(resolved.username, resolved.password)
+            request_kwargs: dict[str, Any] = {"headers": {"Accept": "application/json"}}
+            if auth is not None:
+                request_kwargs["auth"] = auth
+            timeout = httpx.Timeout(3.5)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                try:
+                    show_config_res = await client.get(
+                        f"{resolved.api_url}/api/v1/show_config", **request_kwargs
+                    )
+                    show_config_res.raise_for_status()
+                    show_config_payload = show_config_res.json()
+                    if isinstance(show_config_payload, dict):
+                        strategy_config["show_config"] = {
+                            "bot_name": str(show_config_payload.get("bot_name") or ""),
+                            "state": str(show_config_payload.get("state") or ""),
+                            "runmode": str(show_config_payload.get("runmode") or ""),
+                            "strategy": str(show_config_payload.get("strategy") or ""),
+                            "strategy_version": str(
+                                show_config_payload.get("strategy_version") or ""
+                            ),
+                            "timeframe": str(
+                                show_config_payload.get("timeframe") or ""
+                            ),
+                            "trading_mode": str(
+                                show_config_payload.get("trading_mode") or ""
+                            ),
+                            "max_open_trades": int(
+                                show_config_payload.get("max_open_trades") or 0
+                            ),
+                            "stake_currency": str(
+                                show_config_payload.get("stake_currency") or ""
+                            ),
+                            "stake_amount": str(
+                                show_config_payload.get("stake_amount") or ""
+                            ),
+                            "available_capital": float(
+                                show_config_payload.get("available_capital") or 0.0
+                            ),
+                            "force_entry_enable": bool(
+                                show_config_payload.get("force_entry_enable")
+                            ),
+                            "position_adjustment_enable": bool(
+                                show_config_payload.get("position_adjustment_enable")
+                            ),
+                            "max_entry_position_adjustment": int(
+                                show_config_payload.get("max_entry_position_adjustment")
+                                or 0
+                            ),
+                        }
+                except Exception as exc:
+                    strategy_config["errors"].append(f"show_config: {exc}")
+
+                try:
+                    status_res = await client.get(
+                        f"{resolved.api_url}/api/v1/status", **request_kwargs
+                    )
+                    status_res.raise_for_status()
+                    status_rows = status_res.json()
+                    rows = [
+                        row for row in list(status_rows or []) if isinstance(row, dict)
+                    ]
+                    execution["open_trade_count"] = len(rows)
+                    execution["open_pairs"] = [
+                        str(row.get("pair") or "") for row in rows if row.get("pair")
+                    ]
+                    execution["open_stake_total_krw"] = sum(
+                        float(row.get("stake_amount") or 0.0)
+                        for row in rows
+                        if bool(row.get("is_open", True))
+                    )
+                    for row in rows:
+                        if not bool(row.get("is_open", True)):
+                            continue
+                        pair = str(row.get("pair") or "").strip()
+                        ticker = pair.split("/")[0].strip()
+                        if len(ticker) != 6 or not ticker.isdigit():
+                            continue
+                        stake = float(row.get("stake_amount") or 0.0)
+                        if stake <= 0:
+                            continue
+                        open_stake_by_ticker[ticker] = (
+                            float(open_stake_by_ticker.get(ticker) or 0.0) + stake
+                        )
+                except Exception as exc:
+                    execution["errors"].append(f"status: {exc}")
+                    strategy_config["errors"].append(f"status: {exc}")
+
+                try:
+                    balance_res = await client.get(
+                        f"{resolved.api_url}/api/v1/balance", **request_kwargs
+                    )
+                    balance_res.raise_for_status()
+                    balance_payload = balance_res.json()
+                    if isinstance(balance_payload, dict):
+                        total_value = float(
+                            balance_payload.get("total")
+                            or balance_payload.get("value")
+                            or 0.0
+                        )
+                        if total_value > 0:
+                            execution["total_value_krw"] = total_value
+                        currencies = balance_payload.get("currencies")
+                        if isinstance(currencies, list):
+                            for row in currencies:
+                                if not isinstance(row, dict):
+                                    continue
+                                currency = str(row.get("currency") or "").strip()
+                                if not currency:
+                                    continue
+                                if currency.upper() == "KRW":
+                                    krw_cash_balance = max(
+                                        krw_cash_balance,
+                                        _safe_positive_float(
+                                            row.get("balance") or row.get("free")
+                                        ),
+                                    )
+                                    continue
+                                if len(currency) != 6 or not currency.isdigit():
+                                    continue
+                                qty = max(
+                                    _safe_positive_float(row.get("balance")),
+                                    _safe_positive_float(row.get("free")),
+                                )
+                                if qty > 0:
+                                    balance_qty_by_ticker[currency] = (
+                                        float(
+                                            balance_qty_by_ticker.get(currency) or 0.0
+                                        )
+                                        + qty
+                                    )
+                                est_stake = _safe_positive_float(row.get("est_stake"))
+                                if est_stake > 0:
+                                    balance_value_by_ticker[currency] = max(
+                                        float(
+                                            balance_value_by_ticker.get(currency) or 0.0
+                                        ),
+                                        est_stake,
+                                    )
+                except Exception as exc:
+                    execution["errors"].append(f"balance: {exc}")
+                    strategy_config["errors"].append(f"balance: {exc}")
+
+    if settings.kis_primary_ready:
+        for ticker, qty in balance_qty_by_ticker.items():
+            if _safe_positive_float(balance_value_by_ticker.get(ticker)) > 0:
+                continue
+            try:
+                quote = await kis_primary.fetch_domestic_quote(ticker)
+                price = _safe_positive_float((quote or {}).get("price"))
+            except Exception:
+                price = 0.0
+            if price <= 0:
+                continue
+            balance_value_by_ticker[ticker] = qty * price
+
+    for ticker, stake in open_stake_by_ticker.items():
+        if stake > _safe_positive_float(balance_value_by_ticker.get(ticker)):
+            balance_value_by_ticker[ticker] = stake
+
+    holdings_total_krw = sum(
+        _safe_positive_float(value) for value in balance_value_by_ticker.values()
+    )
+    total_value_krw = float(execution.get("total_value_krw") or 0.0)
+    computed_total_krw = krw_cash_balance + holdings_total_krw
+    if computed_total_krw > total_value_krw:
+        total_value_krw = computed_total_krw
+        execution["total_value_krw"] = total_value_krw
+
+    open_stake_total_krw = float(execution.get("open_stake_total_krw") or 0.0)
+    if total_value_krw > 0:
+        execution["actual_invested_ratio"] = max(
+            0.0, min(1.0, holdings_total_krw / total_value_krw)
+        )
+
+    all_tickers = list(
+        dict.fromkeys(
+            target_ticker_order
+            + list(balance_value_by_ticker.keys())
+            + list(open_stake_by_ticker.keys())
+        )
+    )
+    symbol_name_map: dict[str, str] = {}
+    if all_tickers:
+        try:
+            symbol_name_map = naver_report_repository.resolve_symbol_names(all_tickers)
+        except Exception:
+            symbol_name_map = {}
+
+    clamped_target_cash_weight = max(0.0, min(1.0, target_cash_weight))
+
+    target_rows = [
+        {
+            "ticker": ticker,
+            "name": str(symbol_name_map.get(ticker) or ticker),
+            "weight": float(target_weights.get(ticker) or 0.0),
+        }
+        for ticker in target_ticker_order
+    ]
+    target_rows.append(
+        {
+            "ticker": "KRW",
+            "name": "현금",
+            "weight": clamped_target_cash_weight,
+        }
+    )
+
+    extra_current_tickers = [
+        ticker
+        for ticker, _ in sorted(
+            balance_value_by_ticker.items(), key=lambda item: item[1], reverse=True
+        )
+        if ticker not in set(target_ticker_order)
+    ]
+    current_ticker_order = target_ticker_order + extra_current_tickers
+    current_rows: list[dict[str, Any]] = []
+    for ticker in current_ticker_order:
+        current_value = float(balance_value_by_ticker.get(ticker) or 0.0)
+        current_weight = (
+            max(0.0, min(1.0, current_value / total_value_krw))
+            if total_value_krw > 0
+            else 0.0
+        )
+        current_rows.append(
+            {
+                "ticker": ticker,
+                "name": str(symbol_name_map.get(ticker) or ticker),
+                "weight": current_weight,
+            }
+        )
+    current_cash_weight = (
+        max(0.0, min(1.0, krw_cash_balance / total_value_krw))
+        if total_value_krw > 0
+        else max(
+            0.0,
+            min(1.0, 1.0 - float(execution.get("actual_invested_ratio") or 0.0)),
+        )
+    )
+    current_rows.append(
+        {
+            "ticker": "KRW",
+            "name": "현금",
+            "weight": current_cash_weight,
+        }
+    )
+
+    return {
+        "status": "ok",
+        "updated_at": updated_at,
+        "target": {
+            "updated_at": str(
+                override_payload.get("tradecraft_target_weights_updated_at") or ""
+            ),
+            "target_cash_weight": target_cash_weight,
+            "target_invested_ratio": target_invested_ratio,
+            "rows": target_rows,
+        },
+        "current": {
+            "updated_at": updated_at,
+            "rows": current_rows,
+        },
+        "execution": execution,
+        "strategy_config": strategy_config,
     }
 
 
@@ -1322,6 +1677,11 @@ async def kis_trader_status() -> dict[str, Any]:
         "enabled": settings.kis_trader_enabled,
         "snapshot": snapshot,
     }
+
+
+@app.get("/api/rebalance/kis-status")
+async def rebalance_kis_status() -> dict[str, Any]:
+    return await _build_kis_rebalance_status_payload()
 
 
 @app.post("/api/kis/trader/run-once")

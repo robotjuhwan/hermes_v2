@@ -209,6 +209,13 @@ def test_portfolio_coach_builds_actionable_pack_with_review_queue(
     assert "근거 부족 체크" not in message
     used = list(payload.get("used_candidates") or [])
     assert len(used) == 3
+    pack = dict(payload.get("pack") or {})
+    strategy_spec = dict(pack.get("strategy_spec") or {})
+    seed = dict(pack.get("advice_seed_json") or {})
+    model_portfolio = dict(seed.get("model_portfolio") or {})
+    target_cash_weight = float(model_portfolio.get("target_cash_weight") or -1)
+    assert 0.03 <= target_cash_weight <= 0.35
+    assert strategy_spec.get("target_cash_weight") == target_cash_weight
 
 
 def test_portfolio_coach_dedupe_by_date_holdings_candidates(tmp_path: Path) -> None:

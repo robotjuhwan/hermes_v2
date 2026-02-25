@@ -131,3 +131,45 @@ def test_naver_report_repository_upsert_with_structured_facts(tmp_path: Path) ->
     assert facts is not None
     assert facts.get("rating") == "BUY"
     assert int((facts.get("target_price") or {}).get("value") or 0) == 120000
+
+
+def test_symbol_directory_upsert_and_resolve(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.upsert_symbol_directory(
+        symbol="005930",
+        company_name="삼성전자",
+        market="KOSPI",
+        source="test",
+        confidence=0.9,
+    )
+
+    assert repo.get_symbol_name("005930") == "삼성전자"
+    out = repo.resolve_symbol_names(["005930", "000660"])
+    assert out == {"005930": "삼성전자"}
+
+
+def test_upsert_report_backfills_symbol_directory(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+
+    report_id = repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=1",
+        pdf_url="https://stock.pstatic.net/stock-research/company/1.pdf",
+        pdf_sha256="abc123",
+        pdf_archived_path=".runtime/naver_reports/pdfs/ab/c1/abc123.pdf",
+        title="삼성전자 리포트",
+        company_name="삼성전자",
+        broker="테스트증권",
+        analyst="홍길동",
+        symbol="005930",
+        published_at="2025-01-10",
+        crawled_at="2026-01-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="삼성전자 실적 개선 전망",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    assert report_id > 0
+    assert repo.get_symbol_name("005930") == "삼성전자"

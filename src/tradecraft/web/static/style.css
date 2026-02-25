@@ -615,14 +615,15 @@ textarea {
 }
 
 .target-table-wrap {
-  overflow: auto;
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 10px;
 }
 
 .target-table {
   width: 100%;
-  min-width: 520px;
+  min-width: 0;
+  table-layout: fixed;
   border-collapse: collapse;
 }
 
@@ -632,6 +633,9 @@ textarea {
   padding: 8px;
   font-size: 12px;
   text-align: left;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .target-table th {
@@ -683,6 +687,10 @@ textarea {
   padding: 10px;
   display: grid;
   gap: 8px;
+}
+
+.helper-card-wide {
+  grid-column: 1 / -1;
 }
 
 .helper-card h4 {
