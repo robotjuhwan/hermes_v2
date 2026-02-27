@@ -891,6 +891,12 @@ class PortfolioCoachStore:
             )
             self._ensure_column(conn, "advice_messages", "reviewed_at", "TEXT")
             self._ensure_column(conn, "advice_messages", "review_note", "TEXT")
+            self._ensure_column(
+                conn,
+                "advice_messages",
+                "rebalance_targets_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
 
     def _ensure_column(
         self,
@@ -970,6 +976,7 @@ class PortfolioCoachStore:
         candidate_hash: str,
         status: str,
         review_note: str = "",
+        rebalance_targets: list[dict[str, Any]] | None = None,
     ) -> int:
         now = utc_now_iso()
         with self._connect() as conn:
@@ -978,8 +985,8 @@ class PortfolioCoachStore:
                 INSERT INTO advice_messages(
                     as_of, as_of_date, user_id, message_md, used_candidates_json,
                     holdings_hash, candidate_hash, message_hash, sent_at, status,
-                    reviewed_at, review_note
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    reviewed_at, review_note, rebalance_targets_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     as_of,
@@ -994,6 +1001,7 @@ class PortfolioCoachStore:
                     status,
                     None,
                     review_note,
+                    json.dumps(rebalance_targets or [], ensure_ascii=False),
                 ),
             )
             rowid = cur.lastrowid
@@ -1010,7 +1018,7 @@ class PortfolioCoachStore:
                 """
                 SELECT message_id, as_of, as_of_date, user_id, message_md, used_candidates_json,
                        holdings_hash, candidate_hash, message_hash, sent_at, status,
-                       reviewed_at, review_note
+                       reviewed_at, review_note, rebalance_targets_json
                 FROM advice_messages
                 WHERE (? = '' OR status = ?)
                 ORDER BY message_id DESC
@@ -1027,6 +1035,12 @@ class PortfolioCoachStore:
                 )
             except json.JSONDecodeError:
                 payload["used_candidates"] = []
+            try:
+                payload["rebalance_targets"] = json.loads(
+                    str(payload.get("rebalance_targets_json") or "[]")
+                )
+            except json.JSONDecodeError:
+                payload["rebalance_targets"] = []
             out.append(payload)
         return out
 
@@ -1036,7 +1050,7 @@ class PortfolioCoachStore:
                 """
                 SELECT message_id, as_of, as_of_date, user_id, message_md, used_candidates_json,
                        holdings_hash, candidate_hash, message_hash, sent_at, status,
-                       reviewed_at, review_note
+                       reviewed_at, review_note, rebalance_targets_json
                 FROM advice_messages
                 WHERE message_id = ?
                 LIMIT 1
@@ -1052,7 +1066,49 @@ class PortfolioCoachStore:
             )
         except json.JSONDecodeError:
             payload["used_candidates"] = []
+        try:
+            payload["rebalance_targets"] = json.loads(
+                str(payload.get("rebalance_targets_json") or "[]")
+            )
+        except json.JSONDecodeError:
+            payload["rebalance_targets"] = []
         return payload
+
+    def list_recent_rebalance_history(
+        self, *, user_id: str, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        resolved_limit = max(min(int(limit), 20), 1)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT message_id, as_of, status, rebalance_targets_json
+                FROM advice_messages
+                WHERE user_id = ?
+                ORDER BY message_id DESC
+                LIMIT ?
+                """,
+                (user_id, resolved_limit),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                targets = json.loads(str(row["rebalance_targets_json"] or "[]"))
+            except json.JSONDecodeError:
+                targets = []
+            if not isinstance(targets, list):
+                targets = []
+            normalized_targets = [item for item in targets if isinstance(item, dict)]
+            if not normalized_targets:
+                continue
+            out.append(
+                {
+                    "message_id": int(row["message_id"] or 0),
+                    "as_of": str(row["as_of"] or ""),
+                    "status": str(row["status"] or ""),
+                    "targets": normalized_targets,
+                }
+            )
+        return out
 
     def update_message_status(
         self,
@@ -1178,6 +1234,9 @@ class PortfolioCoachService:
         )
         response_status = "pending_review" if self.config.review_queue_enabled else "ok"
         message_id = 0
+        rebalance_targets_for_history = self._extract_rebalance_targets_for_history(
+            advice_seed_json=dict(pack.get("advice_seed_json") or {})
+        )
         if self.config.review_queue_enabled:
             message_id = self.store.write_advice_message(
                 as_of=as_of,
@@ -1187,6 +1246,7 @@ class PortfolioCoachService:
                 holdings_hash=holdings_hash,
                 candidate_hash=candidate_hash,
                 status="pending_review",
+                rebalance_targets=rebalance_targets_for_history,
             )
         return {
             "status": response_status,
@@ -1205,14 +1265,27 @@ class PortfolioCoachService:
         if message_id > 0:
             self.store.update_message_status(message_id=message_id, status=status)
             return
+        pack_obj = payload.get("pack")
+        seed_obj: dict[str, Any] = {}
+        if isinstance(pack_obj, dict):
+            seed_candidate = pack_obj.get("advice_seed_json")
+            if isinstance(seed_candidate, dict):
+                seed_obj = seed_candidate
+        used_candidates_obj = payload.get("used_candidates")
+        used_candidates = (
+            list(used_candidates_obj) if isinstance(used_candidates_obj, list) else []
+        )
         self.store.write_advice_message(
             as_of=str(payload.get("as_of") or utc_now_iso()),
             user_id=self.config.user_id,
             message_md=str(payload.get("message") or ""),
-            used_candidates=list(payload.get("used_candidates") or []),
+            used_candidates=used_candidates,
             holdings_hash=str(payload.get("holdings_hash") or ""),
             candidate_hash=str(payload.get("candidate_hash") or ""),
             status=status,
+            rebalance_targets=self._extract_rebalance_targets_for_history(
+                advice_seed_json=seed_obj
+            ),
         )
 
     async def _enrich_positions(self, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1559,6 +1632,106 @@ class PortfolioCoachService:
 
         decided = base + adjust
         return min(max(decided, 0.03), 0.35)
+
+    def _extract_rebalance_targets_for_history(
+        self, *, advice_seed_json: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        model = advice_seed_json.get("model_portfolio")
+        if not isinstance(model, dict):
+            return []
+        rows: list[dict[str, Any]] = []
+        for row in list(model.get("targets") or []):
+            if not isinstance(row, dict):
+                continue
+            ticker = str(row.get("ticker") or "").strip()
+            if len(ticker) != 6 or not ticker.isdigit():
+                continue
+            weight = max(_safe_float(row.get("target_weight")), 0.0)
+            if weight <= 0:
+                continue
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "name": str(row.get("name") or ticker),
+                    "target_weight": round(weight, 6),
+                }
+            )
+        rows.sort(key=lambda item: _safe_float(item.get("target_weight")), reverse=True)
+        return rows
+
+    def _build_rebalance_history_context(
+        self,
+        *,
+        current_targets: list[dict[str, Any]],
+        current_cash_weight: float,
+    ) -> tuple[list[dict[str, Any]], str]:
+        history_rows = self.store.list_recent_rebalance_history(
+            user_id=self.config.user_id,
+            limit=5,
+        )
+        context_rows: list[dict[str, Any]] = []
+        for row in history_rows:
+            targets = [
+                {
+                    "ticker": str(item.get("ticker") or ""),
+                    "target_weight": round(_safe_float(item.get("target_weight")), 6),
+                }
+                for item in list(row.get("targets") or [])
+                if isinstance(item, dict)
+                and len(str(item.get("ticker") or "")) == 6
+                and str(item.get("ticker") or "").isdigit()
+                and _safe_float(item.get("target_weight")) > 0
+            ][:8]
+            if not targets:
+                continue
+            context_rows.append(
+                {
+                    "as_of": str(row.get("as_of") or ""),
+                    "status": str(row.get("status") or ""),
+                    "targets": targets,
+                }
+            )
+
+        churn_note = "리밸런싱 타깃 급변 주의: 직전 대비 완만 조정"
+        if context_rows:
+            prev_targets = {
+                str(item.get("ticker") or ""): _safe_float(item.get("target_weight"))
+                for item in list(context_rows[0].get("targets") or [])
+                if isinstance(item, dict)
+            }
+            now_targets = {
+                str(item.get("ticker") or ""): _safe_float(item.get("target_weight"))
+                for item in current_targets
+                if isinstance(item, dict)
+            }
+            all_keys = sorted(set(prev_targets.keys()) | set(now_targets.keys()))
+            turnover = sum(
+                abs(
+                    _safe_float(now_targets.get(key))
+                    - _safe_float(prev_targets.get(key))
+                )
+                for key in all_keys
+            )
+            changed = sum(
+                1
+                for key in all_keys
+                if abs(
+                    _safe_float(now_targets.get(key))
+                    - _safe_float(prev_targets.get(key))
+                )
+                >= 0.03
+            )
+            churn_note = (
+                "리밸런싱 타깃 급변 주의: "
+                f"직전 대비 turnover {turnover*100:.1f}%p, 큰변화 {changed}종목"
+            )
+
+        history_hint = (
+            "주의: 리밸런싱 타깃이 직전 대비 과도하게 급변하지 않도록 하세요. "
+            "강한 신규 근거가 없으면 기존 타깃을 유지/완만 조정하고, 교체 종목 수를 최소화하세요. "
+            f"현재 목표 현금비중은 {current_cash_weight*100:.1f}% 입니다."
+        )
+        return context_rows, f"{churn_note}. {history_hint}"
 
     def _build_rebalance_options(
         self,
@@ -2773,6 +2946,23 @@ class PortfolioCoachService:
         portfolio_status = self._build_portfolio_status(
             snapshot=snapshot, enriched=enriched
         )
+        current_targets_for_history = [
+            {
+                "ticker": str(row.get("ticker") or ""),
+                "name": str(row.get("name") or ""),
+                "target_weight": round(_safe_float(row.get("target_weight")), 6),
+            }
+            for row in model_targets
+            if len(str(row.get("ticker") or "")) == 6
+            and str(row.get("ticker") or "").isdigit()
+            and _safe_float(row.get("target_weight")) > 0
+        ]
+        rebalance_history_rows, rebalance_history_hint = (
+            self._build_rebalance_history_context(
+                current_targets=current_targets_for_history,
+                current_cash_weight=decided_target_cash_weight,
+            )
+        )
 
         advice_seed_json = {
             "header": {
@@ -2798,7 +2988,8 @@ class PortfolioCoachService:
                     if _clean_line(item, 120)
                 ][:5]
                 + [
-                    f"target_cash_weight {decided_target_cash_weight*100:.1f}% (research_adaptive)"
+                    f"target_cash_weight {decided_target_cash_weight*100:.1f}% (research_adaptive)",
+                    rebalance_history_hint,
                 ],
             },
             "model_portfolio": {
@@ -2812,6 +3003,7 @@ class PortfolioCoachService:
                 "gaps": gaps,
                 "next_actions": next_actions,
                 "name_mapping_failures": name_mapping_failures,
+                "rebalance_history": rebalance_history_rows,
             },
             "actions": action_trades,
             "trades": action_trades,
@@ -2873,6 +3065,12 @@ class PortfolioCoachService:
         if not self.llm_bridge.ready:
             return None
         seed = self._render_json_fallback(pack)
+        coverage_obj = seed.get("evidence_coverage")
+        recent_history_rows: list[Any] = []
+        if isinstance(coverage_obj, dict):
+            history_obj = coverage_obj.get("rebalance_history")
+            if isinstance(history_obj, list):
+                recent_history_rows = history_obj
         payload = {
             "model": self.llm_bridge.resolved_model,
             "temperature": 0.1,
@@ -2883,7 +3081,9 @@ class PortfolioCoachService:
                     "content": (
                         "Return only one JSON object with keys: header, market_mood, portfolio, action_plan, model_portfolio, evidence_coverage, notes. "
                         "Do not add extra keys. Keep action_plan.trades length exactly 3 and model_portfolio.targets length 5-6 when possible. "
-                        "Rewrite wording only; preserve numbers and evidence citations. No markdown output."
+                        "Rewrite wording only; preserve numbers and evidence citations. "
+                        "Rebalance target churn must stay low versus recent rebalance history: avoid abrupt target replacement/weight swings unless evidence_coverage clearly justifies it. "
+                        "No markdown output."
                     ),
                 },
                 {
@@ -2893,6 +3093,11 @@ class PortfolioCoachService:
                             "task": "Polish portfolio direct-brief JSON while preserving facts.",
                             "as_of": snapshot.get("as_of"),
                             "seed": seed,
+                            "rebalance_guidance": {
+                                "stability_priority": "high",
+                                "instruction": "직전 리밸런싱 히스토리를 근거로 목표 비중 급변을 피하고 완만 조정 우선",
+                                "recent_history": recent_history_rows,
+                            },
                             "schema": {
                                 "header": {
                                     "mode": "PAPER_DIRECT",

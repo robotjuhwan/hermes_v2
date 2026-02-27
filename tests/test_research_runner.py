@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, date
 from types import SimpleNamespace
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from tradecraft.runtime.research_runner import (
@@ -10,8 +11,10 @@ from tradecraft.runtime.research_runner import (
     _extract_balance_totals,
     _extract_reduce_tickers_from_payload,
     _extract_rebalance_target_weights_from_payload,
+    _extract_trade_id_from_forceenter_error,
     _extract_total_value_krw_from_payload,
     _extract_target_cash_weight_from_payload,
+    _resolve_symbol_names_for_codes,
     _next_advice_slot,
     _parse_krw_amount,
     _restart_kis_freqtrade_if_running,
@@ -274,6 +277,45 @@ def test_extract_target_cash_weight_prefers_strategy_spec() -> None:
     }
     out = _extract_target_cash_weight_from_payload(payload)
     assert out == 0.2
+
+
+def test_extract_trade_id_from_forceenter_error() -> None:
+    reason = "Error querying /api/v1/forceenter: position for 043150/KRW already open - id: 123 and has open order 0025037200"
+    assert _extract_trade_id_from_forceenter_error(reason) == 123
+    assert _extract_trade_id_from_forceenter_error("unknown") == 0
+
+
+def test_resolve_symbol_names_for_codes_uses_pykrx_fallback(monkeypatch) -> None:
+    class _Repo:
+        def resolve_symbol_names(self, symbols):
+            return {}
+
+        def search(self, query: str, symbol: str, category: str, limit: int = 3):
+            return []
+
+        def upsert_symbol_directory(self, **kwargs):
+            return None
+
+        def refresh_symbol_directory_from_krx(self):
+            return {"ok": True}
+
+    monkeypatch.setattr(
+        "tradecraft.runtime.research_runner._fetch_company_name_from_pykrx",
+        lambda symbol: "테스트기업" if str(symbol) == "123456" else "",
+    )
+    monkeypatch.setattr(
+        "tradecraft.runtime.research_runner._fetch_company_name_from_naver",
+        lambda symbol: "",
+    )
+
+    out = _resolve_symbol_names_for_codes(
+        codes=["123456"],
+        report_repository=cast(Any, _Repo()),
+        kis=None,
+        initial_map={},
+    )
+
+    assert out == {"123456": "테스트기업"}
 
 
 def test_parse_krw_amount_parses_currency_text() -> None:

@@ -216,6 +216,36 @@ def test_portfolio_coach_builds_actionable_pack_with_review_queue(
     target_cash_weight = float(model_portfolio.get("target_cash_weight") or -1)
     assert 0.03 <= target_cash_weight <= 0.35
     assert strategy_spec.get("target_cash_weight") == target_cash_weight
+    history_rows = service.store.list_recent_rebalance_history(user_id="u1", limit=5)
+    assert len(history_rows) == 1
+    assert len(list(history_rows[0].get("targets") or [])) >= 1
+
+
+def test_portfolio_coach_includes_rebalance_history_context(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.store.write_advice_message(
+        as_of="2026-02-18T00:00:00+09:00",
+        user_id="u1",
+        message_md="seed history",
+        used_candidates=[],
+        holdings_hash="h1",
+        candidate_hash="c1",
+        status="sent",
+        rebalance_targets=[
+            {"ticker": "005930", "target_weight": 0.28},
+            {"ticker": "000660", "target_weight": 0.24},
+        ],
+    )
+
+    payload = asyncio.run(service.build_advice())
+    pack = dict(payload.get("pack") or {})
+    seed = dict(pack.get("advice_seed_json") or {})
+    coverage = dict(seed.get("evidence_coverage") or {})
+    history = list(coverage.get("rebalance_history") or [])
+    notes = list((dict(seed.get("action_plan") or {})).get("notes") or [])
+
+    assert len(history) >= 1
+    assert any("급변" in str(note) for note in notes)
 
 
 def test_portfolio_coach_dedupe_by_date_holdings_candidates(tmp_path: Path) -> None:

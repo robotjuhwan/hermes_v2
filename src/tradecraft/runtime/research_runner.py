@@ -163,6 +163,17 @@ def _parse_krw_amount(value: Any) -> float:
     return max(_safe_float(normalized), 0.0)
 
 
+def _extract_trade_id_from_forceenter_error(reason: str) -> int:
+    text = str(reason or "")
+    match = re.search(r"already open - id:\s*(\d+)", text)
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except Exception:
+        return 0
+
+
 def _extract_pick_codes(snapshot: dict, limit: int = 6) -> list[str]:
     out: list[str] = []
     max_items = max(int(limit), 1)
@@ -216,17 +227,49 @@ def _fetch_company_name_from_naver(symbol: str) -> str:
     return name[:40]
 
 
-def _resolve_pick_name_map(
-    snapshot: dict,
+def _fetch_company_name_from_pykrx(symbol: str) -> str:
+    code = str(symbol or "").strip()
+    if not re.fullmatch(r"\d{6}", code):
+        return ""
+    try:
+        from pykrx import stock  # type: ignore
+
+        name = str(stock.get_market_ticker_name(code) or "").strip()
+    except Exception:
+        return ""
+    if not name or name == code or re.fullmatch(r"\d{6}", name):
+        return ""
+    return name[:40]
+
+
+def _resolve_symbol_names_for_codes(
+    *,
+    codes: list[str],
     report_repository: NaverReportRepository,
     kis: KISAdapter | None,
+    initial_map: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    picks = _extract_pick_codes(snapshot)
+    unique_codes: list[str] = []
+    for code in codes:
+        text = str(code or "").strip()
+        if not re.fullmatch(r"\d{6}", text):
+            continue
+        if text not in unique_codes:
+            unique_codes.append(text)
+
     resolved: dict[str, str] = {}
+    for code, name in dict(initial_map or {}).items():
+        c = str(code or "").strip()
+        n = str(name or "").strip()
+        if re.fullmatch(r"\d{6}", c) and n and not re.fullmatch(r"\d{6}", n):
+            resolved[c] = n
+
+    if not unique_codes:
+        return resolved
 
     if hasattr(report_repository, "resolve_symbol_names"):
         try:
-            cached = report_repository.resolve_symbol_names(picks)
+            cached = report_repository.resolve_symbol_names(unique_codes)
         except Exception:
             cached = {}
         for code, name in dict(cached or {}).items():
@@ -234,7 +277,9 @@ def _resolve_pick_name_map(
             if text_name and not re.fullmatch(r"\d{6}", text_name):
                 resolved[str(code).strip()] = text_name
 
-    for code in picks:
+    for code in unique_codes:
+        if resolved.get(code):
+            continue
         rows = report_repository.search(query="", symbol=code, category="", limit=3)
         for row in rows:
             company_name = str(row.get("company_name") or "").strip()
@@ -250,7 +295,26 @@ def _resolve_pick_name_map(
                 resolved[code] = company_name
                 break
 
-    for code in picks:
+    for code in unique_codes:
+        if resolved.get(code):
+            continue
+        pykrx_name = _fetch_company_name_from_pykrx(code)
+        if pykrx_name:
+            resolved[code] = pykrx_name
+
+    unresolved = [code for code in unique_codes if not resolved.get(code)]
+    if unresolved and hasattr(report_repository, "refresh_symbol_directory_from_krx"):
+        try:
+            report_repository.refresh_symbol_directory_from_krx()
+            refreshed = report_repository.resolve_symbol_names(unresolved)
+        except Exception:
+            refreshed = {}
+        for code, name in dict(refreshed or {}).items():
+            text_name = str(name or "").strip()
+            if text_name and not re.fullmatch(r"\d{6}", text_name):
+                resolved[str(code).strip()] = text_name
+
+    for code in unique_codes:
         if resolved.get(code):
             continue
         naver_name = _fetch_company_name_from_naver(code)
@@ -258,7 +322,7 @@ def _resolve_pick_name_map(
             resolved[code] = naver_name
 
     if kis is not None:
-        for code in picks:
+        for code in unique_codes:
             if resolved.get(code):
                 continue
             try:
@@ -289,6 +353,20 @@ def _resolve_pick_name_map(
                 pass
 
     return resolved
+
+
+def _resolve_pick_name_map(
+    snapshot: dict,
+    report_repository: NaverReportRepository,
+    kis: KISAdapter | None,
+) -> dict[str, str]:
+    picks = _extract_pick_codes(snapshot)
+    return _resolve_symbol_names_for_codes(
+        codes=picks,
+        report_repository=report_repository,
+        kis=kis,
+        initial_map={},
+    )
 
 
 def _should_run_learning(
@@ -837,6 +915,7 @@ async def _execute_kis_forcexy_target_orders(
     balance_url = f"{resolved.api_url}/api/v1/balance"
     pair_candles_url = f"{resolved.api_url}/api/v1/pair_candles"
     forceenter_url = f"{resolved.api_url}/api/v1/forceenter"
+    trades_url = f"{resolved.api_url}/api/v1/trades"
     auth = bridge._auth_tuple(resolved.username, resolved.password)
     request_kwargs: dict[str, Any] = {"headers": {"Accept": "application/json"}}
     if auth is not None:
@@ -921,6 +1000,7 @@ async def _execute_kis_forcexy_target_orders(
 
             last_reason = ""
             done = False
+            stale_trade_reset_done = False
             for retry_stake in retry_stakes:
                 body["stakeamount"] = retry_stake
                 try:
@@ -941,6 +1021,23 @@ async def _execute_kis_forcexy_target_orders(
                     break
                 except Exception as exc:
                     last_reason = str(exc)
+                    trade_id = _extract_trade_id_from_forceenter_error(last_reason)
+                    if trade_id > 0 and not stale_trade_reset_done:
+                        try:
+                            drop_res = await client.delete(
+                                f"{trades_url}/{trade_id}",
+                                **request_kwargs,
+                            )
+                            drop_res.raise_for_status()
+                            stale_trade_reset_done = True
+                            logger.warning(
+                                "dropped stale open trade during forceenter retry: pair=%s trade_id=%s",
+                                pair,
+                                trade_id,
+                            )
+                            continue
+                        except Exception:
+                            pass
                     continue
 
             if not done:
@@ -1035,6 +1132,60 @@ async def _execute_kis_forcexy_target_orders(
 
 
 def _restart_kis_freqtrade_if_running(settings: AppSettings) -> dict[str, Any]:
+    def _is_live_pid(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            out = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "state="],
+                text=True,
+            ).strip()
+        except Exception:
+            return False
+        if not out:
+            return False
+        state = out[:1].upper()
+        return state != "Z"
+
+    def _list_live_kis_pids() -> list[int]:
+        out: list[int] = []
+        try:
+            ps_out = subprocess.check_output(
+                ["ps", "-ax", "-o", "pid=,command="],
+                text=True,
+            )
+        except Exception:
+            return out
+        for line in ps_out.splitlines():
+            text = str(line or "").strip()
+            if "freqtrade trade" not in text:
+                continue
+            if "config_kis_jurobot.json" not in text:
+                continue
+            parts = text.split(None, 1)
+            if not parts:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            if _is_live_pid(pid):
+                out.append(pid)
+        return sorted(set(out))
+
+    def _terminate_pids(pids: list[int]) -> None:
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                continue
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            alive = [pid for pid in pids if _is_live_pid(pid)]
+            if not alive:
+                return
+            time.sleep(0.1)
+
     manager = FreqtradeProcessManager(
         FreqtradeProcessManagerConfig(
             executable_path=settings.freqtrade_executable_path,
@@ -1050,46 +1201,21 @@ def _restart_kis_freqtrade_if_running(settings: AppSettings) -> dict[str, Any]:
             )
         ],
     )
+    live_pids = _list_live_kis_pids()
+    stopped_external_pids: list[int] = []
+    if len(live_pids) >= 2:
+        stopped_external_pids = list(live_pids)
+        _terminate_pids(live_pids)
+
     status = manager.list_statuses()[0]
-    external_pids: list[int] = []
     if not bool(status.get("running")):
-        try:
-            ps_out = subprocess.check_output(
-                ["ps", "-ax", "-o", "pid=,command="],
-                text=True,
+        fresh_live_pids = _list_live_kis_pids()
+        if fresh_live_pids:
+            stopped_external_pids = list(
+                sorted(set(stopped_external_pids + fresh_live_pids))
             )
-            for line in ps_out.splitlines():
-                text = str(line or "").strip()
-                if "freqtrade trade" not in text:
-                    continue
-                if "config_kis_jurobot.json" not in text:
-                    continue
-                parts = text.split(None, 1)
-                if not parts:
-                    continue
-                pid = int(parts[0])
-                if pid > 0:
-                    external_pids.append(pid)
-        except Exception:
-            external_pids = []
-        for pid in external_pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except Exception:
-                continue
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            alive = False
-            for pid in external_pids:
-                try:
-                    os.kill(pid, 0)
-                    alive = True
-                    break
-                except Exception:
-                    continue
-            if not alive:
-                break
-            time.sleep(0.1)
+            _terminate_pids(fresh_live_pids)
+
     stop_action = manager.stop("kis")
     start_action = manager.start("kis")
     return {
@@ -1097,7 +1223,7 @@ def _restart_kis_freqtrade_if_running(settings: AppSettings) -> dict[str, Any]:
         "stop_action": stop_action.get("action"),
         "start_action": start_action.get("action"),
         "pid": start_action.get("pid"),
-        "stopped_external_pids": external_pids,
+        "stopped_external_pids": stopped_external_pids,
     }
 
 
@@ -1163,6 +1289,21 @@ def _probe_kis_freqtrade_api(settings: AppSettings) -> dict[str, Any]:
 
 
 def _start_kis_freqtrade_if_stopped(settings: AppSettings) -> dict[str, Any]:
+    def _is_live_pid(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            out = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "state="],
+                text=True,
+            ).strip()
+        except Exception:
+            return False
+        if not out:
+            return False
+        state = out[:1].upper()
+        return state != "Z"
+
     manager = FreqtradeProcessManager(
         FreqtradeProcessManagerConfig(
             executable_path=settings.freqtrade_executable_path,
@@ -1179,7 +1320,8 @@ def _start_kis_freqtrade_if_stopped(settings: AppSettings) -> dict[str, Any]:
         ],
     )
     status = manager.list_statuses()[0]
-    if bool(status.get("running")):
+    running_pid = int(status.get("pid") or 0)
+    if bool(status.get("running")) and _is_live_pid(running_pid):
         return {
             "status": "ok",
             "action": "already_running",
@@ -1202,7 +1344,7 @@ def _start_kis_freqtrade_if_stopped(settings: AppSettings) -> dict[str, Any]:
             if not parts:
                 continue
             pid = int(parts[0])
-            if pid > 0:
+            if pid > 0 and _is_live_pid(pid):
                 external_pids.append(pid)
     except Exception:
         external_pids = []
@@ -1471,7 +1613,7 @@ def run() -> None:
                                         for ticker, weight in rebalance_targets.items()
                                     ),
                                 )
-                        if sent_ok and (did_symbol_sync or rebalance_targets):
+                        if did_symbol_sync or rebalance_targets:
                             try:
                                 refresh_result = _reload_kis_freqtrade_config(settings)
                                 if str(refresh_result.get("status")) != "ok":
@@ -1494,7 +1636,7 @@ def run() -> None:
                                     "kis freqtrade refresh after target sync: %s",
                                     restart_result,
                                 )
-                        if sent_ok and rebalance_targets:
+                        if rebalance_targets:
                             try:
                                 execution_result = asyncio.run(
                                     _execute_kis_forcexy_target_orders(
@@ -1537,24 +1679,13 @@ def run() -> None:
                                     str(row.get("pair") or "").split("/")[0].strip()
                                     for row in (executed_rows + failed_rows)
                                 ]
-                                if hasattr(report_repository, "resolve_symbol_names"):
-                                    try:
-                                        db_map = report_repository.resolve_symbol_names(
-                                            pair_tickers
-                                        )
-                                    except Exception:
-                                        db_map = {}
-                                    for code, name in dict(db_map or {}).items():
-                                        if (
-                                            re.fullmatch(r"\d{6}", str(code or ""))
-                                            and str(name or "").strip()
-                                            and not re.fullmatch(
-                                                r"\d{6}", str(name or "").strip()
-                                            )
-                                        ):
-                                            ticker_name_map[str(code).strip()] = str(
-                                                name
-                                            ).strip()
+                                resolved_map = _resolve_symbol_names_for_codes(
+                                    codes=pair_tickers,
+                                    report_repository=report_repository,
+                                    kis=kis,
+                                    initial_map=ticker_name_map,
+                                )
+                                ticker_name_map.update(resolved_map)
                                 notice_lines = [
                                     f"[Portfolio Coach Execution] {label} {next_advice_at.strftime('%Y-%m-%d %H:%M')} (KST)",
                                     f"- status: {execution_result.get('status')}",
@@ -1655,6 +1786,7 @@ def run() -> None:
             ),
             1,
         )
+        sleep_sec = min(sleep_sec, 60)
         time.sleep(sleep_sec)
 
 

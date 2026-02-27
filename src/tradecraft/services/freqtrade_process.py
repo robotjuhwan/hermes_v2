@@ -239,6 +239,13 @@ class FreqtradeProcessManager:
             self._clear_pid(bot.bot_id)
             pid = 0
 
+        if not running:
+            external_pids = self._find_running_pids_for_bot(config_path)
+            if external_pids:
+                pid = external_pids[0]
+                running = True
+                self._pid_path(bot.bot_id).write_text(str(pid), encoding="utf-8")
+
         return {
             "bot_id": bot.bot_id,
             "label": bot.label,
@@ -349,12 +356,48 @@ class FreqtradeProcessManager:
         if pid <= 0:
             return False
         try:
+            state = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "state="],
+                text=True,
+            ).strip()
+            if state and state[:1].upper() == "Z":
+                return False
+        except Exception:
+            pass
+        try:
             os.kill(pid, 0)
         except ProcessLookupError:
             return False
         except PermissionError:
             return True
         return True
+
+    def _find_running_pids_for_bot(self, config_path: Path) -> list[int]:
+        target = str(config_path)
+        out: list[int] = []
+        try:
+            ps_out = subprocess.check_output(
+                ["ps", "-ax", "-o", "pid=,command="],
+                text=True,
+            )
+        except Exception:
+            return out
+        for line in ps_out.splitlines():
+            text = str(line or "").strip()
+            if "freqtrade trade" not in text:
+                continue
+            if target not in text:
+                continue
+            parts = text.split(None, 1)
+            if not parts:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            if self._is_pid_alive(pid):
+                out.append(pid)
+        return out
 
     @staticmethod
     def _resolve_path(path_value: str) -> Path:
