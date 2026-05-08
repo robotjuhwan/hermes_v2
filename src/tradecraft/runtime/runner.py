@@ -5,6 +5,7 @@ import time
 
 from tradecraft.config import AppSettings
 from tradecraft.runtime.engine import RuntimeEngine
+from tradecraft.runtime.process_status import write_current_runner_pid
 from tradecraft.runtime.session_loader import load_runtime_sessions
 from tradecraft.runtime.state_store import RuntimeStateStore
 
@@ -22,6 +23,7 @@ def _build_runtime_engine(settings: AppSettings, interval: int) -> tuple[Runtime
 
 
 def run() -> None:
+    write_current_runner_pid("runtime")
     settings = AppSettings()
     interval = max(int(settings.runtime_write_interval_sec), 1)
     store = RuntimeStateStore(settings.runtime_state_path)
@@ -31,6 +33,8 @@ def run() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     logger.info(
         "runtime started: state_path=%s interval=%ss sessions=%s",
         settings.runtime_state_path,

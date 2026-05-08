@@ -786,7 +786,7 @@ class PortfolioCoachConfig:
     llm_bridge_url: str = ""
     llm_bridge_token: str = ""
     llm_bridge_timeout_ms: int = 60000
-    llm_model: str = "gpt-5.3-codex"
+    llm_model: str = "gpt-5.5"
 
 
 class KISHoldingsProvider:
@@ -2313,7 +2313,6 @@ class PortfolioCoachService:
         date_kst, time_kst = _to_kst_date_time(as_of)
         data_ref = f"DATA(as_of={date_kst} {time_kst} KST)"
         entry = self._action_entry(as_of)
-        max_cap = float(self.config.max_single_position_weight)
 
         report_rows = self._collect_recent_report_rows(lookback_days=90)
         if len(report_rows) < 300:

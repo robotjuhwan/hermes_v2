@@ -10,23 +10,23 @@ Requires-Dist: pydantic>=2.8.0
 Requires-Dist: pydantic-settings>=2.4.0
 Requires-Dist: httpx>=0.27.0
 Requires-Dist: pypdf>=5.0.0
+Requires-Dist: chromadb>=0.5.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.2.0; extra == "dev"
 Requires-Dist: ruff>=0.5.0; extra == "dev"
 
 # TradeCraft Control Plane
 
-Freqtrade 기반 자동매매를 모니터링/제어하기 위한 Control Plane 프로젝트입니다.
+거래소 자산, 리서치 지식, 투자 도움 에이전트를 통합하는 Control Plane 프로젝트입니다.
 
 - 웹 UI 우선: 반응형(PC/모바일)
 - 거래소/시장 탭: 전체, 업비트, 바이낸스, 국장, 미장 잔고 조회
 - 전체 자산 총합 + 탭별 자산/현금/평가손익 요약
 - 자산 상세: 계좌현금(KRW/USDT/USD)과 보유 포지션을 단일 테이블로 통합
-- 봇 세션 패널: Freqtrade Spot/Futures 오픈 포지션 + 런타임 세션 상태 모니터링
+- 세션 패널: 로컬 런타임 세션 상태 모니터링
 - 단기 세션 지표: 실현/미실현/수수료/순손익(실시간) 분리 표시
 - 밸런스 세션 원칙: 드리프트, 턴오버, 벤치마크, 트래킹에러, 리밸런스 기준 표시
 - Telegram API 브릿지: 상태 조회 + webhook 수신 + getUpdates 폴링
-- Freqtrade API 브릿지: Spot/Futures 오픈 포지션/PNL/세션 연동
 - Upbit API 연동(초기): 키 설정 시 대시보드 업비트 잔고 실조회
 - Telegram CLI:
   - `/help`
@@ -36,7 +36,7 @@ Freqtrade 기반 자동매매를 모니터링/제어하기 위한 Control Plane 
   - `/upbit` `/binance` `/krx` `/kr2` `/us`
   - `/sessions`
   - `/session <id>`
-- Tradecraft는 UI/제어 계층, 자동매매 실행은 외부 Freqtrade 인스턴스가 담당
+- Tradecraft는 UI/제어/지식 계층을 담당하고, 거래소별 자산 조회와 KIS 직접 트레이더를 연동합니다.
 - 백엔드: FastAPI
 
 Telegram 설정은 UI에서 변경하지 않고 `.env`로만 관리합니다.
@@ -56,11 +56,20 @@ Tradecraft Control Plane(UI + Telegram + Integrations):
 tradecraft-control
 ```
 
+리포트 수집 + RAG sync + KRX 리서치/조언 통합 러너:
+
+```bash
+tradecraft-intelligence
+```
+
 KRX 리서치 스케줄러(Codex CLI + 리포트 URL 수집):
 
 ```bash
 tradecraft-research
 ```
+
+`tradecraft-research`는 호환용으로 유지됩니다. 리포트 수집까지 함께 돌릴 때는
+`tradecraft-intelligence` 하나만 켜는 것을 권장합니다.
 
 KIS LLM 트레이더 러너(리서치 기반 종목선정 + 주문 실행):
 
@@ -74,7 +83,37 @@ tradecraft-kis-trader
 tradecraft-naver-reports
 ```
 
-Freqtrade Spot/Futures는 외부 프로세스로 실행되며, Tradecraft에서 `/api/freqtrade/strategies` 제어 API를 통해 전략 시작/중지/상태 확인이 가능합니다.
+`tradecraft-naver-reports`는 리포트 수집만 따로 돌릴 때 사용합니다.
+`tradecraft-intelligence`와 동시에 켜면 리포트 수집이 중복될 수 있습니다.
+
+네이버 리포트 전용 API 서버(UI 포함):
+
+```bash
+tradecraft-reports-api
+```
+
+네이버 리포트 전용 워커(주기 수집):
+
+```bash
+tradecraft-reports-worker
+```
+
+네이버 리포트 전용 올인원 실행(API + 워커 + UI 빌드 확인):
+
+```bash
+tradecraft-reports-stack
+```
+
+리포트 전용 UI 빌드(React + Vite):
+
+```bash
+cd /Users/juhwan/hermes_v2/web/reports-console
+npm install
+npm run build
+```
+
+`npm run build` 결과물은 `src/tradecraft/reports_api/web_dist/`에 생성되며, 저장소에는 커밋하지 않습니다.
+`tradecraft-reports-stack`은 UI 산출물이 없으면 자동으로 `npm install` + `npm run build`를 수행한 뒤 API/워커를 함께 시작합니다.
 
 브라우저에서 [http://127.0.0.1:8000](http://127.0.0.1:8000) 접속.
 
@@ -99,20 +138,6 @@ Freqtrade Spot/Futures는 외부 프로세스로 실행되며, Tradecraft에서 
 - `BINANCE_USDT_KRW`
 - `USD_KRW`
 - `FX_CACHE_TTL_SEC`
-- `FREQTRADE_SPOT_API_URL`
-- `FREQTRADE_SPOT_USERNAME`
-- `FREQTRADE_SPOT_PASSWORD`
-- `FREQTRADE_SPOT_CONFIG_PATH`
-- `FREQTRADE_FUTURES_API_URL`
-- `FREQTRADE_FUTURES_USERNAME`
-- `FREQTRADE_FUTURES_PASSWORD`
-- `FREQTRADE_FUTURES_CONFIG_PATH`
-- `FREQTRADE_BOT_API_URLS`
-- `FREQTRADE_EXECUTABLE_PATH`
-- `FREQTRADE_WORKDIR`
-- `FREQTRADE_RUNTIME_DIR`
-- `FREQTRADE_STOP_TIMEOUT_SEC`
-- `FREQTRADE_TIMEOUT_SEC`
 - `KIS_BASE_URL`
 - `KIS_PRIMARY_APP_KEY`
 - `KIS_PRIMARY_APP_SECRET`
@@ -157,26 +182,40 @@ Freqtrade Spot/Futures는 외부 프로세스로 실행되며, Tradecraft에서 
 - `TRADECRAFT_NAVER_REPORTS_MAX_PAGES`
 - `TRADECRAFT_NAVER_REPORTS_SINCE_DATE`
 - `TRADECRAFT_NAVER_REPORTS_REQUEST_DELAY_SEC`
+- `TRADECRAFT_NAVER_REPORTS_LLM_FACTS_ENABLED`
 - `TRADECRAFT_RAG_ENABLED`
 - `TRADECRAFT_RAG_PERSIST_PATH`
 - `TRADECRAFT_RAG_COLLECTION_NAME`
 - `TRADECRAFT_RAG_SYNC_CHUNK_LIMIT`
+- `TRADECRAFT_RAG_SYNC_BATCH_SIZE`
+- `TRADECRAFT_RAG_SKIP_EXISTING`
 - `TRADECRAFT_RAG_QUERY_TOP_K`
+- `TRADECRAFT_RAG_QUERY_OVERSAMPLE_FACTOR`
 - `TRADECRAFT_HOST`
 - `TRADECRAFT_PORT`
 - `TRADECRAFT_ALLOW_ORIGINS`
+- `TRADECRAFT_REPORTS_API_HOST`
+- `TRADECRAFT_REPORTS_API_PORT`
+- `TRADECRAFT_REPORTS_API_TOKEN`
+- `TRADECRAFT_REPORTS_API_TOKENS`
+- `TRADECRAFT_REPORTS_UI_ALLOWED_CIDRS`
+- `TRADECRAFT_REPORTS_UI_TRUST_PROXY`
+- `TRADECRAFT_REPORTS_WORKER_STATE_PATH`
 
-RAG is optional. If `chromadb` is not installed, RAG endpoints stay available but return `available=false`.
+RAG uses ChromaDB. Report chunks are synced in bounded batches and existing
+vector ids are skipped by default so the intelligence runner can keep the
+vector index fresh without re-embedding the full report corpus every cycle.
 
 운영 기준:
-- 자동매매 세션/오픈 포지션 연동은 `FREQTRADE_*` 설정을 사용합니다.
-- 전략별 포트 분리가 필요하면 `FREQTRADE_BOT_API_URLS`(`bot_id=url,bot_id=url`)로 봇별 API URL을 지정할 수 있습니다.
+- 자동매매 실행은 KIS 직접 트레이더와 거래소별 자산 어댑터를 중심으로 구성합니다.
 - `TRADECRAFT_RUNTIME_*`는 로컬 런타임 스냅샷 호환용(옵션)입니다.
 
 ## Reference Docs
 
 - Exchange/Broker official API links:
   - `/Users/juhwan/hermes_v2/docs/exchange_api_official_docs.md`
+- Reports pilot runbook:
+  - `/Users/juhwan/hermes_v2/docs/reports_pilot_runbook.md`
 
 ## API (current)
 
@@ -184,12 +223,6 @@ RAG is optional. If `chromadb` is not installed, RAG endpoints stay available bu
 - `GET /api/dashboard`
 - `GET /api/telegram/status`
 - `POST /api/telegram/webhook`
-- `GET /api/freqtrade/strategies`
-- `POST /api/freqtrade/strategies/start-all`
-- `POST /api/freqtrade/strategies/stop-all`
-- `POST /api/freqtrade/strategies/{bot_id}/start`
-- `POST /api/freqtrade/strategies/{bot_id}/stop`
-- `POST /api/freqtrade/strategies/{bot_id}/usdt-limit`
 - `GET /api/kis/trader/status`
 - `POST /api/kis/trader/run-once`
 - `GET /api/reports/status`
@@ -199,13 +232,37 @@ RAG is optional. If `chromadb` is not installed, RAG endpoints stay available bu
 - `POST /api/rag/sync`
 - `GET /api/rag/search`
 
+## Reports API (dedicated)
+
+전용 서버(`tradecraft-reports-api`)는 기본 `:8010` 포트에서 동작하며,
+`/v1/*`는 Bearer 토큰 인증을 사용합니다.
+
+- `GET /v1/health`
+- `GET /v1/reports/status`
+- `POST /v1/reports/crawl-once`
+- `GET /v1/reports/search`
+- `GET /v1/reports/{report_id}`
+- `POST /v1/reports/symbol-directory/refresh`
+- `GET /v1/rag/status`
+- `POST /v1/rag/sync`
+- `GET /v1/rag/search`
+
+UI 백엔드용 API(`tradecraft-reports-api` 동일 서버):
+- `GET /ui-api/overview`
+- `GET /ui-api/reports/recent`
+- `POST /ui-api/actions/crawl-once`
+- `POST /ui-api/actions/rag-sync`
+- `POST /ui-api/actions/symbol-refresh`
+
+운영 메모:
+- `GET /v1/health`는 배포 준비 상태(`readiness`)와 워커 상태(`worker`)를 함께 노출합니다.
+- `GET /v1/reports/status`와 `GET /ui-api/overview`도 동일한 워커/배포 상태를 포함합니다.
+- 워커 상태 파일 기본값은 `.runtime/reports_worker_state.json`입니다.
+- 토큰 회전은 `TRADECRAFT_REPORTS_API_TOKENS`에 `new-token,old-token` 순서로 잠시 겹치게 넣고 재시작한 뒤, 클라이언트 전환 후 구 토큰을 제거하는 방식으로 운영합니다.
+
 웹훅 URL이 비어 있어도 서버가 `getUpdates` 폴링으로 명령을 처리합니다.
 
 Upbit 키가 설정되면 `GET /api/dashboard`의 업비트 자산이 실계정 잔고로 대체됩니다.
-
-Freqtrade Spot/Futures API 정보가 설정되면 `GET /api/dashboard`의 세션 목록에 Freqtrade 오픈 포지션이 반영됩니다.
-
-전략 중지 API는 정지 전에 해당 봇의 `/forceexit all`을 호출해 오픈 포지션 정리를 시도한 후 프로세스를 중지합니다.
 
 `POST /api/telegram/webhook`로 들어온 텔레그램 명령어는 아래를 지원합니다.
 

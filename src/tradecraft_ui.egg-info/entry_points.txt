@@ -1,7 +1,15 @@
 [console_scripts]
 tradecraft-control = tradecraft.main:run
+tradecraft-intelligence = tradecraft.runtime.intelligence_runner:run
+tradecraft-investment-memory = tradecraft.runtime.investment_memory_runner:run
+tradecraft-kis-block-trader = tradecraft.runtime.kis_block_trader_runner:run
 tradecraft-kis-trader = tradecraft.runtime.kis_trader_runner:run
+tradecraft-market-judge = tradecraft.runtime.market_judge_runner:run
 tradecraft-naver-reports = tradecraft.runtime.naver_reports_runner:run
+tradecraft-reports-api = tradecraft.reports_api.main:run
+tradecraft-reports-stack = tradecraft.reports_api.stack:run
+tradecraft-reports-worker = tradecraft.reports_api.worker:run
 tradecraft-research = tradecraft.runtime.research_runner:run
 tradecraft-runtime = tradecraft.runtime.runner:run
+tradecraft-strategy-insights = tradecraft.runtime.strategy_insights_runner:run
 tradecraft-ui = tradecraft.main:run

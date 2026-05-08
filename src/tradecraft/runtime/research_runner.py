@@ -1,31 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import re
-import signal
-import subprocess
 import time
 from datetime import datetime, timedelta
 from datetime import date as date_type
-from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import httpx
 
 from tradecraft.config import AppSettings
+from tradecraft.runtime.process_status import write_current_runner_pid
 from tradecraft.runtime.state_store import RuntimeStateStore, utc_now_iso
-from tradecraft.services.freqtrade import (
-    FreqtradeBotConfig,
-    FreqtradeBridge,
-    FreqtradeBridgeConfig,
-)
-from tradecraft.services.freqtrade_process import (
-    FreqtradeProcessManager,
-    FreqtradeProcessManagerConfig,
+from tradecraft.services.intelligence import (
+    build_report_intelligence_stack,
+    run_report_collection_cycle,
 )
 from tradecraft.services.kis import KISAdapter, KISConfig
 from tradecraft.services.portfolio_coach import (
@@ -39,7 +30,6 @@ from tradecraft.services.research_pipeline import (
 )
 from tradecraft.services.krx_holiday import KRXHolidayCalendar
 from tradecraft.services.naver_reports import NaverReportRepository
-from tradecraft.services.rag_store import RAGStore, RAGStoreConfig
 from tradecraft.services.telegram import TelegramBridge, TelegramConfig
 
 logger = logging.getLogger(__name__)
@@ -75,6 +65,7 @@ def _build_pipeline(settings: AppSettings) -> ResearchPipeline:
         llm_bridge_token=settings.llm_bridge_token,
         llm_bridge_timeout_ms=settings.llm_bridge_timeout_ms,
         llm_model=settings.llm_model,
+        market_intelligence_sources=settings.market_intelligence_source_list,
     )
     return ResearchPipeline(config)
 
@@ -161,17 +152,6 @@ def _parse_krw_amount(value: Any) -> float:
     if not normalized:
         return 0.0
     return max(_safe_float(normalized), 0.0)
-
-
-def _extract_trade_id_from_forceenter_error(reason: str) -> int:
-    text = str(reason or "")
-    match = re.search(r"already open - id:\s*(\d+)", text)
-    if not match:
-        return 0
-    try:
-        return int(match.group(1))
-    except Exception:
-        return 0
 
 
 def _extract_pick_codes(snapshot: dict, limit: int = 6) -> list[str]:
@@ -521,7 +501,6 @@ def _sync_kis_trader_targets_from_morning_advice(
     scheduled_at: datetime,
     trader_state_path: str,
     max_symbols: int,
-    freqtrade_runtime_dir: str = "",
 ) -> list[str]:
     if str(label).strip() != "장전":
         return []
@@ -556,29 +535,6 @@ def _sync_kis_trader_targets_from_morning_advice(
         "%Y-%m-%d %H:%M KST"
     )
     store.write_snapshot(payload)
-
-    runtime_dir = str(freqtrade_runtime_dir or "").strip()
-    if runtime_dir:
-        override_path = Path(runtime_dir) / "kis.override.json"
-        override_payload: dict[str, Any] = {}
-        try:
-            if override_path.exists():
-                loaded = json.loads(override_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    override_payload = loaded
-        except Exception:
-            override_payload = {}
-
-        exchange_payload = override_payload.get("exchange")
-        if not isinstance(exchange_payload, dict):
-            exchange_payload = {}
-        exchange_payload["pair_whitelist"] = [f"{code}/KRW" for code in picks]
-        override_payload["exchange"] = exchange_payload
-        override_path.parent.mkdir(parents=True, exist_ok=True)
-        override_path.write_text(
-            json.dumps(override_payload, ensure_ascii=True),
-            encoding="utf-8",
-        )
     return picks
 
 
@@ -677,49 +633,11 @@ def _extract_total_value_krw_from_payload(payload: dict[str, Any] | None) -> flo
     return 0.0
 
 
-def _extract_balance_totals(
-    balance_payload: dict[str, Any] | None,
-) -> tuple[float, float]:
-    if not isinstance(balance_payload, dict):
-        return 0.0, 0.0
-
-    total = _safe_float(balance_payload.get("total") or balance_payload.get("value"))
-    krw_free = 0.0
-
-    currencies = balance_payload.get("currencies")
-    if isinstance(currencies, list):
-        for row in currencies:
-            if not isinstance(row, dict):
-                continue
-            if str(row.get("currency") or "").upper() != "KRW":
-                continue
-            krw_free = max(
-                _safe_float(row.get("free") or row.get("balance") or row.get("value")),
-                0.0,
-            )
-            if total <= 0:
-                total = max(_safe_float(row.get("balance") or row.get("free")), 0.0)
-            break
-
-    return max(total, 0.0), krw_free
-
-
-def _sum_open_stake_amount(status_rows: list[dict[str, Any]]) -> float:
-    open_stake = 0.0
-    for row in status_rows:
-        if not isinstance(row, dict):
-            continue
-        if not bool(row.get("is_open", True)):
-            continue
-        open_stake += max(_safe_float(row.get("stake_amount")), 0.0)
-    return open_stake
-
-
-def _sync_kis_rebalance_targets_to_freqtrade_override(
+def _sync_kis_rebalance_targets_to_trader_state(
     *,
     payload: dict[str, Any] | None,
     snapshot: dict[str, Any] | None = None,
-    runtime_dir: str,
+    trader_state_path: str,
     max_symbols: int,
 ) -> dict[str, float]:
     targets = _extract_rebalance_target_weights_from_payload(
@@ -747,28 +665,23 @@ def _sync_kis_rebalance_targets_to_freqtrade_override(
                     for code in missing:
                         targets[code] = equal_weight
 
-    path = str(runtime_dir or "").strip()
+    path = str(trader_state_path or "").strip()
     if not path:
         return {}
 
-    override_path = Path(path) / "kis.override.json"
-    override_payload: dict[str, Any] = {}
-    try:
-        if override_path.exists():
-            loaded = json.loads(override_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                override_payload = loaded
-    except Exception:
-        override_payload = {}
+    store = RuntimeStateStore(path)
+    trader_payload = store.read_snapshot() or {}
+    if not isinstance(trader_payload, dict):
+        trader_payload = {}
 
     if target_cash_weight is None:
-        existing = _safe_float(override_payload.get("tradecraft_target_cash_weight"))
+        existing = _safe_float(trader_payload.get("target_cash_weight"))
         if 0.0 <= existing < 1.0:
             target_cash_weight = round(existing, 6)
             investable_ratio = max(1.0 - target_cash_weight, 0.0)
 
     if not targets:
-        existing_weights = override_payload.get("tradecraft_target_weights")
+        existing_weights = trader_payload.get("target_weights")
         if isinstance(existing_weights, dict):
             recovered: dict[str, float] = {}
             for raw_ticker, raw_weight in existing_weights.items():
@@ -797,575 +710,28 @@ def _sync_kis_rebalance_targets_to_freqtrade_override(
     if not targets:
         return {}
 
-    override_payload["tradecraft_target_weights"] = {
+    trader_payload["target_weights"] = {
         ticker: round(weight, 6) for ticker, weight in targets.items()
     }
+    trader_payload["target_symbols"] = list(targets.keys())
     if target_cash_weight is not None:
-        override_payload["tradecraft_target_cash_weight"] = round(target_cash_weight, 6)
+        trader_payload["target_cash_weight"] = round(target_cash_weight, 6)
     if portfolio_total_krw > 0:
-        override_payload["tradecraft_portfolio_total_krw"] = round(
-            portfolio_total_krw, 2
-        )
-    override_payload["tradecraft_target_weights_updated_at"] = utc_now_iso()
-    override_payload["force_entry_enable"] = True
-
-    exchange_payload = override_payload.get("exchange")
-    if not isinstance(exchange_payload, dict):
-        exchange_payload = {}
-    target_pairs = [f"{ticker}/KRW" for ticker in targets.keys()]
-    existing_pairs = [
-        str(pair).strip()
-        for pair in list(exchange_payload.get("pair_whitelist") or [])
-        if str(pair).strip()
-    ]
-    merged_pairs = list(dict.fromkeys(target_pairs + existing_pairs))
-    exchange_payload["pair_whitelist"] = merged_pairs[
-        : max(pick_limit, len(target_pairs))
-    ]
-    override_payload["exchange"] = exchange_payload
-
-    override_path.parent.mkdir(parents=True, exist_ok=True)
-    override_path.write_text(
-        json.dumps(override_payload, ensure_ascii=True),
-        encoding="utf-8",
-    )
+        trader_payload["portfolio_total_krw"] = round(portfolio_total_krw, 2)
+    now_iso = utc_now_iso()
+    trader_payload["target_weights_updated_at"] = now_iso
+    trader_payload["target_symbols_updated_at"] = now_iso
+    trader_payload["target_weights_source"] = "research_runner_portfolio_coach"
+    store.write_snapshot(trader_payload)
     return targets
 
 
-def _extract_reduce_tickers_from_payload(payload: dict[str, Any] | None) -> set[str]:
-    out: set[str] = set()
-    if not isinstance(payload, dict):
-        return out
-    pack = payload.get("pack")
-    if not isinstance(pack, dict):
-        return out
-    seed = pack.get("advice_seed_json")
-    if not isinstance(seed, dict):
-        return out
-    action_plan = seed.get("action_plan")
-    if not isinstance(action_plan, dict):
-        return out
-    for row in list(action_plan.get("rebalance_table_rows") or []):
-        if not isinstance(row, dict):
-            continue
-        action = str(row.get("action") or "").upper().strip()
-        if action not in {"REDUCE", "SELL"}:
-            continue
-        ticker = str(row.get("ticker") or "").strip()
-        if re.fullmatch(r"\d{6}", ticker):
-            out.add(ticker)
-    return out
-
-
-async def _execute_kis_forcexy_target_orders(
-    *,
-    settings: AppSettings,
-    payload: dict[str, Any] | None,
-    rebalance_targets: dict[str, float],
-) -> dict[str, Any]:
-    if not rebalance_targets:
-        return {"status": "skipped", "reason": "empty_targets"}
-
-    bridge = FreqtradeBridge(
-        FreqtradeBridgeConfig(
-            bots=[
-                FreqtradeBotConfig(
-                    bot_id="kis",
-                    label="Freqtrade KIS",
-                    config_path="third_party/freqtrade/user_data/config_kis_jurobot.json",
-                )
-            ],
-            timeout_sec=4.0,
-            bot_api_url_overrides=settings.freqtrade_bot_api_url_map,
-        )
-    )
-    resolved = bridge._resolve_bot_config(bridge.config.bots[0])
-    if resolved is None:
-        return {"status": "skipped", "reason": "kis_api_not_configured"}
-
-    reduce_tickers = _extract_reduce_tickers_from_payload(payload)
-    buy_tickers = [
-        ticker
-        for ticker, _ in sorted(
-            rebalance_targets.items(), key=lambda item: item[1], reverse=True
-        )
-        if ticker not in reduce_tickers
-    ]
-    target_cash_weight = _extract_target_cash_weight_from_payload(payload)
-    target_invested_ratio = min(
-        max(sum(float(weight) for weight in rebalance_targets.values()), 0.0), 1.0
-    )
-    if target_cash_weight is not None:
-        target_invested_ratio = max(1.0 - target_cash_weight, 0.0)
-    target_cash_weight_effective = max(1.0 - target_invested_ratio, 0.0)
-
-    max_orders = max(int(settings.kis_trader_max_orders_per_cycle), 1)
-    buy_tickers = buy_tickers[:max_orders]
-    early_reason = ""
-    if not buy_tickers:
-        early_reason = "no_buy_targets"
-
-    total_value_krw = _extract_total_value_krw_from_payload(payload)
-
-    max_budget = max(float(settings.kis_trader_max_budget_per_order_krw), 0.0)
-    min_budget = max(
-        float(getattr(settings, "portfolio_coach_min_trade_krw", 10000)), 10000.0
-    )
-    status_url = f"{resolved.api_url}/api/v1/status"
-    balance_url = f"{resolved.api_url}/api/v1/balance"
-    pair_candles_url = f"{resolved.api_url}/api/v1/pair_candles"
-    forceenter_url = f"{resolved.api_url}/api/v1/forceenter"
-    trades_url = f"{resolved.api_url}/api/v1/trades"
-    auth = bridge._auth_tuple(resolved.username, resolved.password)
-    request_kwargs: dict[str, Any] = {"headers": {"Accept": "application/json"}}
-    if auth is not None:
-        request_kwargs["auth"] = auth
-
-    executed: list[dict[str, Any]] = []
-    failed: list[dict[str, Any]] = []
-    final_status_rows: list[dict[str, Any]] = []
-    balance_payload: dict[str, Any] | None = None
-    timeout = httpx.Timeout(4.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        ready_tickers: list[str] = list(buy_tickers)
-        for ticker in list(buy_tickers):
-            pair = f"{ticker}/KRW"
-            try:
-                candles_res = await client.get(
-                    pair_candles_url,
-                    params={"pair": pair, "timeframe": "5m", "limit": 20},
-                    **request_kwargs,
-                )
-                candles_res.raise_for_status()
-                candles_payload = candles_res.json()
-                candles = (
-                    candles_payload.get("data")
-                    if isinstance(candles_payload, dict)
-                    else []
-                )
-                if len(list(candles or [])) == 0:
-                    logger.warning(
-                        "pair_candles empty; continuing with forceenter: %s",
-                        pair,
-                    )
-            except Exception:
-                logger.warning(
-                    "pair_candles check failed; continuing with forceenter: %s",
-                    pair,
-                )
-                continue
-
-        buy_tickers = ready_tickers
-        if not buy_tickers:
-            early_reason = "no_candle_ready_targets"
-
-        try:
-            status_res = await client.get(status_url, **request_kwargs)
-            status_res.raise_for_status()
-            status_payload = status_res.json()
-            status_rows = [
-                row for row in list(status_payload or []) if isinstance(row, dict)
-            ]
-            open_pairs = {str(row.get("pair") or "").strip() for row in status_rows}
-            final_status_rows = status_rows
-        except Exception:
-            status_rows = []
-            open_pairs = set()
-
-        for ticker in buy_tickers:
-            pair = f"{ticker}/KRW"
-            if pair in open_pairs:
-                continue
-            target_weight = float(rebalance_targets.get(ticker) or 0.0)
-            stake_amount = max_budget
-            if total_value_krw > 0 and target_weight > 0:
-                stake_amount = min(
-                    max_budget, max(min_budget, total_value_krw * target_weight)
-                )
-            if stake_amount <= 0:
-                continue
-            body = {
-                "pair": pair,
-                "side": "long",
-                "ordertype": "market",
-                "stakeamount": round(stake_amount, 2),
-                "entry_tag": "pc_target_rebalance",
-            }
-            retry_stakes = [
-                round(stake_amount, 2),
-                round(max(stake_amount, 200000.0), 2),
-                round(max(stake_amount, 400000.0), 2),
-            ]
-            retry_stakes = list(dict.fromkeys(retry_stakes))
-
-            last_reason = ""
-            done = False
-            stale_trade_reset_done = False
-            for retry_stake in retry_stakes:
-                body["stakeamount"] = retry_stake
-                try:
-                    response = await client.post(
-                        forceenter_url, json=body, **request_kwargs
-                    )
-                    response.raise_for_status()
-                    payload_json = response.json()
-                    executed.append(
-                        {
-                            "ticker": ticker,
-                            "pair": pair,
-                            "stakeamount": retry_stake,
-                            "trade_id": payload_json.get("trade_id"),
-                        }
-                    )
-                    done = True
-                    break
-                except Exception as exc:
-                    last_reason = str(exc)
-                    trade_id = _extract_trade_id_from_forceenter_error(last_reason)
-                    if trade_id > 0 and not stale_trade_reset_done:
-                        try:
-                            drop_res = await client.delete(
-                                f"{trades_url}/{trade_id}",
-                                **request_kwargs,
-                            )
-                            drop_res.raise_for_status()
-                            stale_trade_reset_done = True
-                            logger.warning(
-                                "dropped stale open trade during forceenter retry: pair=%s trade_id=%s",
-                                pair,
-                                trade_id,
-                            )
-                            continue
-                        except Exception:
-                            pass
-                    continue
-
-            if not done:
-                failed.append(
-                    {
-                        "ticker": ticker,
-                        "pair": pair,
-                        "reason": last_reason,
-                    }
-                )
-
-        try:
-            status_res = await client.get(status_url, **request_kwargs)
-            status_res.raise_for_status()
-            status_payload = status_res.json()
-            final_status_rows = [
-                row for row in list(status_payload or []) if isinstance(row, dict)
-            ]
-        except Exception:
-            pass
-
-        try:
-            balance_res = await client.get(balance_url, **request_kwargs)
-            balance_res.raise_for_status()
-            payload_json = balance_res.json()
-            if isinstance(payload_json, dict):
-                balance_payload = payload_json
-        except Exception:
-            pass
-
-    open_stake_total_krw = _sum_open_stake_amount(final_status_rows)
-    balance_total_krw, balance_krw_free_krw = _extract_balance_totals(balance_payload)
-    ratio_base_krw = total_value_krw if total_value_krw > 0 else balance_total_krw
-
-    actual_invested_ratio: float | None = None
-    if ratio_base_krw > 0:
-        actual_invested_ratio = min(
-            max(open_stake_total_krw / ratio_base_krw, 0.0), 1.0
-        )
-    elif balance_total_krw > 0:
-        actual_invested_ratio = min(
-            max(1.0 - (balance_krw_free_krw / balance_total_krw), 0.0), 1.0
-        )
-
-    actual_cash_ratio: float | None = None
-    if actual_invested_ratio is not None:
-        actual_cash_ratio = max(1.0 - actual_invested_ratio, 0.0)
-
-    ratio_metrics: dict[str, Any] = {
-        "target_invested_ratio": round(target_invested_ratio, 6),
-        "target_cash_weight": round(target_cash_weight_effective, 6),
-        "actual_invested_ratio": (
-            round(actual_invested_ratio, 6)
-            if actual_invested_ratio is not None
-            else None
-        ),
-        "actual_cash_ratio": round(actual_cash_ratio, 6)
-        if actual_cash_ratio is not None
-        else None,
-        "allocation_ratio_base_krw": round(ratio_base_krw, 2),
-        "open_stake_total_krw": round(open_stake_total_krw, 2),
-    }
-    logger.info(
-        "kis forcexy allocation ratios: target_invested=%s actual_invested=%s target_cash=%s actual_cash=%s base_krw=%.0f open_stake_krw=%.0f",
-        f"{target_invested_ratio*100:.1f}%",
-        (
-            f"{actual_invested_ratio*100:.1f}%"
-            if actual_invested_ratio is not None
-            else "n/a"
-        ),
-        f"{target_cash_weight_effective*100:.1f}%",
-        f"{actual_cash_ratio*100:.1f}%" if actual_cash_ratio is not None else "n/a",
-        ratio_base_krw,
-        open_stake_total_krw,
-    )
-
-    if executed:
-        return {
-            "status": "ok",
-            "attempted": len(buy_tickers),
-            "executed": executed,
-            "failed": failed,
-            **ratio_metrics,
-        }
-    return {
-        "status": "skipped",
-        "reason": early_reason or "forceenter_not_executed",
-        "attempted": len(buy_tickers),
-        "failed": failed,
-        **ratio_metrics,
-    }
-
-
-def _restart_kis_freqtrade_if_running(settings: AppSettings) -> dict[str, Any]:
-    def _is_live_pid(pid: int) -> bool:
-        if pid <= 0:
-            return False
-        try:
-            out = subprocess.check_output(
-                ["ps", "-p", str(pid), "-o", "state="],
-                text=True,
-            ).strip()
-        except Exception:
-            return False
-        if not out:
-            return False
-        state = out[:1].upper()
-        return state != "Z"
-
-    def _list_live_kis_pids() -> list[int]:
-        out: list[int] = []
-        try:
-            ps_out = subprocess.check_output(
-                ["ps", "-ax", "-o", "pid=,command="],
-                text=True,
-            )
-        except Exception:
-            return out
-        for line in ps_out.splitlines():
-            text = str(line or "").strip()
-            if "freqtrade trade" not in text:
-                continue
-            if "config_kis_jurobot.json" not in text:
-                continue
-            parts = text.split(None, 1)
-            if not parts:
-                continue
-            try:
-                pid = int(parts[0])
-            except ValueError:
-                continue
-            if _is_live_pid(pid):
-                out.append(pid)
-        return sorted(set(out))
-
-    def _terminate_pids(pids: list[int]) -> None:
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except Exception:
-                continue
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            alive = [pid for pid in pids if _is_live_pid(pid)]
-            if not alive:
-                return
-            time.sleep(0.1)
-
-    manager = FreqtradeProcessManager(
-        FreqtradeProcessManagerConfig(
-            executable_path=settings.freqtrade_executable_path,
-            workdir=settings.freqtrade_workdir,
-            runtime_dir=settings.freqtrade_runtime_dir,
-            stop_timeout_sec=settings.freqtrade_stop_timeout_sec,
-        ),
-        bots=[
-            FreqtradeBotConfig(
-                bot_id="kis",
-                label="Freqtrade KIS",
-                config_path="third_party/freqtrade/user_data/config_kis_jurobot.json",
-            )
-        ],
-    )
-    live_pids = _list_live_kis_pids()
-    stopped_external_pids: list[int] = []
-    if len(live_pids) >= 2:
-        stopped_external_pids = list(live_pids)
-        _terminate_pids(live_pids)
-
-    status = manager.list_statuses()[0]
-    if not bool(status.get("running")):
-        fresh_live_pids = _list_live_kis_pids()
-        if fresh_live_pids:
-            stopped_external_pids = list(
-                sorted(set(stopped_external_pids + fresh_live_pids))
-            )
-            _terminate_pids(fresh_live_pids)
-
-    stop_action = manager.stop("kis")
-    start_action = manager.start("kis")
-    return {
-        "status": "ok",
-        "stop_action": stop_action.get("action"),
-        "start_action": start_action.get("action"),
-        "pid": start_action.get("pid"),
-        "stopped_external_pids": stopped_external_pids,
-    }
-
-
-def _reload_kis_freqtrade_config(settings: AppSettings) -> dict[str, Any]:
-    config_path = Path("third_party/freqtrade/user_data/config_kis_jurobot.json")
-    try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"status": "error", "reason": f"config_read_failed: {exc}"}
-    api_server = payload.get("api_server") if isinstance(payload, dict) else None
-    if not isinstance(api_server, dict):
-        return {"status": "skipped", "reason": "api_server_missing"}
-    port = int(api_server.get("listen_port") or 0)
-    username = str(api_server.get("username") or "").strip()
-    password = str(api_server.get("password") or "").strip()
-    if port <= 0:
-        return {"status": "skipped", "reason": "api_port_missing"}
-    api_url = f"http://127.0.0.1:{port}"
-    headers = {"Accept": "application/json"}
-    kwargs: dict[str, Any] = {"headers": headers, "timeout": httpx.Timeout(3.5)}
-    if username and password:
-        kwargs["auth"] = (username, password)
-    try:
-        with httpx.Client() as client:
-            res = client.post(f"{api_url}/api/v1/reload_config", **kwargs)
-            res.raise_for_status()
-            body = res.json() if res.content else {}
-        return {"status": "ok", "api_url": api_url, "body": body}
-    except Exception as exc:
-        return {"status": "error", "api_url": api_url, "reason": str(exc)}
-
-
-def _probe_kis_freqtrade_api(settings: AppSettings) -> dict[str, Any]:
-    config_path = Path("third_party/freqtrade/user_data/config_kis_jurobot.json")
-    try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"status": "error", "reason": f"config_read_failed: {exc}"}
-
-    api_server = payload.get("api_server") if isinstance(payload, dict) else None
-    if not isinstance(api_server, dict):
-        return {"status": "error", "reason": "api_server_missing"}
-
-    port = int(api_server.get("listen_port") or 0)
-    username = str(api_server.get("username") or "").strip()
-    password = str(api_server.get("password") or "").strip()
-    if port <= 0:
-        return {"status": "error", "reason": "api_port_missing"}
-
-    api_url = f"http://127.0.0.1:{port}"
-    headers = {"Accept": "application/json"}
-    kwargs: dict[str, Any] = {"headers": headers, "timeout": httpx.Timeout(3.5)}
-    if username and password:
-        kwargs["auth"] = (username, password)
-
-    try:
-        with httpx.Client() as client:
-            res = client.get(f"{api_url}/api/v1/show_config", **kwargs)
-            res.raise_for_status()
-        return {"status": "ok", "api_url": api_url}
-    except Exception as exc:
-        return {"status": "error", "api_url": api_url, "reason": str(exc)}
-
-
-def _start_kis_freqtrade_if_stopped(settings: AppSettings) -> dict[str, Any]:
-    def _is_live_pid(pid: int) -> bool:
-        if pid <= 0:
-            return False
-        try:
-            out = subprocess.check_output(
-                ["ps", "-p", str(pid), "-o", "state="],
-                text=True,
-            ).strip()
-        except Exception:
-            return False
-        if not out:
-            return False
-        state = out[:1].upper()
-        return state != "Z"
-
-    manager = FreqtradeProcessManager(
-        FreqtradeProcessManagerConfig(
-            executable_path=settings.freqtrade_executable_path,
-            workdir=settings.freqtrade_workdir,
-            runtime_dir=settings.freqtrade_runtime_dir,
-            stop_timeout_sec=settings.freqtrade_stop_timeout_sec,
-        ),
-        bots=[
-            FreqtradeBotConfig(
-                bot_id="kis",
-                label="Freqtrade KIS",
-                config_path="third_party/freqtrade/user_data/config_kis_jurobot.json",
-            )
-        ],
-    )
-    status = manager.list_statuses()[0]
-    running_pid = int(status.get("pid") or 0)
-    if bool(status.get("running")) and _is_live_pid(running_pid):
-        return {
-            "status": "ok",
-            "action": "already_running",
-            "pid": status.get("pid"),
-        }
-
-    external_pids: list[int] = []
-    try:
-        ps_out = subprocess.check_output(
-            ["ps", "-ax", "-o", "pid=,command="],
-            text=True,
-        )
-        for line in ps_out.splitlines():
-            text = str(line or "").strip()
-            if "freqtrade trade" not in text:
-                continue
-            if "config_kis_jurobot.json" not in text:
-                continue
-            parts = text.split(None, 1)
-            if not parts:
-                continue
-            pid = int(parts[0])
-            if pid > 0 and _is_live_pid(pid):
-                external_pids.append(pid)
-    except Exception:
-        external_pids = []
-    if external_pids:
-        return {
-            "status": "ok",
-            "action": "external_running",
-            "external_pids": external_pids,
-        }
-
-    started = manager.start("kis")
-    return {
-        "status": "ok",
-        "action": started.get("action"),
-        "pid": started.get("pid"),
-    }
-
-
-def run() -> None:
+def run(service_name: str = "tradecraft-research") -> None:
+    runner_key = "intelligence" if service_name == "tradecraft-intelligence" else "research"
+    write_current_runner_pid(runner_key)
     settings = AppSettings()
     update_interval = max(int(settings.research_run_interval_sec), 300)
+    reports_interval = max(int(settings.naver_reports_interval_sec), 300)
     telegram = TelegramBridge(
         TelegramConfig(
             bot_token=settings.telegram_bot_token,
@@ -1377,17 +743,9 @@ def run() -> None:
     )
     calendar = KRXHolidayCalendar()
     kis = _build_primary_kis(settings)
-    report_repository = NaverReportRepository(settings.naver_reports_db_path)
-    rag_store = (
-        RAGStore(
-            RAGStoreConfig(
-                persist_path=settings.rag_persist_path,
-                collection_name=settings.rag_collection_name,
-            )
-        )
-        if settings.rag_enabled
-        else None
-    )
+    report_stack = build_report_intelligence_stack(settings)
+    report_repository = report_stack.repository
+    rag_store = report_stack.rag_store
     portfolio_coach: PortfolioCoachService | None = None
     if settings.portfolio_coach_enabled and kis is not None:
         portfolio_coach = PortfolioCoachService(
@@ -1426,57 +784,56 @@ def run() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.ERROR)
 
-    if not settings.research_enabled:
-        logger.info("research runner disabled: TRADECRAFT_RESEARCH_ENABLED=false")
+    research_enabled = bool(settings.research_enabled)
+    reports_enabled = bool(settings.naver_reports_enabled)
+    once_mode = bool(getattr(settings, "intelligence_once", False))
+    if not research_enabled and not reports_enabled:
+        logger.info(
+            "%s disabled: TRADECRAFT_RESEARCH_ENABLED=false and "
+            "TRADECRAFT_NAVER_REPORTS_ENABLED=false",
+            service_name,
+        )
         return
 
-    pipeline = _build_pipeline(settings)
+    pipeline = _build_pipeline(settings) if research_enabled else None
     logger.info(
-        "research runner started: state_path=%s strategy_md=%s llm_connected=%s update_interval=%ss",
+        "%s started: research=%s reports=%s state_path=%s strategy_md=%s "
+        "llm_connected=%s research_interval=%ss reports_interval=%ss once=%s",
+        service_name,
+        research_enabled,
+        reports_enabled,
         settings.research_state_path,
         settings.research_strategy_md_path,
         llm_connected,
         update_interval,
+        reports_interval,
+        once_mode,
     )
 
     cycle = 0
+    report_cycle = 0
     now = datetime.now(KST)
-    next_update_at = now
-    next_advice_at, label = _next_advice_slot(now, is_open_day=calendar.is_open_day)
+    next_report_at: datetime | None = now if reports_enabled else None
+    next_update_at: datetime | None = now if pipeline is not None else None
+    next_advice_at: datetime | None = None
+    label = ""
+    if pipeline is not None:
+        next_advice_at, label = _next_advice_slot(
+            now,
+            is_open_day=calendar.is_open_day,
+        )
     latest_snapshot: dict | None = None
     last_report_db_updated_at = _report_db_last_updated_at(report_repository)
     if last_report_db_updated_at is None:
         last_report_db_updated_at = ""
-    last_kis_recover_at = now - timedelta(seconds=300)
-    kis_recover_interval = timedelta(seconds=60)
-    kis_api_fail_streak = 0
     while True:
         now = datetime.now(KST)
 
-        if now - last_kis_recover_at >= kis_recover_interval:
-            probe_result = _probe_kis_freqtrade_api(settings)
-            if str(probe_result.get("status")) == "ok":
-                kis_api_fail_streak = 0
-            else:
-                kis_api_fail_streak += 1
-                start_result = _start_kis_freqtrade_if_stopped(settings)
-                logger.warning(
-                    "kis bot health-check failed (%s/3): probe=%s start=%s",
-                    kis_api_fail_streak,
-                    probe_result,
-                    start_result,
-                )
-                if kis_api_fail_streak >= 3:
-                    restart_result = _restart_kis_freqtrade_if_running(settings)
-                    logger.warning(
-                        "kis bot auto-recover restart executed: %s",
-                        restart_result,
-                    )
-                    kis_api_fail_streak = 0
-            last_kis_recover_at = now
-
-        if now >= next_update_at:
+        if pipeline is not None and next_update_at is not None and now >= next_update_at:
             cached_snapshot = latest_snapshot
             if cached_snapshot is None:
                 cached_snapshot = pipeline.store.read_snapshot()
@@ -1511,7 +868,56 @@ def run() -> None:
                 last_report_db_updated_at = current_db_updated_at
             next_update_at = now + timedelta(seconds=update_interval)
 
-        if now >= next_advice_at:
+        if next_report_at is not None and now >= next_report_at:
+            report_cycle += 1
+            try:
+                report_result = asyncio.run(
+                    run_report_collection_cycle(
+                        crawler=report_stack.crawler,
+                        repository=report_repository,
+                        rag_store=rag_store,
+                        rag_enabled=settings.rag_enabled,
+                        rag_sync_chunk_limit=settings.rag_sync_chunk_limit,
+                    )
+                )
+                report_snapshot = report_result.get("snapshot") or {}
+                symbol_refresh = report_result.get("symbol_refresh") or {}
+                rag_sync = report_result.get("rag_sync") or {}
+                if symbol_refresh:
+                    logger.info("report symbol refresh: %s", symbol_refresh)
+                if rag_sync:
+                    logger.info(
+                        "report rag sync: status=%s synced=%s",
+                        str(rag_sync.get("status") or "unknown"),
+                        int(rag_sync.get("synced") or 0),
+                    )
+                logger.info(
+                    "report collection updated: cycle=%s inserted=%s total=%s",
+                    report_cycle,
+                    int(report_snapshot.get("inserted") or 0),
+                    int(
+                        (report_snapshot.get("repository") or {}).get(
+                            "total_reports"
+                        )
+                        or 0
+                    ),
+                )
+                refreshed_db_updated_at = _report_db_last_updated_at(report_repository)
+                if (
+                    pipeline is not None
+                    and refreshed_db_updated_at is not None
+                    and refreshed_db_updated_at != last_report_db_updated_at
+                ):
+                    next_update_at = datetime.now(KST)
+                    logger.info(
+                        "research update scheduled: report db changed last_updated_at=%s",
+                        refreshed_db_updated_at,
+                    )
+            except Exception as exc:
+                logger.warning("report collection failed: %s", exc)
+            next_report_at = now + timedelta(seconds=reports_interval)
+
+        if pipeline is not None and next_advice_at is not None and now >= next_advice_at:
             snapshot = latest_snapshot
             if snapshot is None:
                 snapshot = pipeline.store.read_snapshot()
@@ -1589,7 +995,6 @@ def run() -> None:
                                 scheduled_at=next_advice_at,
                                 trader_state_path=settings.kis_trader_state_path,
                                 max_symbols=settings.kis_trader_max_candidate_codes,
-                                freqtrade_runtime_dir=settings.freqtrade_runtime_dir,
                             )
                             if synced:
                                 did_symbol_sync = True
@@ -1598,10 +1003,10 @@ def run() -> None:
                                     ",".join(synced),
                                 )
                             rebalance_targets = (
-                                _sync_kis_rebalance_targets_to_freqtrade_override(
+                                _sync_kis_rebalance_targets_to_trader_state(
                                     payload=payload,
                                     snapshot=snapshot,
-                                    runtime_dir=settings.freqtrade_runtime_dir,
+                                    trader_state_path=settings.kis_trader_state_path,
                                     max_symbols=settings.kis_trader_max_candidate_codes,
                                 )
                             )
@@ -1614,58 +1019,11 @@ def run() -> None:
                                     ),
                                 )
                         if did_symbol_sync or rebalance_targets:
-                            try:
-                                refresh_result = _reload_kis_freqtrade_config(settings)
-                                if str(refresh_result.get("status")) != "ok":
-                                    refresh_result = _restart_kis_freqtrade_if_running(
-                                        settings
-                                    )
-                                logger.info(
-                                    "kis freqtrade refresh after target sync: %s",
-                                    refresh_result,
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "kis freqtrade refresh after target sync failed: %s",
-                                    exc,
-                                )
-                                restart_result = _restart_kis_freqtrade_if_running(
-                                    settings
-                                )
-                                logger.info(
-                                    "kis freqtrade refresh after target sync: %s",
-                                    restart_result,
-                                )
-                        if rebalance_targets:
-                            try:
-                                execution_result = asyncio.run(
-                                    _execute_kis_forcexy_target_orders(
-                                        settings=settings,
-                                        payload=payload,
-                                        rebalance_targets=rebalance_targets,
-                                    )
-                                )
-                                logger.info(
-                                    "kis forcexy target execution: %s",
-                                    execution_result,
-                                )
-                                logger.info(
-                                    "kis forcexy invested ratio target=%s actual=%s",
-                                    (
-                                        f"{_safe_float(execution_result.get('target_invested_ratio'))*100:.1f}%"
-                                    ),
-                                    (
-                                        f"{_safe_float(execution_result.get('actual_invested_ratio'))*100:.1f}%"
-                                        if execution_result.get("actual_invested_ratio")
-                                        is not None
-                                        else "n/a"
-                                    ),
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "kis forcexy target execution failed: %s",
-                                    exc,
-                                )
+                            logger.info(
+                                "kis direct trader state updated after advice: symbols=%s weights=%s",
+                                did_symbol_sync,
+                                bool(rebalance_targets),
+                            )
                         if sent_ok and execution_result:
                             try:
                                 executed_rows = list(
@@ -1779,11 +1137,20 @@ def run() -> None:
                 is_open_day=calendar.is_open_day,
             )
 
+        if once_mode:
+            logger.info("%s once mode completed", service_name)
+            return
+
+        wakeups = [
+            value
+            for value in (next_report_at, next_update_at, next_advice_at)
+            if value is not None
+        ]
+        if not wakeups:
+            logger.info("%s has no active schedules", service_name)
+            return
         sleep_sec = max(
-            int(
-                min(next_update_at, next_advice_at).timestamp()
-                - datetime.now(KST).timestamp()
-            ),
+            int(min(wakeups).timestamp() - datetime.now(KST).timestamp()),
             1,
         )
         sleep_sec = min(sleep_sec, 60)

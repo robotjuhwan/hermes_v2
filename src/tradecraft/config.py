@@ -1,7 +1,66 @@
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DEFAULT_MARKET_INTELLIGENCE_SOURCES_JSON = json.dumps(
+    [
+        {
+            "source_id": "whale_insight",
+            "label": "Whale Insight",
+            "role": "고래 포지션, 5% 이상 대량보유 변동, 전설 투자자 포트폴리오를 참고 신호로 추적",
+            "coverage": ["KOSPI", "KOSDAQ", "NASDAQ", "NYSE"],
+            "signal_types": [
+                "large_holder_change",
+                "institutional_position",
+                "legend_portfolio",
+            ],
+            "caution": "자동화 수집 기반 참고 데이터로 오류 가능성을 전제로 교차검증",
+        },
+        {
+            "source_id": "after_close_330",
+            "label": "세시반",
+            "role": "장마감 후 수급, 섹터 트리맵, 종가 후보를 5분 브리프용 참고 신호로 추적",
+            "coverage": ["KOSPI", "KOSDAQ"],
+            "signal_types": [
+                "after_close_flow",
+                "sector_treemap",
+                "closing_candidate",
+            ],
+            "caution": "매매 추천이 아니라 당일 시장 분위기와 후보군 보조 신호",
+        },
+    ],
+    ensure_ascii=False,
+)
+
+DEFAULT_STRATEGY_INSIGHT_SOURCES_JSON = json.dumps(
+    [
+        {
+            "source_id": "whale_insight",
+            "label": "Whale Insight 공개 데이터",
+            "kind": "whale_insight_static",
+            "url": "https://whale-insight.com/major_stock",
+            "cache_path": ".runtime/cache/whale_insight_public_signals.json",
+            "symbol_cache_path": ".runtime/cache/strategy_insight_symbol_cache.json",
+            "symbol_search_url": "https://www.sesiban.site/api/v1/assets",
+            "limit": 40,
+            "enabled": True,
+        },
+        {
+            "source_id": "after_close_330",
+            "label": "세시반 공개 JSON",
+            "kind": "sesiban_leading",
+            "url": "https://www.sesiban.site/api/v1/rankings/leading?market=KR",
+            "cache_path": ".runtime/cache/sesiban_public_signals.json",
+            "limit": 40,
+            "enabled": True,
+        },
+    ],
+    ensure_ascii=False,
+)
 
 
 class AppSettings(BaseSettings):
@@ -55,9 +114,20 @@ class AppSettings(BaseSettings):
     runtime_state_path: str = Field(
         default=".runtime/state.json", alias="TRADECRAFT_RUNTIME_STATE_PATH"
     )
+    runtime_sessions_path: str = Field(
+        default="", alias="TRADECRAFT_RUNTIME_SESSIONS_PATH"
+    )
     runtime_max_age_sec: int = Field(default=90, alias="TRADECRAFT_RUNTIME_MAX_AGE_SEC")
     runtime_write_interval_sec: int = Field(
         default=5, alias="TRADECRAFT_RUNTIME_WRITE_INTERVAL_SEC"
+    )
+    runtime_storage_large_file_threshold_mb: int = Field(
+        default=10,
+        alias="TRADECRAFT_RUNTIME_STORAGE_LARGE_FILE_THRESHOLD_MB",
+    )
+    runtime_storage_prune_unreferenced_pdfs: bool = Field(
+        default=True,
+        alias="TRADECRAFT_RUNTIME_STORAGE_PRUNE_UNREFERENCED_PDFS",
     )
     research_state_path: str = Field(
         default=".runtime/research.json", alias="TRADECRAFT_RESEARCH_STATE_PATH"
@@ -68,6 +138,10 @@ class AppSettings(BaseSettings):
     research_enabled: bool = Field(default=True, alias="TRADECRAFT_RESEARCH_ENABLED")
     research_run_interval_sec: int = Field(
         default=1800, alias="TRADECRAFT_RESEARCH_RUN_INTERVAL_SEC"
+    )
+    intelligence_once: bool = Field(
+        default=False,
+        alias="TRADECRAFT_INTELLIGENCE_ONCE",
     )
     research_max_items: int = Field(default=20, alias="TRADECRAFT_RESEARCH_MAX_ITEMS")
     research_knowledge_max_chars: int = Field(
@@ -116,7 +190,7 @@ class AppSettings(BaseSettings):
         alias="TRADECRAFT_LLM_BRIDGE_TIMEOUT_MS",
     )
     llm_model: str = Field(
-        default="gpt-5.3-codex",
+        default="gpt-5.5",
         alias="TRADECRAFT_LLM_MODEL",
     )
     research_report_urls: str = Field(
@@ -201,6 +275,10 @@ class AppSettings(BaseSettings):
     kis_trader_enabled: bool = Field(
         default=False, alias="TRADECRAFT_KIS_TRADER_ENABLED"
     )
+    kis_trader_execute_orders: bool = Field(
+        default=False,
+        alias="TRADECRAFT_KIS_TRADER_EXECUTE_ORDERS",
+    )
     kis_trader_state_path: str = Field(
         default=".runtime/kis_trader.json",
         alias="TRADECRAFT_KIS_TRADER_STATE_PATH",
@@ -240,6 +318,90 @@ class AppSettings(BaseSettings):
     kis_trader_max_candidate_codes: int = Field(
         default=10,
         alias="TRADECRAFT_KIS_TRADER_MAX_CANDIDATE_CODES",
+    )
+    kis_block_trader_enabled: bool = Field(
+        default=False,
+        alias="TRADECRAFT_KIS_BLOCK_TRADER_ENABLED",
+    )
+    kis_block_trader_once: bool = Field(
+        default=False,
+        alias="TRADECRAFT_KIS_BLOCK_TRADER_ONCE",
+    )
+    kis_block_trader_execute_orders: bool = Field(
+        default=False,
+        alias="TRADECRAFT_KIS_BLOCK_TRADER_EXECUTE_ORDERS",
+    )
+    kis_block_trader_db_path: str = Field(
+        default=".runtime/kis_blocks.db",
+        alias="TRADECRAFT_KIS_BLOCK_TRADER_DB_PATH",
+    )
+    kis_block_trader_state_path: str = Field(
+        default=".runtime/kis_block_trader.json",
+        alias="TRADECRAFT_KIS_BLOCK_TRADER_STATE_PATH",
+    )
+    kis_block_trader_rule_interval_sec: int = Field(
+        default=5,
+        alias="TRADECRAFT_KIS_BLOCK_TRADER_RULE_INTERVAL_SEC",
+    )
+    kis_block_trader_manager_interval_sec: int = Field(
+        default=1800,
+        alias="TRADECRAFT_KIS_BLOCK_TRADER_MANAGER_INTERVAL_SEC",
+    )
+    kis_block_trader_aggressive_limit_bps: float = Field(
+        default=30.0,
+        alias="TRADECRAFT_KIS_BLOCK_TRADER_AGGRESSIVE_LIMIT_BPS",
+    )
+    kis_block_trader_pending_reconcile_timeout_sec: int = Field(
+        default=300,
+        alias="TRADECRAFT_KIS_BLOCK_TRADER_PENDING_RECONCILE_TIMEOUT_SEC",
+    )
+    kis_block_trader_max_manager_symbols: int = Field(
+        default=12,
+        alias="TRADECRAFT_KIS_BLOCK_TRADER_MAX_MANAGER_SYMBOLS",
+    )
+    kis_block_trader_manager_query: str = Field(
+        default="국장1 계좌와 전략 지식을 바탕으로 블록 매매 계획을 관리해줘",
+        alias="TRADECRAFT_KIS_BLOCK_TRADER_MANAGER_QUERY",
+    )
+    investment_memory_enabled: bool = Field(
+        default=False,
+        alias="TRADECRAFT_INVESTMENT_MEMORY_ENABLED",
+    )
+    investment_memory_once: bool = Field(
+        default=False,
+        alias="TRADECRAFT_INVESTMENT_MEMORY_ONCE",
+    )
+    investment_memory_root_path: str = Field(
+        default=".runtime/investment_memory",
+        alias="TRADECRAFT_INVESTMENT_MEMORY_ROOT_PATH",
+    )
+    investment_memory_db_path: str = Field(
+        default=".runtime/investment_memory.db",
+        alias="TRADECRAFT_INVESTMENT_MEMORY_DB_PATH",
+    )
+    investment_memory_state_path: str = Field(
+        default=".runtime/investment_memory_runner.json",
+        alias="TRADECRAFT_INVESTMENT_MEMORY_STATE_PATH",
+    )
+    investment_memory_poll_interval_sec: int = Field(
+        default=60,
+        alias="TRADECRAFT_INVESTMENT_MEMORY_POLL_INTERVAL_SEC",
+    )
+    investment_memory_send_telegram: bool = Field(
+        default=True,
+        alias="TRADECRAFT_INVESTMENT_MEMORY_SEND_TELEGRAM",
+    )
+    investment_memory_policy_mode: str = Field(
+        default="soft_auto",
+        alias="TRADECRAFT_INVESTMENT_MEMORY_POLICY_MODE",
+    )
+    investment_memory_persona_tone: str = Field(
+        default="friendly_partner",
+        alias="TRADECRAFT_INVESTMENT_MEMORY_PERSONA_TONE",
+    )
+    investment_memory_context_max_chars: int = Field(
+        default=8000,
+        alias="TRADECRAFT_INVESTMENT_MEMORY_CONTEXT_MAX_CHARS",
     )
     naver_reports_enabled: bool = Field(
         default=False,
@@ -288,6 +450,10 @@ class AppSettings(BaseSettings):
         default=240,
         alias="TRADECRAFT_NAVER_REPORTS_MIN_PDF_TEXT_CHARS",
     )
+    naver_reports_llm_facts_enabled: bool = Field(
+        default=False,
+        alias="TRADECRAFT_NAVER_REPORTS_LLM_FACTS_ENABLED",
+    )
     rag_enabled: bool = Field(default=True, alias="TRADECRAFT_RAG_ENABLED")
     rag_persist_path: str = Field(
         default=".runtime/rag_chroma",
@@ -301,55 +467,148 @@ class AppSettings(BaseSettings):
         default=50000,
         alias="TRADECRAFT_RAG_SYNC_CHUNK_LIMIT",
     )
+    rag_sync_batch_size: int = Field(
+        default=512,
+        alias="TRADECRAFT_RAG_SYNC_BATCH_SIZE",
+    )
+    rag_skip_existing: bool = Field(
+        default=True,
+        alias="TRADECRAFT_RAG_SKIP_EXISTING",
+    )
     rag_query_top_k: int = Field(
         default=8,
         alias="TRADECRAFT_RAG_QUERY_TOP_K",
+    )
+    rag_query_oversample_factor: int = Field(
+        default=4,
+        alias="TRADECRAFT_RAG_QUERY_OVERSAMPLE_FACTOR",
+    )
+    market_intelligence_sources_json: str = Field(
+        default=DEFAULT_MARKET_INTELLIGENCE_SOURCES_JSON,
+        alias="TRADECRAFT_MARKET_INTELLIGENCE_SOURCES_JSON",
+    )
+    strategy_insight_sources_json: str = Field(
+        default=DEFAULT_STRATEGY_INSIGHT_SOURCES_JSON,
+        alias="TRADECRAFT_STRATEGY_INSIGHT_SOURCES_JSON",
+    )
+    strategy_insight_collect_interval_sec: int = Field(
+        default=900,
+        alias="TRADECRAFT_STRATEGY_INSIGHT_COLLECT_INTERVAL_SEC",
+    )
+    strategy_insight_request_timeout_sec: float = Field(
+        default=10.0,
+        alias="TRADECRAFT_STRATEGY_INSIGHT_REQUEST_TIMEOUT_SEC",
+    )
+    strategy_insight_once: bool = Field(
+        default=False,
+        alias="TRADECRAFT_STRATEGY_INSIGHT_ONCE",
+    )
+    strategy_insight_state_path: str = Field(
+        default=".runtime/strategy_insights_runner.json",
+        alias="TRADECRAFT_STRATEGY_INSIGHT_STATE_PATH",
+    )
+    strategy_insight_db_path: str = Field(
+        default=".runtime/strategy_insights.db",
+        alias="TRADECRAFT_STRATEGY_INSIGHT_DB_PATH",
+    )
+    valuation_db_path: str = Field(
+        default=".runtime/symbol_fundamentals.db",
+        alias="TRADECRAFT_VALUATION_DB_PATH",
+    )
+    valuation_watchlist: str = Field(
+        default="005930,000660,402340,178920",
+        alias="TRADECRAFT_VALUATION_WATCHLIST",
+    )
+    valuation_timeout_sec: float = Field(
+        default=8.0,
+        alias="TRADECRAFT_VALUATION_TIMEOUT_SEC",
+    )
+    valuation_min_refresh_hours: int = Field(
+        default=12,
+        alias="TRADECRAFT_VALUATION_MIN_REFRESH_HOURS",
+    )
+    valuation_max_symbols_per_collect: int = Field(
+        default=80,
+        alias="TRADECRAFT_VALUATION_MAX_SYMBOLS_PER_COLLECT",
     )
     kis_trader_report_context_top_k: int = Field(
         default=6,
         alias="TRADECRAFT_KIS_TRADER_REPORT_CONTEXT_TOP_K",
     )
-    freqtrade_spot_api_url: str = Field(default="", alias="FREQTRADE_SPOT_API_URL")
-    freqtrade_spot_username: str = Field(default="", alias="FREQTRADE_SPOT_USERNAME")
-    freqtrade_spot_password: str = Field(default="", alias="FREQTRADE_SPOT_PASSWORD")
-    freqtrade_spot_config_path: str = Field(
-        default="third_party/freqtrade/user_data/config_jurobot.json",
-        alias="FREQTRADE_SPOT_CONFIG_PATH",
+    market_judge_enabled: bool = Field(
+        default=False,
+        alias="TRADECRAFT_MARKET_JUDGE_ENABLED",
     )
-    freqtrade_futures_api_url: str = Field(
-        default="", alias="FREQTRADE_FUTURES_API_URL"
+    market_judge_once: bool = Field(
+        default=False,
+        alias="TRADECRAFT_MARKET_JUDGE_ONCE",
     )
-    freqtrade_futures_username: str = Field(
-        default="", alias="FREQTRADE_FUTURES_USERNAME"
+    market_judge_db_path: str = Field(
+        default=".runtime/market_judgment.db",
+        alias="TRADECRAFT_MARKET_JUDGE_DB_PATH",
     )
-    freqtrade_futures_password: str = Field(
-        default="", alias="FREQTRADE_FUTURES_PASSWORD"
+    market_judge_state_path: str = Field(
+        default=".runtime/market_judge.json",
+        alias="TRADECRAFT_MARKET_JUDGE_STATE_PATH",
     )
-    freqtrade_futures_config_path: str = Field(
-        default="third_party/freqtrade/user_data/config_jurobot_futures.json",
-        alias="FREQTRADE_FUTURES_CONFIG_PATH",
+    market_quote_interval_sec: int = Field(
+        default=60,
+        alias="TRADECRAFT_MARKET_QUOTE_INTERVAL_SEC",
     )
-    freqtrade_bot_api_urls: str = Field(default="", alias="FREQTRADE_BOT_API_URLS")
-    freqtrade_executable_path: str = Field(
-        default="third_party/freqtrade/.venv-ft/bin/freqtrade",
-        alias="FREQTRADE_EXECUTABLE_PATH",
+    market_judge_interval_sec: int = Field(
+        default=600,
+        alias="TRADECRAFT_MARKET_JUDGE_INTERVAL_SEC",
     )
-    freqtrade_workdir: str = Field(
-        default="third_party/freqtrade",
-        alias="FREQTRADE_WORKDIR",
+    market_judge_max_symbols: int = Field(
+        default=60,
+        alias="TRADECRAFT_MARKET_JUDGE_MAX_SYMBOLS",
     )
-    freqtrade_runtime_dir: str = Field(
-        default=".runtime/freqtrade",
-        alias="FREQTRADE_RUNTIME_DIR",
+    market_judge_llm_max_symbols: int = Field(
+        default=12,
+        alias="TRADECRAFT_MARKET_JUDGE_LLM_MAX_SYMBOLS",
     )
-    freqtrade_stop_timeout_sec: float = Field(
-        default=8.0,
-        alias="FREQTRADE_STOP_TIMEOUT_SEC",
+    market_judge_use_naver_fallback: bool = Field(
+        default=True,
+        alias="TRADECRAFT_MARKET_JUDGE_USE_NAVER_FALLBACK",
     )
-    freqtrade_timeout_sec: float = Field(default=3.5, alias="FREQTRADE_TIMEOUT_SEC")
-    host: str = Field(default="0.0.0.0", alias="TRADECRAFT_HOST")
+    market_judge_query: str = Field(
+        default="장중 현재 움직임과 내 국장1 계좌를 반영해 관심/보류 판단을 정리해줘",
+        alias="TRADECRAFT_MARKET_JUDGE_QUERY",
+    )
+    host: str = Field(default="127.0.0.1", alias="TRADECRAFT_HOST")
     port: int = Field(default=8000, alias="TRADECRAFT_PORT")
     allow_origins: str = Field(default="*", alias="TRADECRAFT_ALLOW_ORIGINS")
+    reports_api_host: str = Field(
+        default="127.0.0.1",
+        alias="TRADECRAFT_REPORTS_API_HOST",
+    )
+    reports_api_port: int = Field(
+        default=8010,
+        alias="TRADECRAFT_REPORTS_API_PORT",
+    )
+    reports_api_token: str = Field(
+        default="",
+        alias="TRADECRAFT_REPORTS_API_TOKEN",
+    )
+    reports_api_tokens: str = Field(
+        default="",
+        alias="TRADECRAFT_REPORTS_API_TOKENS",
+    )
+    reports_ui_allowed_cidrs: str = Field(
+        default=(
+            "127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,"
+            "192.168.0.0/16,::1/128"
+        ),
+        alias="TRADECRAFT_REPORTS_UI_ALLOWED_CIDRS",
+    )
+    reports_ui_trust_proxy: bool = Field(
+        default=False,
+        alias="TRADECRAFT_REPORTS_UI_TRUST_PROXY",
+    )
+    reports_worker_state_path: str = Field(
+        default=".runtime/reports_worker_state.json",
+        alias="TRADECRAFT_REPORTS_WORKER_STATE_PATH",
+    )
 
     @property
     def cors_origins(self) -> list[str]:
@@ -383,24 +642,6 @@ class AppSettings(BaseSettings):
         return bool(
             self.binance_futures_key_resolved and self.binance_futures_secret_resolved
         )
-
-    @property
-    def freqtrade_bot_api_url_map(self) -> dict[str, str]:
-        out: dict[str, str] = {}
-        raw = self.freqtrade_bot_api_urls.strip()
-        if not raw:
-            return out
-
-        for chunk in raw.split(","):
-            item = chunk.strip()
-            if not item or "=" not in item:
-                continue
-            bot_id, api_url = item.split("=", 1)
-            key = bot_id.strip()
-            value = api_url.strip().rstrip("/")
-            if key and value:
-                out[key] = value
-        return out
 
     @property
     def kis_primary_ready(self) -> bool:
@@ -441,9 +682,132 @@ class AppSettings(BaseSettings):
         return self.llm_bridge_mode in {"command", "url"}
 
     @property
+    def naver_reports_llm_facts_active(self) -> bool:
+        return bool(self.naver_reports_llm_facts_enabled and self.llm_bridge_ready)
+
+    @property
     def naver_reports_seed_url_list(self) -> list[str]:
         value = self.naver_reports_seed_urls.strip()
         if value:
             return [item.strip() for item in value.split(",") if item.strip()]
         single = self.naver_reports_seed_url.strip()
         return [single] if single else []
+
+    @property
+    def market_intelligence_source_list(self) -> list[dict[str, str | list[str]]]:
+        raw = str(self.market_intelligence_sources_json or "").strip()
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, list):
+            return []
+
+        out: list[dict[str, str | list[str]]] = []
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            source_id = str(row.get("source_id") or "").strip()
+            label = str(row.get("label") or source_id).strip()
+            if not source_id or not label:
+                continue
+            coverage = [
+                str(item).strip()
+                for item in list(row.get("coverage") or [])
+                if str(item).strip()
+            ]
+            signal_types = [
+                str(item).strip()
+                for item in list(row.get("signal_types") or [])
+                if str(item).strip()
+            ]
+            out.append(
+                {
+                    "source_id": source_id,
+                    "label": label,
+                    "role": str(row.get("role") or "").strip(),
+                    "coverage": coverage,
+                    "signal_types": signal_types,
+                    "caution": str(row.get("caution") or "").strip(),
+                }
+            )
+        return out
+
+    @property
+    def strategy_insight_source_list(self) -> list[dict[str, Any]]:
+        raw = str(self.strategy_insight_sources_json or "").strip()
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(payload, dict):
+            rows = [payload]
+        elif isinstance(payload, list):
+            rows = payload
+        else:
+            return []
+
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            source_id = str(row.get("source_id") or row.get("id") or "").strip()
+            if not source_id:
+                continue
+            item: dict[str, Any] = {
+                "source_id": source_id,
+                "label": str(row.get("label") or source_id).strip(),
+                "enabled": row.get("enabled", True),
+                "dedupe": row.get("dedupe", True),
+            }
+            for key in (
+                "path",
+                "url",
+                "text",
+                "payload",
+                "signals",
+                "kind",
+                "cache_path",
+                "symbol_cache_path",
+                "symbol_search_url",
+                "limit",
+            ):
+                if key in row:
+                    item[key] = row[key]
+            if any(
+                key in item
+                for key in (
+                    "path",
+                    "url",
+                    "text",
+                    "payload",
+                    "signals",
+                    "kind",
+                )
+            ):
+                out.append(item)
+        return out
+
+    @property
+    def reports_ui_allowed_cidr_list(self) -> list[str]:
+        return [
+            item.strip()
+            for item in str(self.reports_ui_allowed_cidrs or "").split(",")
+            if item.strip()
+        ]
+
+    @property
+    def reports_api_token_list(self) -> list[str]:
+        out: list[str] = []
+        for item in str(self.reports_api_tokens or "").split(","):
+            token = item.strip()
+            if token and token not in out:
+                out.append(token)
+        legacy = str(self.reports_api_token or "").strip()
+        if legacy and legacy not in out:
+            out.append(legacy)
+        return out

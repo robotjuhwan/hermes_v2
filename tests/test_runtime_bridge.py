@@ -52,6 +52,30 @@ def test_runtime_reader_ok_snapshot(tmp_path) -> None:
     assert sessions[0]["session_id"] == "s1"
 
 
+def test_runtime_reader_exposes_full_snapshot_metadata(tmp_path) -> None:
+    path = tmp_path / "state.json"
+    store = RuntimeStateStore(path)
+    store.write_snapshot(
+        {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "runtime": {
+                "role": "session_state_monitor",
+                "execution_mode": "skeleton_noop",
+                "executes_orders": False,
+            },
+            "sessions": [{"session_id": "s1", "mode": "short_term"}],
+        }
+    )
+
+    reader = RuntimeSnapshotReader(str(path), max_age_sec=30)
+    payload, status = reader.read_snapshot()
+
+    assert status == "ok"
+    assert payload is not None
+    assert payload["runtime"]["role"] == "session_state_monitor"
+    assert payload["age_sec"] >= 0
+
+
 def test_research_reader_missing_snapshot(tmp_path) -> None:
     path = tmp_path / "research.json"
     reader = ResearchSnapshotReader(str(path), max_age_sec=10)
@@ -123,6 +147,36 @@ def test_research_reader_stale_snapshot(tmp_path) -> None:
     payload, status = reader.read_feed()
     assert payload is None
     assert status == "stale"
+
+
+def test_research_reader_can_expose_stale_snapshot(tmp_path) -> None:
+    path = tmp_path / "research.json"
+    store = RuntimeStateStore(path)
+    store.write_snapshot(
+        {
+            "updated_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+            "source": "codex",
+            "query": "KRX",
+            "items": [
+                {
+                    "title": "Old research",
+                    "summary": "outdated but still useful as cache",
+                }
+            ],
+        }
+    )
+
+    reader = ResearchSnapshotReader(str(path), max_age_sec=60)
+    payload, status = reader.read_feed(allow_stale=True)
+    assert status == "stale"
+    assert payload is not None
+    assert payload["status"] == "stale"
+    assert payload["stale"] is True
+    assert payload["source"] == "codex"
+    assert payload["query"] == "KRX"
+    assert payload["count"] == 1
+    assert payload["items"][0]["title"] == "Old research"
+    assert payload["age_sec"] > payload["max_age_sec"]
 
 
 def test_research_reader_exposes_agent_self_score(tmp_path) -> None:

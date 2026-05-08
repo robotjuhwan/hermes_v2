@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
-from typing import Any
+from typing import Any, Iterable
 
 from tradecraft.runtime.state_store import RuntimeStateStore
 
@@ -43,6 +42,26 @@ class RuntimeSnapshotReader:
 
         normalized = [row for row in sessions if isinstance(row, dict)]
         return normalized, "ok"
+
+    def read_snapshot(self) -> tuple[dict[str, Any] | None, str]:
+        snapshot = self.store.read_snapshot()
+        if not snapshot:
+            return None, "missing"
+
+        updated_raw = str(snapshot.get("updated_at") or "").strip()
+        updated_at = _parse_iso(updated_raw) if updated_raw else None
+        if not updated_at:
+            return None, "invalid_timestamp"
+
+        age = datetime.now(timezone.utc) - updated_at
+        status = "stale" if age > self.max_age else "ok"
+        payload = dict(snapshot)
+        if not isinstance(payload.get("sessions"), list):
+            return None, "invalid_sessions"
+        payload["status"] = status
+        payload["age_sec"] = max(int(age.total_seconds()), 0)
+        payload["max_age_sec"] = max(int(self.max_age.total_seconds()), 1)
+        return payload, status
 
 
 def _text_or_empty(value: Any) -> str:
@@ -134,7 +153,48 @@ class ResearchSnapshotReader:
 
         return normalized
 
-    def read_feed(self) -> tuple[dict[str, Any] | None, str]:
+    def _build_payload(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        updated_raw: str,
+        status: str,
+        age_sec: int,
+    ) -> tuple[dict[str, Any] | None, str]:
+        items = snapshot.get("items")
+        if items is None:
+            items = []
+        elif not isinstance(items, list):
+            return None, "invalid_items"
+
+        normalized = self._iter_items(items)
+        agent_self_score_100 = _score_100(snapshot.get("agent_self_score_100"))
+        agent_self_score_note = _text_or_empty(snapshot.get("agent_self_score_note"))
+        learning_total_count = _non_negative_int(snapshot.get("learning_total_count"))
+        max_age_sec = max(int(self.max_age.total_seconds()), 1)
+        return {
+            "updated_at": updated_raw,
+            "source": _text_or_empty(
+                snapshot.get("source") or snapshot.get("provider") or "scheduled"
+            )
+            or "scheduled",
+            "query": _text_or_empty(
+                snapshot.get("query") or snapshot.get("topic") or "general"
+            ),
+            "status": status,
+            "stale": status == "stale",
+            "age_sec": max(age_sec, 0),
+            "max_age_sec": max_age_sec,
+            "count": len(normalized),
+            "learning_total_count": learning_total_count,
+            "items": normalized,
+            "agent_self_score_100": agent_self_score_100,
+            "agent_self_score_note": agent_self_score_note,
+        }, status
+
+    def read_feed(
+        self, *, allow_stale: bool = False
+    ) -> tuple[dict[str, Any] | None, str]:
         snapshot = self.store.read_snapshot()
         if not snapshot:
             return None, "missing"
@@ -146,31 +206,18 @@ class ResearchSnapshotReader:
 
         age = datetime.now(timezone.utc) - updated_at
         if age > self.max_age:
-            return None, "stale"
-
-        items = snapshot.get("items")
-        if items is None:
-            items = []
-        elif not isinstance(items, list):
-            return None, "invalid_items"
-
-        normalized = self._iter_items(items)
-        agent_self_score_100 = _score_100(snapshot.get("agent_self_score_100"))
-        agent_self_score_note = _text_or_empty(snapshot.get("agent_self_score_note"))
-        learning_total_count = _non_negative_int(snapshot.get("learning_total_count"))
-        return {
-            "updated_at": updated_raw,
-            "source": _text_or_empty(
-                snapshot.get("source") or snapshot.get("provider") or "scheduled"
+            if not allow_stale:
+                return None, "stale"
+            return self._build_payload(
+                snapshot,
+                updated_raw=updated_raw,
+                status="stale",
+                age_sec=int(age.total_seconds()),
             )
-            or "scheduled",
-            "query": _text_or_empty(
-                snapshot.get("query") or snapshot.get("topic") or "general"
-            ),
-            "status": "ok",
-            "count": len(normalized),
-            "learning_total_count": learning_total_count,
-            "items": normalized,
-            "agent_self_score_100": agent_self_score_100,
-            "agent_self_score_note": agent_self_score_note,
-        }, "ok"
+
+        return self._build_payload(
+            snapshot,
+            updated_raw=updated_raw,
+            status="ok",
+            age_sec=int(age.total_seconds()),
+        )

@@ -1,25 +1,18 @@
 from __future__ import annotations
 
-import json
-from datetime import datetime, date
-from types import SimpleNamespace
+from datetime import date, datetime, timedelta
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from tradecraft.runtime.research_runner import (
     _build_advice_message,
-    _extract_balance_totals,
-    _extract_reduce_tickers_from_payload,
     _extract_rebalance_target_weights_from_payload,
-    _extract_trade_id_from_forceenter_error,
     _extract_total_value_krw_from_payload,
     _extract_target_cash_weight_from_payload,
     _resolve_symbol_names_for_codes,
     _next_advice_slot,
     _parse_krw_amount,
-    _restart_kis_freqtrade_if_running,
-    _sum_open_stake_amount,
-    _sync_kis_rebalance_targets_to_freqtrade_override,
+    _sync_kis_rebalance_targets_to_trader_state,
     _sync_kis_trader_targets_from_morning_advice,
     _should_run_learning,
 )
@@ -116,7 +109,6 @@ def test_sync_kis_trader_targets_from_morning_advice_writes_target_symbols(
     tmp_path,
 ) -> None:
     state_path = tmp_path / "kis_trader.json"
-    runtime_dir = tmp_path / "freqtrade"
     codes = _sync_kis_trader_targets_from_morning_advice(
         snapshot={
             "items": [
@@ -128,19 +120,10 @@ def test_sync_kis_trader_targets_from_morning_advice_writes_target_symbols(
         scheduled_at=datetime(2026, 2, 19, 8, 0, tzinfo=KST),
         trader_state_path=str(state_path),
         max_symbols=3,
-        freqtrade_runtime_dir=str(runtime_dir),
     )
     saved = RuntimeStateStore(state_path).read_snapshot() or {}
-    override = json.loads(
-        (runtime_dir / "kis.override.json").read_text(encoding="utf-8")
-    )
     assert codes == ["005930", "000660", "035420"]
     assert saved.get("target_symbols") == ["005930", "000660", "035420"]
-    assert override.get("exchange", {}).get("pair_whitelist") == [
-        "005930/KRW",
-        "000660/KRW",
-        "035420/KRW",
-    ]
 
 
 def test_sync_kis_trader_targets_from_morning_advice_skips_non_morning(
@@ -156,82 +139,6 @@ def test_sync_kis_trader_targets_from_morning_advice_skips_non_morning(
     )
     assert codes == []
     assert RuntimeStateStore(state_path).read_snapshot() is None
-
-
-def test_restart_kis_freqtrade_if_running_restarts_bot(monkeypatch) -> None:
-    calls: list[tuple[str, str]] = []
-
-    class DummyManager:
-        def __init__(self, *_args, **_kwargs) -> None:
-            pass
-
-        def list_statuses(self):
-            return [{"running": True}]
-
-        def stop(self, bot_id: str):
-            calls.append(("stop", bot_id))
-            return {"action": "stopped"}
-
-        def start(self, bot_id: str):
-            calls.append(("start", bot_id))
-            return {"action": "started", "pid": 10101}
-
-    monkeypatch.setattr(
-        "tradecraft.runtime.research_runner.FreqtradeProcessManager",
-        DummyManager,
-    )
-
-    settings = SimpleNamespace(
-        freqtrade_executable_path="freqtrade",
-        freqtrade_workdir="third_party/freqtrade",
-        freqtrade_runtime_dir=".runtime/freqtrade",
-        freqtrade_stop_timeout_sec=8.0,
-    )
-    out = _restart_kis_freqtrade_if_running(settings)  # type: ignore[arg-type]
-
-    assert out.get("status") == "ok"
-    assert out.get("stop_action") == "stopped"
-    assert out.get("start_action") == "started"
-    assert out.get("pid") == 10101
-    assert calls == [("stop", "kis"), ("start", "kis")]
-
-
-def test_restart_kis_freqtrade_if_running_skips_when_stopped(monkeypatch) -> None:
-    calls: list[tuple[str, str]] = []
-
-    class DummyManager:
-        def __init__(self, *_args, **_kwargs) -> None:
-            pass
-
-        def list_statuses(self):
-            return [{"running": False}]
-
-        def stop(self, bot_id: str):
-            calls.append(("stop", bot_id))
-            return {"action": "stopped"}
-
-        def start(self, bot_id: str):
-            calls.append(("start", bot_id))
-            return {"action": "started", "pid": 10101}
-
-    monkeypatch.setattr(
-        "tradecraft.runtime.research_runner.FreqtradeProcessManager",
-        DummyManager,
-    )
-
-    settings = SimpleNamespace(
-        freqtrade_executable_path="freqtrade",
-        freqtrade_workdir="third_party/freqtrade",
-        freqtrade_runtime_dir=".runtime/freqtrade",
-        freqtrade_stop_timeout_sec=8.0,
-    )
-    out = _restart_kis_freqtrade_if_running(settings)  # type: ignore[arg-type]
-
-    assert out.get("status") == "ok"
-    assert out.get("stop_action") == "stopped"
-    assert out.get("start_action") == "started"
-    assert out.get("pid") == 10101
-    assert calls == [("stop", "kis"), ("start", "kis")]
 
 
 def test_extract_rebalance_target_weights_from_payload() -> None:
@@ -277,12 +184,6 @@ def test_extract_target_cash_weight_prefers_strategy_spec() -> None:
     }
     out = _extract_target_cash_weight_from_payload(payload)
     assert out == 0.2
-
-
-def test_extract_trade_id_from_forceenter_error() -> None:
-    reason = "Error querying /api/v1/forceenter: position for 043150/KRW already open - id: 123 and has open order 0025037200"
-    assert _extract_trade_id_from_forceenter_error(reason) == 123
-    assert _extract_trade_id_from_forceenter_error("unknown") == 0
 
 
 def test_resolve_symbol_names_for_codes_uses_pykrx_fallback(monkeypatch) -> None:
@@ -335,29 +236,9 @@ def test_extract_total_value_krw_from_payload_uses_total_krw_text() -> None:
     assert _extract_total_value_krw_from_payload(payload) == 2330000.0
 
 
-def test_extract_balance_totals_and_sum_open_stake() -> None:
-    balance_payload = {
-        "total": 1200000,
-        "currencies": [
-            {"currency": "KRW", "free": 900000, "balance": 900000},
-            {"currency": "005930", "free": 1, "balance": 1},
-        ],
-    }
-    status_rows = [
-        {"pair": "005930/KRW", "is_open": True, "stake_amount": 120000},
-        {"pair": "000660/KRW", "is_open": True, "stake_amount": 80000},
-    ]
-    total_krw, krw_free = _extract_balance_totals(balance_payload)
-    open_stake = _sum_open_stake_amount(status_rows)
-
-    assert total_krw == 1200000.0
-    assert krw_free == 900000.0
-    assert open_stake == 200000.0
-
-
-def test_sync_kis_rebalance_targets_to_freqtrade_override(tmp_path) -> None:
-    runtime_dir = tmp_path / "freqtrade"
-    out = _sync_kis_rebalance_targets_to_freqtrade_override(
+def test_sync_kis_rebalance_targets_to_trader_state(tmp_path) -> None:
+    state_path = tmp_path / "kis_trader.json"
+    out = _sync_kis_rebalance_targets_to_trader_state(
         payload={
             "pack": {
                 "advice_seed_json": {
@@ -370,27 +251,24 @@ def test_sync_kis_rebalance_targets_to_freqtrade_override(tmp_path) -> None:
                 }
             }
         },
-        runtime_dir=str(runtime_dir),
+        trader_state_path=str(state_path),
         max_symbols=6,
     )
-    saved = json.loads((runtime_dir / "kis.override.json").read_text(encoding="utf-8"))
+    saved = RuntimeStateStore(state_path).read_snapshot() or {}
     assert out == {"005930": 0.2, "000660": 0.15}
-    assert saved.get("tradecraft_target_weights") == {
+    assert saved.get("target_weights") == {
         "005930": 0.2,
         "000660": 0.15,
     }
-    assert saved.get("force_entry_enable") is True
-    assert saved.get("exchange", {}).get("pair_whitelist") == [
-        "005930/KRW",
-        "000660/KRW",
-    ]
+    assert saved.get("target_symbols") == ["005930", "000660"]
+    assert saved.get("target_weights_source") == "research_runner_portfolio_coach"
 
 
-def test_sync_kis_rebalance_targets_to_freqtrade_override_writes_cash_weight(
+def test_sync_kis_rebalance_targets_to_trader_state_writes_cash_weight(
     tmp_path,
 ) -> None:
-    runtime_dir = tmp_path / "freqtrade"
-    out = _sync_kis_rebalance_targets_to_freqtrade_override(
+    state_path = tmp_path / "kis_trader.json"
+    out = _sync_kis_rebalance_targets_to_trader_state(
         payload={
             "pack": {
                 "advice_seed_json": {
@@ -404,20 +282,20 @@ def test_sync_kis_rebalance_targets_to_freqtrade_override_writes_cash_weight(
                 }
             }
         },
-        runtime_dir=str(runtime_dir),
+        trader_state_path=str(state_path),
         max_symbols=6,
     )
-    saved = json.loads((runtime_dir / "kis.override.json").read_text(encoding="utf-8"))
+    saved = RuntimeStateStore(state_path).read_snapshot() or {}
     assert round(sum(out.values()), 6) == 0.75
-    assert saved.get("tradecraft_target_cash_weight") == 0.25
-    assert round(sum(saved.get("tradecraft_target_weights", {}).values()), 6) == 0.75
+    assert saved.get("target_cash_weight") == 0.25
+    assert round(sum(saved.get("target_weights", {}).values()), 6) == 0.75
 
 
-def test_sync_kis_rebalance_targets_to_freqtrade_override_adds_snapshot_picks(
+def test_sync_kis_rebalance_targets_to_trader_state_adds_snapshot_picks(
     tmp_path,
 ) -> None:
-    runtime_dir = tmp_path / "freqtrade"
-    out = _sync_kis_rebalance_targets_to_freqtrade_override(
+    state_path = tmp_path / "kis_trader.json"
+    out = _sync_kis_rebalance_targets_to_trader_state(
         payload={
             "pack": {
                 "advice_seed_json": {
@@ -434,53 +312,30 @@ def test_sync_kis_rebalance_targets_to_freqtrade_override_adds_snapshot_picks(
                 {"picks": ["005930", "000660", "012450"]},
             ]
         },
-        runtime_dir=str(runtime_dir),
+        trader_state_path=str(state_path),
         max_symbols=6,
     )
-    saved = json.loads((runtime_dir / "kis.override.json").read_text(encoding="utf-8"))
+    saved = RuntimeStateStore(state_path).read_snapshot() or {}
     assert out.get("005930") == 0.2
     assert out.get("000660") == 0.08
     assert out.get("012450") == 0.08
-    assert saved.get("exchange", {}).get("pair_whitelist") == [
-        "005930/KRW",
-        "000660/KRW",
-        "012450/KRW",
-    ]
+    assert saved.get("target_symbols") == ["005930", "000660", "012450"]
 
 
-def test_sync_kis_rebalance_targets_to_freqtrade_override_uses_snapshot_when_no_targets(
+def test_sync_kis_rebalance_targets_to_trader_state_uses_snapshot_when_no_targets(
     tmp_path,
 ) -> None:
-    runtime_dir = tmp_path / "freqtrade"
-    out = _sync_kis_rebalance_targets_to_freqtrade_override(
+    state_path = tmp_path / "kis_trader.json"
+    out = _sync_kis_rebalance_targets_to_trader_state(
         payload={"pack": {"advice_seed_json": {"model_portfolio": {"targets": []}}}},
         snapshot={
             "items": [
                 {"picks": ["005930", "000660"]},
             ]
         },
-        runtime_dir=str(runtime_dir),
+        trader_state_path=str(state_path),
         max_symbols=6,
     )
-    saved = json.loads((runtime_dir / "kis.override.json").read_text(encoding="utf-8"))
+    saved = RuntimeStateStore(state_path).read_snapshot() or {}
     assert out == {"005930": 0.5, "000660": 0.5}
-    assert saved.get("tradecraft_target_weights") == {"005930": 0.5, "000660": 0.5}
-
-
-def test_extract_reduce_tickers_from_payload() -> None:
-    payload = {
-        "pack": {
-            "advice_seed_json": {
-                "action_plan": {
-                    "rebalance_table_rows": [
-                        {"ticker": "033790", "action": "REDUCE"},
-                        {"ticker": "005930", "action": "BUY"},
-                        {"ticker": "000660", "action": "SELL"},
-                        {"ticker": "bad", "action": "REDUCE"},
-                    ]
-                }
-            }
-        }
-    }
-    out = _extract_reduce_tickers_from_payload(payload)
-    assert out == {"033790", "000660"}
+    assert saved.get("target_weights") == {"005930": 0.5, "000660": 0.5}

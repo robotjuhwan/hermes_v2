@@ -14,6 +14,20 @@ class KISAPIError(RuntimeError):
     pass
 
 
+def _positive_int(value: Any) -> int:
+    try:
+        if value is None:
+            return 0
+        if isinstance(value, (int, float)):
+            return max(int(float(value)), 0)
+        text = str(value).replace(",", "").strip()
+        if not text or text in {"-", "N/A", "nan"}:
+            return 0
+        return max(int(float(text)), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 @dataclass
 class KISConfig:
     app_key: str = ""
@@ -24,8 +38,12 @@ class KISConfig:
     tr_id_balance: str = "TTTC8434R"
     tr_id_us_present_balance: str = "CTRP6504R"
     tr_id_quote: str = "FHKST01010100"
-    tr_id_order_buy: str = "TTTC0802U"
-    tr_id_order_sell: str = "TTTC0801U"
+    tr_id_order_buy: str = "TTTC0012U"
+    tr_id_order_sell: str = "TTTC0011U"
+    tr_id_order_revise_cancel: str = "TTTC0013U"
+    tr_id_order_daily: str = "TTTC0081R"
+    tr_id_order_cancelable: str = "TTTC0084R"
+    exchange_id: str = "KRX"
     cust_type: str = "P"
 
     @property
@@ -133,6 +151,9 @@ class KISAdapter:
             "ORD_DVSN": str(order_type or "01"),
             "ORD_QTY": str(qty),
             "ORD_UNPR": str(max(int(price), 0)),
+            "EXCG_ID_DVSN_CD": self.config.exchange_id or "KRX",
+            "SLL_TYPE": "",
+            "CNDT_PRIC": "",
         }
         headers = {
             "Authorization": f"Bearer {token}",
@@ -164,6 +185,15 @@ class KISAdapter:
 
         out = body.get("output")
         output = out if isinstance(out, dict) else {}
+        order_orgno = self._first_text(
+            output,
+            "KRX_FWDG_ORD_ORGNO",
+            "krx_fwdg_ord_orgno",
+            "ORD_GNO_BRNO",
+            "ord_gno_brno",
+            "ORD_ORGNO",
+            "ord_orgno",
+        )
         return {
             "symbol": code,
             "side": norm_side,
@@ -171,8 +201,322 @@ class KISAdapter:
             "price": int(max(price, 0)),
             "order_type": str(order_type or "01"),
             "order_no": str(output.get("ODNO") or output.get("odno") or ""),
+            "order_orgno": order_orgno,
             "response": body,
         }
+
+    async def fetch_domestic_order_daily(
+        self,
+        *,
+        symbol: str = "",
+        order_no: str = "",
+        order_orgno: str = "",
+        start_date: str | None = None,
+        end_date: str | None = None,
+        side_code: str = "00",
+        ccld_dvsn: str = "00",
+        max_pages: int = 3,
+    ) -> dict[str, Any]:
+        if not self.config.ready:
+            raise KISAPIError("kis config missing")
+
+        today = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
+        resolved_start = self._normalize_yyyymmdd(start_date) or today
+        resolved_end = self._normalize_yyyymmdd(end_date) or today
+        code = str(symbol or "").strip()
+        if code and (len(code) != 6 or not code.isdigit()):
+            raise KISAPIError("invalid domestic symbol")
+
+        rows: list[dict[str, Any]] = []
+        summaries: list[dict[str, Any]] = []
+        fk100 = ""
+        nk100 = ""
+        tr_cont = ""
+        page_limit = max(int(max_pages), 1)
+        for _ in range(page_limit):
+            payload, next_tr_cont = await self._inquire_domestic_order_daily_page(
+                symbol=code,
+                order_no=str(order_no or "").strip(),
+                order_orgno=str(order_orgno or "").strip(),
+                start_date=resolved_start,
+                end_date=resolved_end,
+                side_code=str(side_code or "00"),
+                ccld_dvsn=str(ccld_dvsn or "00"),
+                fk100=fk100,
+                nk100=nk100,
+                tr_cont=tr_cont,
+            )
+            output1 = payload.get("output1")
+            if isinstance(output1, list):
+                rows.extend(item for item in output1 if isinstance(item, dict))
+            elif isinstance(output1, dict):
+                rows.append(output1)
+
+            output2 = payload.get("output2")
+            if isinstance(output2, list):
+                summaries.extend(item for item in output2 if isinstance(item, dict))
+            elif isinstance(output2, dict):
+                summaries.append(output2)
+
+            fk100 = str(payload.get("ctx_area_fk100") or "")
+            nk100 = str(payload.get("ctx_area_nk100") or "")
+            if next_tr_cont not in {"M", "F"}:
+                break
+            if not (fk100 or nk100):
+                break
+            tr_cont = "N"
+
+        return {
+            "status": "ok",
+            "rows": rows,
+            "orders": [self.normalize_domestic_order_row(row) for row in rows],
+            "summary": summaries[-1] if summaries else {},
+            "start_date": resolved_start,
+            "end_date": resolved_end,
+            "symbol": code,
+            "order_no": str(order_no or "").strip(),
+        }
+
+    async def fetch_domestic_cancelable_orders(
+        self,
+        *,
+        query_type: str = "0",
+        side_code: str = "0",
+        max_pages: int = 3,
+    ) -> dict[str, Any]:
+        if not self.config.ready:
+            raise KISAPIError("kis config missing")
+
+        rows: list[dict[str, Any]] = []
+        fk100 = ""
+        nk100 = ""
+        tr_cont = ""
+        page_limit = max(int(max_pages), 1)
+        for _ in range(page_limit):
+            payload, next_tr_cont = await self._inquire_domestic_cancelable_page(
+                query_type=str(query_type or "0"),
+                side_code=str(side_code or "0"),
+                fk100=fk100,
+                nk100=nk100,
+                tr_cont=tr_cont,
+            )
+            output = payload.get("output")
+            if isinstance(output, list):
+                rows.extend(item for item in output if isinstance(item, dict))
+            elif isinstance(output, dict):
+                rows.append(output)
+
+            fk100 = str(payload.get("ctx_area_fk100") or "")
+            nk100 = str(payload.get("ctx_area_nk100") or "")
+            if next_tr_cont not in {"M", "F"}:
+                break
+            if not (fk100 or nk100):
+                break
+            tr_cont = "N"
+
+        return {
+            "status": "ok",
+            "rows": rows,
+            "orders": [self.normalize_domestic_order_row(row) for row in rows],
+        }
+
+    async def cancel_domestic_order(
+        self,
+        *,
+        order_no: str,
+        order_orgno: str = "",
+        quantity: int = 0,
+        order_type: str = "00",
+        exchange_id: str = "",
+    ) -> dict[str, Any]:
+        if not self.config.ready:
+            raise KISAPIError("kis config missing")
+
+        resolved_order_no = str(order_no or "").strip()
+        if not resolved_order_no:
+            raise KISAPIError("order_no is required")
+
+        cancelable_match: dict[str, Any] = {}
+        try:
+            cancelable = await self.fetch_domestic_cancelable_orders(max_pages=3)
+            for row in cancelable.get("orders") or []:
+                if str(row.get("order_no") or "").strip() == resolved_order_no:
+                    cancelable_match = row if isinstance(row, dict) else {}
+                    break
+        except Exception:
+            cancelable_match = {}
+
+        resolved_orgno = str(order_orgno or "").strip() or str(
+            cancelable_match.get("order_orgno") or ""
+        ).strip()
+        if not resolved_orgno:
+            raise KISAPIError("cancelable order orgno not found")
+
+        remaining_qty = _positive_int(cancelable_match.get("cancelable_qty"))
+        if remaining_qty <= 0:
+            remaining_qty = _positive_int(cancelable_match.get("remaining_qty"))
+        requested_qty = int(quantity or 0)
+        if requested_qty <= 0:
+            requested_qty = remaining_qty
+
+        token = await self._get_access_token()
+        cano, product_code = self._account_parts()
+        payload = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": product_code,
+            "KRX_FWDG_ORD_ORGNO": resolved_orgno,
+            "ORGN_ODNO": resolved_order_no,
+            "ORD_DVSN": str(order_type or "00"),
+            "RVSE_CNCL_DVSN_CD": "02",
+            "ORD_QTY": str(max(int(requested_qty), 0)),
+            "ORD_UNPR": "0",
+            "QTY_ALL_ORD_YN": "Y",
+            "EXCG_ID_DVSN_CD": str(exchange_id or self.config.exchange_id or "KRX"),
+        }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "appkey": self.config.app_key,
+            "appsecret": self.config.app_secret,
+            "tr_id": self.config.tr_id_order_revise_cancel,
+            "custtype": self.config.cust_type,
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=UTF-8",
+        }
+
+        url = f"{self.config.base_url.rstrip('/')}/uapi/domestic-stock/v1/trading/order-rvsecncl"
+        timeout = httpx.Timeout(10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                url, content=json.dumps(payload), headers=headers
+            )
+
+        body = self._parse_json(response)
+        if response.status_code >= 400:
+            raise KISAPIError(f"kis cancel request failed: {body}")
+        if str(body.get("rt_cd")) != "0":
+            msg = str(body.get("msg1") or body.get("msg_cd") or body)
+            raise KISAPIError(f"kis cancel request rejected: {msg}")
+
+        out = body.get("output")
+        output = out if isinstance(out, dict) else {}
+        return {
+            "order_no": resolved_order_no,
+            "order_orgno": resolved_orgno,
+            "cancel_order_no": str(output.get("ODNO") or output.get("odno") or ""),
+            "cancel_order_orgno": self._first_text(
+                output,
+                "KRX_FWDG_ORD_ORGNO",
+                "krx_fwdg_ord_orgno",
+                "ORD_GNO_BRNO",
+                "ord_gno_brno",
+                "ORD_ORGNO",
+                "ord_orgno",
+            ),
+            "quantity": requested_qty,
+            "response": body,
+        }
+
+    async def _inquire_domestic_order_daily_page(
+        self,
+        *,
+        symbol: str,
+        order_no: str,
+        order_orgno: str,
+        start_date: str,
+        end_date: str,
+        side_code: str,
+        ccld_dvsn: str,
+        fk100: str = "",
+        nk100: str = "",
+        tr_cont: str = "",
+    ) -> tuple[dict[str, Any], str]:
+        token = await self._get_access_token()
+        cano, product_code = self._account_parts()
+        params = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": product_code,
+            "INQR_STRT_DT": start_date,
+            "INQR_END_DT": end_date,
+            "SLL_BUY_DVSN_CD": side_code,
+            "PDNO": symbol,
+            "CCLD_DVSN": ccld_dvsn,
+            "INQR_DVSN": "00",
+            "INQR_DVSN_3": "00",
+            "ORD_GNO_BRNO": order_orgno,
+            "ODNO": order_no,
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": fk100,
+            "CTX_AREA_NK100": nk100,
+            "EXCG_ID_DVSN_CD": self.config.exchange_id or "KRX",
+        }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "appkey": self.config.app_key,
+            "appsecret": self.config.app_secret,
+            "tr_id": self.config.tr_id_order_daily,
+            "custtype": self.config.cust_type,
+            "Accept": "application/json",
+        }
+        if tr_cont:
+            headers["tr_cont"] = tr_cont
+
+        url = f"{self.config.base_url.rstrip('/')}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        timeout = httpx.Timeout(10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(url, params=params, headers=headers)
+
+        payload = self._parse_json(response)
+        if response.status_code >= 400:
+            raise KISAPIError(f"kis order inquiry request failed: {payload}")
+        if str(payload.get("rt_cd")) != "0":
+            msg = str(payload.get("msg1") or payload.get("msg_cd") or payload)
+            raise KISAPIError(f"kis order inquiry request rejected: {msg}")
+        next_tr_cont = str(response.headers.get("tr_cont") or "").upper().strip()
+        return payload, next_tr_cont
+
+    async def _inquire_domestic_cancelable_page(
+        self,
+        *,
+        query_type: str,
+        side_code: str,
+        fk100: str = "",
+        nk100: str = "",
+        tr_cont: str = "",
+    ) -> tuple[dict[str, Any], str]:
+        token = await self._get_access_token()
+        cano, product_code = self._account_parts()
+        params = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": product_code,
+            "INQR_DVSN_1": query_type,
+            "INQR_DVSN_2": side_code,
+            "CTX_AREA_FK100": fk100,
+            "CTX_AREA_NK100": nk100,
+        }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "appkey": self.config.app_key,
+            "appsecret": self.config.app_secret,
+            "tr_id": self.config.tr_id_order_cancelable,
+            "custtype": self.config.cust_type,
+            "Accept": "application/json",
+        }
+        if tr_cont:
+            headers["tr_cont"] = tr_cont
+
+        url = f"{self.config.base_url.rstrip('/')}/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
+        timeout = httpx.Timeout(10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(url, params=params, headers=headers)
+
+        payload = self._parse_json(response)
+        if response.status_code >= 400:
+            raise KISAPIError(f"kis cancelable inquiry request failed: {payload}")
+        if str(payload.get("rt_cd")) != "0":
+            msg = str(payload.get("msg1") or payload.get("msg_cd") or payload)
+            raise KISAPIError(f"kis cancelable inquiry request rejected: {msg}")
+        next_tr_cont = str(response.headers.get("tr_cont") or "").upper().strip()
+        return payload, next_tr_cont
 
     async def _fetch_balance_rows(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if not self.config.ready:
@@ -447,6 +791,62 @@ class KISAdapter:
         assets.sort(key=lambda item: (item["kind"] != "cash", str(item["asset"])))
         return assets
 
+    def normalize_domestic_order_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        order_qty = _positive_int(row.get("ord_qty"))
+        filled_qty = _positive_int(row.get("tot_ccld_qty"))
+        remaining_qty = _positive_int(row.get("rmn_qty"))
+        if remaining_qty <= 0 and order_qty > 0 and filled_qty < order_qty:
+            cancel_confirmed = _positive_int(row.get("cnc_cfrm_qty"))
+            rejected_qty = _positive_int(row.get("rjct_qty"))
+            remaining_qty = max(order_qty - filled_qty - cancel_confirmed - rejected_qty, 0)
+        total_amount = self._to_float(row.get("tot_ccld_amt") or row.get("prsm_tlex_smtl"))
+        avg_price = self._to_float(row.get("avg_prvs") or row.get("pchs_avg_pric"))
+        if avg_price <= 0 and filled_qty > 0 and total_amount > 0:
+            avg_price = total_amount / filled_qty
+
+        cancelable_qty = _positive_int(row.get("psbl_qty"))
+        if cancelable_qty <= 0:
+            cancelable_qty = remaining_qty
+
+        return {
+            "order_date": str(row.get("ord_dt") or ""),
+            "order_no": self._first_text(row, "odno", "ODNO"),
+            "order_orgno": self._first_text(
+                row,
+                "ord_gno_brno",
+                "ORD_GNO_BRNO",
+                "krx_fwdg_ord_orgno",
+                "KRX_FWDG_ORD_ORGNO",
+                "ord_orgno",
+                "ORD_ORGNO",
+            ),
+            "original_order_no": self._first_text(row, "orgn_odno", "ORGN_ODNO"),
+            "symbol": self._first_text(row, "pdno", "PDNO"),
+            "name": self._first_text(row, "prdt_name", "PRDT_NAME"),
+            "side_code": self._first_text(row, "sll_buy_dvsn_cd", "SLL_BUY_DVSN_CD"),
+            "side_name": self._first_text(
+                row, "sll_buy_dvsn_cd_name", "SLL_BUY_DVSN_CD_NAME"
+            ),
+            "order_type": self._first_text(row, "ord_dvsn_cd", "ORD_DVSN_CD"),
+            "order_type_name": self._first_text(row, "ord_dvsn_name", "ORD_DVSN_NAME"),
+            "order_qty": order_qty,
+            "order_price": int(self._to_float(row.get("ord_unpr"))),
+            "filled_qty": filled_qty,
+            "remaining_qty": remaining_qty,
+            "cancelable_qty": cancelable_qty,
+            "avg_fill_price": avg_price,
+            "total_fill_amount": total_amount,
+            "canceled": str(row.get("cncl_yn") or "").upper() == "Y",
+            "order_time": str(row.get("ord_tmd") or ""),
+            "exchange_id": self._first_text(
+                row,
+                "excg_id_dvsn_cd",
+                "excg_id_dvsn_Cd",
+                "EXCG_ID_DVSN_CD",
+            ),
+            "raw": row,
+        }
+
     def _to_us_assets(
         self,
         rows: list[dict[str, Any]],
@@ -677,6 +1077,23 @@ class KISAdapter:
             return float(text)
         except ValueError:
             return 0.0
+
+    @staticmethod
+    def _first_text(row: dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            value = row.get(key)
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _normalize_yyyymmdd(value: str | None) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        digits = "".join(ch for ch in text if ch.isdigit())
+        return digits[:8] if len(digits) >= 8 else ""
 
     @staticmethod
     def _parse_json(response: httpx.Response) -> dict[str, Any]:

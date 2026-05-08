@@ -57,6 +57,44 @@ def test_kis_to_assets_maps_balance_rows() -> None:
     assert "000660" not in symbols
 
 
+def test_kis_domestic_order_tr_ids_use_current_cash_order_family() -> None:
+    config = KISConfig()
+
+    assert config.tr_id_order_buy == "TTTC0012U"
+    assert config.tr_id_order_sell == "TTTC0011U"
+    assert config.tr_id_order_revise_cancel == "TTTC0013U"
+    assert config.tr_id_order_daily == "TTTC0081R"
+    assert config.tr_id_order_cancelable == "TTTC0084R"
+
+
+def test_kis_normalize_domestic_order_row_maps_fill_fields() -> None:
+    adapter = KISAdapter(KISConfig())
+    row = {
+        "ord_dt": "20260508",
+        "ord_gno_brno": "00123",
+        "odno": "0000007777",
+        "pdno": "005930",
+        "prdt_name": "삼성전자",
+        "sll_buy_dvsn_cd": "02",
+        "ord_qty": "3",
+        "ord_unpr": "70000",
+        "tot_ccld_qty": "2",
+        "tot_ccld_amt": "142000",
+        "rmn_qty": "1",
+        "psbl_qty": "1",
+    }
+
+    order = adapter.normalize_domestic_order_row(row)
+
+    assert order["order_no"] == "0000007777"
+    assert order["order_orgno"] == "00123"
+    assert order["symbol"] == "005930"
+    assert order["filled_qty"] == 2
+    assert order["remaining_qty"] == 1
+    assert order["cancelable_qty"] == 1
+    assert order["avg_fill_price"] == pytest.approx(71_000.0)
+
+
 def test_kis_select_cash_value_infers_from_total_minus_stocks() -> None:
     adapter = KISAdapter(
         KISConfig(

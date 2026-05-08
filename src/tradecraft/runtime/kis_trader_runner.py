@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from tradecraft.config import AppSettings
+from tradecraft.runtime.process_status import write_current_runner_pid
 from tradecraft.services.kis import KISAdapter, KISConfig
 from tradecraft.services.kis_llm_trader import KISLLMTrader, KISLLMTraderConfig
 from tradecraft.services.naver_reports import NaverReportRepository
@@ -61,6 +62,9 @@ def _build_trader(settings: AppSettings) -> KISLLMTrader:
             RAGStoreConfig(
                 persist_path=settings.rag_persist_path,
                 collection_name=settings.rag_collection_name,
+                sync_batch_size=settings.rag_sync_batch_size,
+                skip_existing=settings.rag_skip_existing,
+                query_oversample_factor=settings.rag_query_oversample_factor,
             )
         )
         if settings.rag_enabled
@@ -76,6 +80,7 @@ def _build_trader(settings: AppSettings) -> KISLLMTrader:
         llm_bridge_token=settings.llm_bridge_token,
         llm_bridge_timeout_ms=settings.llm_bridge_timeout_ms,
         llm_model=settings.llm_model,
+        execute_orders=settings.kis_trader_execute_orders,
         persona=settings.kis_trader_persona,
         max_orders_per_cycle=settings.kis_trader_max_orders_per_cycle,
         max_budget_per_order_krw=settings.kis_trader_max_budget_per_order_krw,
@@ -94,6 +99,7 @@ def _build_trader(settings: AppSettings) -> KISLLMTrader:
 
 
 def run() -> None:
+    write_current_runner_pid("kis_trader")
     settings = AppSettings()
     interval = max(int(settings.kis_trader_interval_sec), 30)
 
@@ -101,6 +107,8 @@ def run() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     if not settings.kis_trader_enabled:
         logger.info("kis trader disabled: TRADECRAFT_KIS_TRADER_ENABLED=false")

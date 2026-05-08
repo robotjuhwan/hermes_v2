@@ -1,22 +1,16 @@
-# Exchange API Official Docs (Tradecraft + Freqtrade)
+# Exchange API Official Docs (Tradecraft)
 
 Last verified: 2026-02-14 (KST)
 
 ## 0) Execution architecture (current)
 
-- 자동매매 실행 엔진: **Freqtrade** (Spot/Futures)
-- Tradecraft 역할: UI/Telegram/통합 대시보드 + Freqtrade REST 상태 연동
+- 자동매매 실행 후보: **거래소별 직접 어댑터 + KIS 직접 트레이더**
+- Tradecraft 역할: UI/Telegram/통합 대시보드 + 리서치/RAG/투자 도움 에이전트
 - 거래소/브로커 공식 문서는 Tradecraft 계정 조회 및 운영 검증 기준으로 유지
 
 ## 1) Current integration targets (now)
 
-### 1.0 Trading engine (active)
-
-| Component | Scope | Official docs | Auth | Note |
-|---|---|---|---|---|
-| Freqtrade REST API | Spot/Futures bot status + open positions | https://www.freqtrade.io/en/stable/rest-api/ | Username/Password (basic auth) | Tradecraft가 세션/포지션 모니터링에 사용 |
-
-### 1.1 Crypto venues (active targets)
+### 1.0 Crypto venues (active targets)
 
 | Venue | Scope | Official docs | Auth | Test/Sandbox |
 |---|---|---|---|---|
@@ -25,7 +19,7 @@ Last verified: 2026-02-14 (KST)
 | Binance Futures | USD-M / COIN-M | https://developers.binance.com/docs/derivatives<br>https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info<br>https://developers.binance.com/docs/derivatives/coin-margined-futures/general-info | API Key + signed request | Futures Testnet 지원 |
 | Bithumb | Spot | https://apidocs.bithumb.com/ | API Key + signed request | 운영/테스트 정책은 문서 기준 확인 |
 
-### 1.2 KR/US Stocks (active target)
+### 1.1 KR/US Stocks (active target)
 
 | Provider | Scope | Official docs | Auth | Note |
 |---|---|---|---|---|
@@ -57,8 +51,8 @@ Reason:
 - 계좌/권한/서비스 정책에 따라 특정 기능 가능 여부가 달라질 수 있음
 
 Current project direction:
-- **Crypto auto-trading execution: Freqtrade**
-- Tradecraft는 Freqtrade/거래소 상태를 통합해 모니터링/제어
+- **Crypto execution is venue-adapter first**, with account/asset visibility kept separate from automated order execution.
+- Tradecraft는 거래소/브로커 자산 상태와 리서치 지식을 통합해 모니터링/조언합니다.
 - **Primary stock provider: KIS only** for KR/US stocks
 - Kiwoom: later optional expansion (not in current build scope)
 

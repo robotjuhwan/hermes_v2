@@ -7,259 +7,303 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23111827'/%3E%3Cpath d='M8 18h16M10 13h12M12 23h8' stroke='%23f5c542' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/style.css?v=20260508_nav_v2" />
 </head>
 <body>
   <div class="bg-mesh"></div>
   <main class="app">
-    <header class="hero card">
-      <div>
-        <p class="eyebrow">HERMES</p>
-        <h1>HERMES BOT</h1>
-        <p class="sub">시세/주문보다 먼저, 거래소/시장별 잔고를 체계적으로 확인하는 반응형 운영 화면</p>
-      </div>
-      <div class="pillbox">
-        <span id="healthPill" class="pill">API checking...</span>
-        <span id="clockPill" class="pill mono">--</span>
-        <span id="fxUsdtPill" class="pill mono">USDT/KRW --</span>
-        <span id="fxUsdPill" class="pill mono">USD/KRW --</span>
-        <span id="fxUpdatedPill" class="pill mono">FX --</span>
-        <button id="helperNavBtn" class="btn ghost" type="button">투자 도움 에이전트</button>
-        <button id="themeToggle" class="btn ghost theme-btn" type="button">다크 모드</button>
-      </div>
-    </header>
-
-    <section id="mainMetricsSection" class="metrics">
-      <article class="metric card">
-        <p>전체 자산 합계</p>
-        <h2 id="totalAssetValue">-</h2>
-      </article>
-      <article class="metric card">
-        <p>현금성 자산</p>
-        <h2 id="cashAssetValue">-</h2>
-      </article>
-      <article class="metric card">
-        <p>투자 중 자산</p>
-        <h2 id="investedAssetValue">-</h2>
-      </article>
-      <article class="metric card">
-        <p>평가 손익</p>
-        <h2 id="unrealizedPnlValue">-</h2>
-      </article>
-      <article class="metric card spouse">
-        <p>와이프 계좌 분리</p>
-        <h2 id="spouseAssetValue">-</h2>
-        <small id="spouseAssetDetail" class="metric-sub">-</small>
-      </article>
-      <article class="panel card">
-        <p>연동 시장 수</p>
-        <h2 id="venueCountValue">-</h2>
-      </article>
-    </section>
-
-    <section id="mainBalanceSection" class="balance-shell card">
-      <div class="panel-head">
-        <h3>거래소/시장별 잔고 탭</h3>
-        <div class="panel-actions">
-          <span id="activeMarketBadge" class="pill">전체</span>
-          <button id="refreshBtn" class="btn ghost" type="button">Refresh</button>
-        </div>
-      </div>
-      <div id="venueTabs" class="tab-row"></div>
-
-      <div class="mini-metrics">
-        <article class="mini-card">
-          <p>선택 탭 자산</p>
-          <h4 id="activeTotalValue">-</h4>
-        </article>
-        <article class="mini-card">
-          <p>선택 탭 현금</p>
-          <h4 id="activeCashValue">-</h4>
-        </article>
-        <article class="mini-card">
-          <p>선택 탭 투자금</p>
-          <h4 id="activeInvestedValue">-</h4>
-        </article>
-        <article class="mini-card">
-          <p>선택 탭 평가손익</p>
-          <h4 id="activePnlValue">-</h4>
-        </article>
-      </div>
-
-      <div class="balance-grid">
-        <article class="panel card">
-          <div class="panel-head">
-            <h3>자산 상세 (현금 + 보유자산 통합)</h3>
+    <div class="product-shell">
+      <aside class="nav-rail card" aria-label="HERMES 주요 화면">
+        <div class="nav-brand">
+          <span class="brand-mark">H</span>
+          <div>
+            <strong>HERMES</strong>
+            <small>portfolio intelligence</small>
           </div>
+        </div>
+        <nav class="nav-stack" aria-label="주요 내비게이션">
+          <button id="mainNavBtn" class="nav-item active" type="button">
+            <span>Dashboard</span>
+            <strong>자산 대시보드</strong>
+          </button>
+          <button id="helperNavBtn" class="nav-item" type="button">
+            <span>Research</span>
+            <strong>AI 리서치룸</strong>
+          </button>
+          <button class="nav-item" type="button" data-nav-helper-tab="kis_trader">
+            <span>Trading</span>
+            <strong>블록 트레이딩</strong>
+          </button>
+          <button class="nav-item" type="button" data-nav-helper-tab="runtime">
+            <span>System</span>
+            <strong>데이터·실행</strong>
+          </button>
+        </nav>
+        <div class="nav-foot">
+          <span>현재 모드</span>
+          <strong>Paper · 실주문 잠금</strong>
+        </div>
+      </aside>
+
+      <div class="product-workspace">
+        <header class="hero card">
+          <div>
+            <p class="eyebrow">HERMES BOT</p>
+            <h1>Investment Operations Cockpit</h1>
+            <p class="sub">잔고, 리서치 지식, 전략 힌트를 한 화면에서 조용하게 검토하는 반다크 금융 워크스페이스</p>
+          </div>
+          <div class="pillbox">
+            <span id="healthPill" class="pill">API checking...</span>
+            <span id="clockPill" class="pill mono">--</span>
+            <span id="fxUsdtPill" class="pill mono">USDT/KRW --</span>
+            <span id="fxUsdPill" class="pill mono">USD/KRW --</span>
+            <span id="fxUpdatedPill" class="pill mono">FX --</span>
+            <button id="themeToggle" class="btn ghost theme-btn" type="button">다크 모드</button>
+          </div>
+        </header>
+
+        <div id="mainDashboardPage" class="dashboard-page">
+          <section id="mainMetricsSection" class="metrics">
+            <article class="metric metric-primary card">
+              <p>전체 자산 합계</p>
+              <h2 id="totalAssetValue">-</h2>
+              <small>거래소와 증권 계좌를 합산한 운영 기준값</small>
+            </article>
+            <article class="metric card">
+              <p>현금성 자산</p>
+              <h2 id="cashAssetValue">-</h2>
+            </article>
+            <article class="metric card">
+              <p>투자 중 자산</p>
+              <h2 id="investedAssetValue">-</h2>
+            </article>
+            <article class="metric card">
+              <p>평가 손익</p>
+              <h2 id="unrealizedPnlValue">-</h2>
+            </article>
+            <article class="metric card spouse">
+              <p>와이프 계좌 분리</p>
+              <h2 id="spouseAssetValue">-</h2>
+              <small id="spouseAssetDetail" class="metric-sub">-</small>
+            </article>
+            <article class="metric card">
+              <p>연동 시장 수</p>
+              <h2 id="venueCountValue">-</h2>
+            </article>
+          </section>
+
+          <div class="dashboard-content-grid">
+            <section id="mainBalanceSection" class="balance-shell card">
+              <div class="panel-head">
+                <div>
+                  <span class="section-kicker">Portfolio</span>
+                  <h3>거래소/시장별 잔고</h3>
+                </div>
+                <div class="panel-actions">
+                  <span id="activeMarketBadge" class="pill">전체</span>
+                  <button id="refreshBtn" class="btn ghost" type="button">Refresh</button>
+                </div>
+              </div>
+              <div id="venueTabs" class="tab-row"></div>
+
+              <div class="mini-metrics">
+                <article class="mini-card">
+                  <p>선택 탭 자산</p>
+                  <h4 id="activeTotalValue">-</h4>
+                </article>
+                <article class="mini-card">
+                  <p>선택 탭 현금</p>
+                  <h4 id="activeCashValue">-</h4>
+                </article>
+                <article class="mini-card">
+                  <p>선택 탭 투자금</p>
+                  <h4 id="activeInvestedValue">-</h4>
+                </article>
+                <article class="mini-card">
+                  <p>선택 탭 평가손익</p>
+                  <h4 id="activePnlValue">-</h4>
+                </article>
+              </div>
+
+              <div class="balance-grid">
+                <article class="panel panel-flat">
+                  <div class="panel-head compact">
+                    <h3>자산 상세</h3>
+                    <span class="muted-label">현금 + 보유자산 통합</span>
+                  </div>
+                  <div class="table-wrap">
+                    <table class="asset-table">
+                      <thead>
+                        <tr>
+                          <th>자산</th>
+                          <th>유형</th>
+                          <th>수량</th>
+                          <th>가용</th>
+                          <th>락</th>
+                          <th>평단</th>
+                          <th>현재가</th>
+                          <th>평가금액</th>
+                          <th>평가손익</th>
+                        </tr>
+                      </thead>
+                      <tbody id="assetsBody"></tbody>
+                    </table>
+                  </div>
+                </article>
+              </div>
+            </section>
+
+            <aside class="ops-column">
+              <section id="mainLayoutSection" class="telegram-shell card">
+                <div class="panel-head">
+                  <div>
+                    <span class="section-kicker">Operations</span>
+                    <h3>Live Event Feed</h3>
+                  </div>
+                </div>
+                <ul id="eventList" class="event-list"></ul>
+              </section>
+
+              <section id="mainTelegramSection" class="telegram-shell card">
+                <div class="panel-head">
+                  <div>
+                    <span class="section-kicker">Integrations</span>
+                    <h3>Connection Status</h3>
+                  </div>
+                </div>
+                <div class="integration-stack">
+                  <div id="telegramStatus" class="notice">Telegram 상태 불러오는 중...</div>
+                  <div class="notice">
+                    보안 정책: Telegram 설정은 UI에서 변경하지 않습니다. <br />
+                    <span class="mono">.env</span>의
+                    <span class="mono">TRADECRAFT_TELEGRAM_BOT_TOKEN</span>,
+                    <span class="mono">TRADECRAFT_TELEGRAM_CHAT_ID</span> 값을 수정 후 서버를 재시작하세요.
+                  </div>
+                </div>
+              </section>
+            </aside>
+          </div>
+        </div>
+
+        <section id="helperAgentSection" class="helper-shell card" hidden>
+          <aside class="helper-rail">
+            <button id="helperBackBtn" class="btn ghost" type="button">메인으로 돌아가기</button>
+            <div class="helper-identity">
+              <span class="section-kicker">Research Room</span>
+              <h3>투자 도움 에이전트</h3>
+              <p>질문, 전략 후보, 리서치 근거, 장중 판단을 한 흐름으로 묶어 봅니다.</p>
+            </div>
+            <div id="helperTabs" class="helper-tab-stack">
+              <button type="button" class="tab-button active" data-helper-tab="ask">AI 질문</button>
+              <button type="button" class="tab-button" data-helper-tab="strategy_intel">전략 워치</button>
+              <button type="button" class="tab-button" data-helper-tab="memory">메모리</button>
+              <button type="button" class="tab-button" data-helper-tab="research">리서치 근거</button>
+              <button type="button" class="tab-button" data-helper-tab="market_judge">장중 판단</button>
+              <button type="button" class="tab-button" data-helper-tab="kis_trader">블록 트레이딩</button>
+              <button type="button" class="tab-button" data-helper-tab="runtime">운영/데이터</button>
+            </div>
+          </aside>
+          <div class="helper-stage">
+            <div class="panel-head">
+              <div>
+                <span class="section-kicker">Workspace</span>
+                <h3 id="helperStageTitle">AI 질문</h3>
+              </div>
+              <div class="panel-actions">
+                <span id="helperScorePill" class="pill mono">현재 역량 --/100</span>
+                <span id="helperUpdatedAt" class="pill mono">--</span>
+              </div>
+            </div>
+            <div id="helperContent" class="helper-content">
+              <div class="notice">투자 도움 에이전트 상태를 불러오는 중입니다.</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="backtestPane" class="backtest-shell card hidden">
+          <div class="panel-head">
+            <h3>백테스트 시나리오 랩</h3>
+            <div class="panel-actions">
+              <span id="btStatusText" class="pill">idle</span>
+              <button id="btRefreshBtn" class="btn ghost" type="button">상태 갱신</button>
+              <button id="btStopBtn" class="btn ghost" type="button">중지</button>
+              <button id="btStartBtn" class="btn warm" type="button">START</button>
+            </div>
+          </div>
+
+          <div class="bt-form-grid">
+            <label>시나리오
+              <select id="btScenario"></select>
+            </label>
+            <label>Cycles
+              <input id="btCycles" type="number" min="1" value="720" />
+            </label>
+            <label>Step(sec)
+              <input id="btStepSec" type="number" min="1" value="60" />
+            </label>
+            <label>Speed(x)
+              <input id="btSpeed" type="number" min="0.01" step="0.01" value="120" />
+            </label>
+            <label>Fee Rate
+              <input id="btFeeRate" type="number" min="0" step="0.0001" value="0.0005" />
+            </label>
+            <label>Slippage(bps)
+              <input id="btSlippage" type="number" min="0" step="0.1" value="1" />
+            </label>
+          </div>
+
+          <div class="bt-session-box">
+            <h4>세션 선택 (체크한 세션만 실행)</h4>
+            <div id="btSessionList" class="bt-session-list"></div>
+          </div>
+
+          <div class="bt-progress-wrap">
+            <div id="btProgressText" class="mono">0 / 0 (0%)</div>
+            <div class="bt-progress-track">
+              <div id="btProgressBar" class="bt-progress-bar"></div>
+            </div>
+          </div>
+
+          <div class="bt-kpi-grid">
+            <article class="mini-card"><p>순손익</p><h4 id="btNetPnl">0 KRW</h4></article>
+            <article class="mini-card"><p>실현 손익</p><h4 id="btRealized">0 KRW</h4></article>
+            <article class="mini-card"><p>미실현 손익</p><h4 id="btUnrealized">0 KRW</h4></article>
+            <article class="mini-card"><p>수수료</p><h4 id="btFees">0 KRW</h4></article>
+          </div>
+
+          <div class="bt-chart-shell">
+            <svg id="btCurve" viewBox="0 0 1000 260" preserveAspectRatio="none" aria-label="backtest equity curve">
+              <polyline id="btCurveLine" fill="none" stroke-width="2" points=""></polyline>
+            </svg>
+          </div>
+
+          <div class="bt-meta">
+            <span id="btMeta" class="mono">-</span>
+            <span id="btDataStatus" class="mono">data cache: -</span>
+          </div>
+
           <div class="table-wrap">
-            <table>
+            <table class="bt-session-table">
               <thead>
                 <tr>
-                  <th>자산</th>
-                  <th>유형</th>
-                  <th>수량</th>
-                  <th>가용</th>
-                  <th>락</th>
-                  <th>평단</th>
-                  <th>현재가</th>
-                  <th>평가금액</th>
-                  <th>평가손익</th>
+                  <th>SESSION</th>
+                  <th>SYMBOL</th>
+                  <th>SIGNALS</th>
+                  <th>FILLS</th>
+                  <th>TRADES</th>
+                  <th>NET PNL</th>
                 </tr>
               </thead>
-              <tbody id="assetsBody"></tbody>
+              <tbody id="btSessionBody"></tbody>
             </table>
           </div>
-        </article>
+        </section>
       </div>
-    </section>
-
-    <section id="mainLayoutSection" class="layout">
-      <article class="panel card">
-        <div class="panel-head">
-          <h3>봇 세션 상태 (요약)</h3>
-          <span id="sessionUpdatedAt" class="pill mono">--</span>
-        </div>
-        <div id="sessionCards" class="session-grid"></div>
-      </article>
-
-      <article class="panel card">
-        <div class="panel-head">
-          <h3>Live Event Feed</h3>
-        </div>
-        <ul id="eventList" class="event-list"></ul>
-      </article>
-    </section>
-
-    <section id="helperAgentSection" class="helper-shell card" hidden>
-      <div class="panel-head">
-        <h3>투자 도움 에이전트</h3>
-        <div class="panel-actions">
-          <button id="helperBackBtn" class="btn ghost" type="button">메인으로 돌아가기</button>
-          <span id="helperScorePill" class="pill mono">현재 역량 --/100</span>
-          <span id="helperUpdatedAt" class="pill mono">--</span>
-        </div>
-      </div>
-      <div id="helperTabs" class="tab-row">
-        <button type="button" class="tab-button active" data-helper-tab="research">리서치 요약</button>
-        <button type="button" class="tab-button" data-helper-tab="runtime">실행 상태</button>
-        <button type="button" class="tab-button" data-helper-tab="rebalance">리밸런싱</button>
-        <button type="button" class="tab-button" data-helper-tab="kis_trader">KIS 트레이더</button>
-        <button type="button" class="tab-button" data-helper-tab="reports">리포트 수집</button>
-      </div>
-      <div id="helperContent" class="helper-content">
-        <div class="notice">투자 도움 에이전트 상태를 불러오는 중입니다.</div>
-      </div>
-    </section>
-
-    <section id="mainStrategySection" class="strategy-shell card">
-      <div class="panel-head">
-        <h3>전략 실행 제어</h3>
-        <div class="panel-actions">
-          <span id="strategyUpdatedAt" class="pill mono">--</span>
-          <button id="strategyRefreshBtn" class="btn ghost" type="button">Status</button>
-          <button id="strategyStartAllBtn" class="btn" type="button">Start All</button>
-          <button id="strategyStopAllBtn" class="btn warm" type="button">Stop All</button>
-        </div>
-      </div>
-      <div id="strategyList" class="strategy-list"></div>
-    </section>
-
-    <section id="mainTelegramSection" class="telegram-shell card">
-      <div class="panel-head">
-        <h3>Integration Status</h3>
-      </div>
-      <div class="integration-stack">
-        <div id="telegramStatus" class="notice">Telegram 상태 불러오는 중...</div>
-        <div class="notice">
-          보안 정책: Telegram 설정은 UI에서 변경하지 않습니다. <br />
-          <span class="mono">.env</span>의
-          <span class="mono">TRADECRAFT_TELEGRAM_BOT_TOKEN</span>,
-          <span class="mono">TRADECRAFT_TELEGRAM_CHAT_ID</span> 값을 수정 후 서버를 재시작하세요.
-        </div>
-      </div>
-    </section>
     </div>
-
-    <section id="backtestPane" class="backtest-shell card hidden">
-      <div class="panel-head">
-        <h3>백테스트 시나리오 랩</h3>
-        <div class="panel-actions">
-          <span id="btStatusText" class="pill">idle</span>
-          <button id="btRefreshBtn" class="btn ghost" type="button">상태 갱신</button>
-          <button id="btStopBtn" class="btn ghost" type="button">중지</button>
-          <button id="btStartBtn" class="btn warm" type="button">START</button>
-        </div>
-      </div>
-
-      <div class="bt-form-grid">
-        <label>시나리오
-          <select id="btScenario"></select>
-        </label>
-        <label>Cycles
-          <input id="btCycles" type="number" min="1" value="720" />
-        </label>
-        <label>Step(sec)
-          <input id="btStepSec" type="number" min="1" value="60" />
-        </label>
-        <label>Speed(x)
-          <input id="btSpeed" type="number" min="0.01" step="0.01" value="120" />
-        </label>
-        <label>Fee Rate
-          <input id="btFeeRate" type="number" min="0" step="0.0001" value="0.0005" />
-        </label>
-        <label>Slippage(bps)
-          <input id="btSlippage" type="number" min="0" step="0.1" value="1" />
-        </label>
-      </div>
-
-      <div class="bt-session-box">
-        <h4>세션 선택 (체크한 세션만 실행)</h4>
-        <div id="btSessionList" class="bt-session-list"></div>
-      </div>
-
-      <div class="bt-progress-wrap">
-        <div id="btProgressText" class="mono">0 / 0 (0%)</div>
-        <div class="bt-progress-track">
-          <div id="btProgressBar" class="bt-progress-bar"></div>
-        </div>
-      </div>
-
-      <div class="bt-kpi-grid">
-        <article class="mini-card"><p>순손익</p><h4 id="btNetPnl">0 KRW</h4></article>
-        <article class="mini-card"><p>실현 손익</p><h4 id="btRealized">0 KRW</h4></article>
-        <article class="mini-card"><p>미실현 손익</p><h4 id="btUnrealized">0 KRW</h4></article>
-        <article class="mini-card"><p>수수료</p><h4 id="btFees">0 KRW</h4></article>
-      </div>
-
-      <div class="bt-chart-shell">
-        <svg id="btCurve" viewBox="0 0 1000 260" preserveAspectRatio="none" aria-label="backtest equity curve">
-          <polyline id="btCurveLine" fill="none" stroke-width="2" points=""></polyline>
-        </svg>
-      </div>
-
-      <div class="bt-meta">
-        <span id="btMeta" class="mono">-</span>
-        <span id="btDataStatus" class="mono">data cache: -</span>
-      </div>
-
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>SESSION</th>
-              <th>SYMBOL</th>
-              <th>SIGNALS</th>
-              <th>FILLS</th>
-              <th>TRADES</th>
-              <th>NET PNL</th>
-            </tr>
-          </thead>
-          <tbody id="btSessionBody"></tbody>
-        </table>
-      </div>
-    </section>
   </main>
 
-  <script src="/static/app.js?v=20260225_06"></script>
+  <div id="helperModalRoot"></div>
+  <script src="/static/app.js?v=20260508_nav_v2"></script>
 </body>
 </html>

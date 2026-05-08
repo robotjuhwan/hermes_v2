@@ -5,3 +5,7 @@ __pycache__/
 *.pyc
 .env
 .runtime/
+node_modules/
+playwright-report/
+test-results/
+src/tradecraft/reports_api/web_dist/

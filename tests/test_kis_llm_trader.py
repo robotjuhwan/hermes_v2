@@ -83,8 +83,54 @@ def test_kis_llm_trader_runs_with_fallback(tmp_path: Path, monkeypatch) -> None:
 
     snapshot = asyncio.run(trader.run_once())
     assert snapshot["status"] == "ok"
-    assert len(fake.orders) >= 1
+    assert snapshot["execution_mode"] == "dry_run"
+    assert fake.orders == []
+    assert snapshot["orders"][0]["status"] == "planned"
     assert trader_path.exists()
+
+
+def test_kis_llm_trader_sends_orders_only_when_enabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    research_path = tmp_path / "research.json"
+    trader_path = tmp_path / "kis_trader.json"
+    RuntimeStateStore(research_path).write_snapshot(
+        {
+            "updated_at": utc_now_iso(),
+            "source": "research_runner",
+            "query": "KRX",
+            "items": [
+                {
+                    "title": "note",
+                    "summary": "관심종목 005930",
+                    "picks": ["005930"],
+                }
+            ],
+        }
+    )
+
+    fake = _FakeKIS()
+    trader = KISLLMTrader(
+        config=KISLLMTraderConfig(
+            research_state_path=str(research_path),
+            trader_state_path=str(trader_path),
+            llm_command="",
+            persona="pro",
+            execute_orders=True,
+            max_orders_per_cycle=1,
+            max_budget_per_order_krw=200_000,
+            min_confidence=0.5,
+        ),
+        kis=fake,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(trader, "_is_krx_open", lambda: True)
+
+    snapshot = asyncio.run(trader.run_once())
+
+    assert snapshot["execution_mode"] == "live"
+    assert len(fake.orders) == 1
+    assert snapshot["orders"][0]["status"] == "sent"
 
 
 def test_collect_report_context_ranks_recency(tmp_path: Path) -> None:

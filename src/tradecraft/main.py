@@ -2,63 +2,97 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
-import socket
-import subprocess
 import json
+import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
-import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from tradecraft.backtest.data_registry import BacktestDataRegistry
 from tradecraft.backtest.engine import BacktestConfig
-from tradecraft.backtest.live_manager import BacktestLiveManager
-from tradecraft.backtest.scenarios import apply_scenario, list_scenarios
+from tradecraft.backtest.scenarios import apply_scenario
 from tradecraft.config import AppSettings
 from tradecraft.services.binance import STABLE_USD_ASSETS, BinanceAdapter, BinanceConfig
 from tradecraft.services.bithumb import BithumbAdapter, BithumbConfig
 from tradecraft.services.fx import FxRateConfig, FxRateService
-from tradecraft.services.freqtrade import (
-    FreqtradeBotConfig,
-    FreqtradeBridge,
-    FreqtradeBridgeConfig,
-)
-from tradecraft.services.freqtrade_process import (
-    FreqtradeProcessManager,
-    FreqtradeProcessManagerConfig,
-)
 from tradecraft.services.kis import KISAdapter, KISConfig
-from tradecraft.services.kis_llm_trader import KISLLMTrader, KISLLMTraderConfig
-from tradecraft.services.portfolio_coach import PortfolioCoachStore
-from tradecraft.services.naver_reports import (
-    NaverReportCrawlerConfig,
-    NaverReportRepository,
-    NaverSecuritiesCrawler,
+from tradecraft.services.kis_block_trader import (
+    KISBlockTrader,
+    KISBlockTraderConfig,
 )
-from tradecraft.services.rag_store import RAGStore, RAGStoreConfig
+from tradecraft.services.investment_memory import (
+    InvestmentMemoryConfig,
+    InvestmentMemoryService,
+)
+from tradecraft.services.kis_llm_trader import KISLLMTrader, KISLLMTraderConfig
+from tradecraft.services.llm_bridge import LLMBridge, LLMBridgeConfig
+from tradecraft.services.intelligence import (
+    build_report_intelligence_status,
+    build_report_intelligence_stack,
+    run_report_collection_cycle,
+    sync_report_rag,
+)
+from tradecraft.services.portfolio_coach import PortfolioCoachStore
 from tradecraft.services.market import (
     mock_dashboard,
     recalculate_dashboard_totals,
     replace_venue_assets,
     upsert_venue_assets,
 )
+from tradecraft.services.market_judgment import (
+    MarketJudgmentConfig,
+    MarketJudgmentEngine,
+)
 from tradecraft.services.runtime_bridge import (
     ResearchSnapshotReader,
     RuntimeSnapshotReader,
 )
+from tradecraft.services.runtime_maintenance import (
+    RuntimeStoragePolicy,
+    build_runtime_storage_report,
+    cleanup_runtime_storage,
+)
+from tradecraft.services.strategy_intelligence import (
+    StrategyIntelligenceConfig,
+    StrategyIntelligenceEngine,
+    StrategyInsightCollector,
+    classify_strategy_intent,
+)
+from tradecraft.services.symbol_fundamentals import (
+    SymbolFundamentalsConfig,
+    SymbolFundamentalsService,
+)
 from tradecraft.runtime.state_store import RuntimeStateStore
+from tradecraft.runtime.process_status import (
+    clear_current_runner_pid,
+    runner_process_status,
+    write_current_runner_pid,
+)
+from tradecraft.runtime.research_feed import read_active_research_feed
 from tradecraft.services.telegram import TelegramBridge, TelegramConfig
 from tradecraft.services.telegram_cli import TelegramCLI
 from tradecraft.services.upbit import UpbitAdapter, UpbitConfig
 
 settings = AppSettings()
+
+
+def _settings_symbols_from_csv(value: Any) -> list[str]:
+    return [
+        symbol
+        for symbol in dict.fromkeys(
+            item.strip()
+            for item in re.split(r"[\s,;]+", str(value or ""))
+            if item.strip()
+        )
+        if re.fullmatch(r"\d{6}", symbol)
+    ]
+
+
 telegram = TelegramBridge(
     TelegramConfig(
         bot_token=settings.telegram_bot_token,
@@ -119,36 +153,106 @@ research_reader = ResearchSnapshotReader(
 )
 kis_trader_store = RuntimeStateStore(settings.kis_trader_state_path)
 portfolio_coach_store = PortfolioCoachStore(settings.portfolio_coach_db_path)
-naver_report_repository = NaverReportRepository(settings.naver_reports_db_path)
-rag_store = (
-    RAGStore(
-        RAGStoreConfig(
-            persist_path=settings.rag_persist_path,
-            collection_name=settings.rag_collection_name,
-        )
+report_intelligence_stack = build_report_intelligence_stack(settings)
+naver_report_repository = report_intelligence_stack.repository
+naver_report_crawler = report_intelligence_stack.crawler
+rag_store = report_intelligence_stack.rag_store
+helper_llm_bridge = LLMBridge(
+    LLMBridgeConfig(
+        command=settings.llm_bridge_command,
+        args=settings.llm_bridge_args,
+        url=settings.llm_bridge_url,
+        token=settings.llm_bridge_token,
+        timeout_ms=settings.llm_bridge_timeout_ms,
+        model=settings.llm_model,
     )
-    if settings.rag_enabled
-    else None
 )
-naver_report_crawler = NaverSecuritiesCrawler(
-    config=NaverReportCrawlerConfig(
-        db_path=settings.naver_reports_db_path,
-        pdf_archive_dir=settings.naver_reports_pdf_archive_dir,
-        seed_url=settings.naver_reports_seed_url,
-        seed_urls=settings.naver_reports_seed_url_list,
-        max_pages=settings.naver_reports_max_pages,
-        since_date=settings.naver_reports_since_date,
-        request_delay_sec=settings.naver_reports_request_delay_sec,
-        min_pdf_text_chars=settings.naver_reports_min_pdf_text_chars,
-        llm_bridge_command=settings.llm_bridge_command,
-        llm_bridge_args=settings.llm_bridge_args,
-        llm_bridge_url=settings.llm_bridge_url,
-        llm_bridge_token=settings.llm_bridge_token,
-        llm_bridge_timeout_ms=settings.llm_bridge_timeout_ms,
-        llm_model=settings.llm_model,
+symbol_fundamentals_service = SymbolFundamentalsService(
+    SymbolFundamentalsConfig(
+        db_path=settings.valuation_db_path,
+        timeout_sec=settings.valuation_timeout_sec,
+        min_refresh_hours=settings.valuation_min_refresh_hours,
+        max_symbols_per_collect=settings.valuation_max_symbols_per_collect,
+    )
+)
+investment_memory_service = InvestmentMemoryService(
+    config=InvestmentMemoryConfig(
+        root_path=settings.investment_memory_root_path,
+        db_path=settings.investment_memory_db_path,
+        strategy_md_path=settings.research_strategy_md_path,
+        policy_mode=settings.investment_memory_policy_mode,
+        persona_tone=settings.investment_memory_persona_tone,
+        telegram_enabled=settings.investment_memory_send_telegram,
+        context_max_chars=settings.investment_memory_context_max_chars,
     ),
-    repository=naver_report_repository,
+    llm_bridge=helper_llm_bridge,
+    telegram=telegram,
 )
+strategy_intelligence = StrategyIntelligenceEngine(
+    repository=naver_report_repository,
+    rag_store=rag_store,
+    llm_bridge=helper_llm_bridge,
+    fundamentals_repository=symbol_fundamentals_service,
+    config=StrategyIntelligenceConfig(
+        insight_db_path=settings.strategy_insight_db_path,
+        model_timeout_ms=settings.llm_bridge_timeout_ms,
+    ),
+)
+market_judgment_engine = MarketJudgmentEngine(
+    config=MarketJudgmentConfig(
+        db_path=settings.market_judge_db_path,
+        state_path=settings.market_judge_state_path,
+        quote_interval_sec=settings.market_quote_interval_sec,
+        judge_interval_sec=settings.market_judge_interval_sec,
+        max_symbols=settings.market_judge_max_symbols,
+        llm_max_symbols=settings.market_judge_llm_max_symbols,
+        use_naver_fallback=settings.market_judge_use_naver_fallback,
+        query=settings.market_judge_query,
+    ),
+    kis=kis_primary,
+    llm_bridge=helper_llm_bridge,
+    strategy_engine=strategy_intelligence,
+    report_repository=naver_report_repository,
+    fundamentals_repository=symbol_fundamentals_service,
+    rag_store=rag_store,
+    research_feed_provider=lambda: _read_strategy_research_feed(),
+    watchlist=_settings_symbols_from_csv(settings.valuation_watchlist),
+)
+kis_block_trader = KISBlockTrader(
+    config=KISBlockTraderConfig(
+        db_path=settings.kis_block_trader_db_path,
+        state_path=settings.kis_block_trader_state_path,
+        enabled=settings.kis_block_trader_enabled,
+        execute_orders=settings.kis_block_trader_execute_orders,
+        rule_interval_sec=settings.kis_block_trader_rule_interval_sec,
+        manager_interval_sec=settings.kis_block_trader_manager_interval_sec,
+        aggressive_limit_bps=settings.kis_block_trader_aggressive_limit_bps,
+        pending_reconcile_timeout_sec=(
+            settings.kis_block_trader_pending_reconcile_timeout_sec
+        ),
+        max_manager_symbols=settings.kis_block_trader_max_manager_symbols,
+        use_naver_fallback=settings.market_judge_use_naver_fallback,
+        manager_query=settings.kis_block_trader_manager_query,
+    ),
+    kis=kis_primary,
+    llm_bridge=helper_llm_bridge,
+    strategy_engine=strategy_intelligence,
+    market_judgment_provider=market_judgment_engine,
+    research_feed_provider=lambda: _read_strategy_research_feed(),
+    memory_context_provider=investment_memory_service.context_pack,
+)
+
+
+def _build_strategy_insight_collector(
+    sources: list[dict[str, Any]] | None = None,
+) -> StrategyInsightCollector:
+    return StrategyInsightCollector(
+        engine=strategy_intelligence,
+        sources=settings.strategy_insight_source_list if sources is None else sources,
+        timeout_sec=settings.strategy_insight_request_timeout_sec,
+    )
+
+
 kis_llm_trader = KISLLMTrader(
     config=KISLLMTraderConfig(
         research_state_path=settings.research_state_path,
@@ -160,6 +264,7 @@ kis_llm_trader = KISLLMTrader(
         llm_bridge_token=settings.llm_bridge_token,
         llm_bridge_timeout_ms=settings.llm_bridge_timeout_ms,
         llm_model=settings.llm_model,
+        execute_orders=settings.kis_trader_execute_orders,
         persona=settings.kis_trader_persona,
         max_orders_per_cycle=settings.kis_trader_max_orders_per_cycle,
         max_budget_per_order_krw=settings.kis_trader_max_budget_per_order_krw,
@@ -173,78 +278,6 @@ kis_llm_trader = KISLLMTrader(
     report_repo=naver_report_repository,
     rag_store=rag_store,
 )
-freqtrade_bot_configs = [
-    FreqtradeBotConfig(
-        bot_id="spot",
-        label="Freqtrade Spot",
-        api_url=settings.freqtrade_spot_api_url,
-        username=settings.freqtrade_spot_username,
-        password=settings.freqtrade_spot_password,
-        config_path=settings.freqtrade_spot_config_path,
-        venue_id="binance",
-        venue_label="바이낸스 현물",
-        market_tag="FREQTRADE_SPOT",
-    ),
-    FreqtradeBotConfig(
-        bot_id="futures",
-        label="Freqtrade Futures",
-        api_url=settings.freqtrade_futures_api_url,
-        username=settings.freqtrade_futures_username,
-        password=settings.freqtrade_futures_password,
-        config_path=settings.freqtrade_futures_config_path,
-        venue_id="binance_futures",
-        venue_label="바이낸스 선물",
-        market_tag="FREQTRADE_FUTURES",
-    ),
-    FreqtradeBotConfig(
-        bot_id="e0v1e",
-        label="Freqtrade E0V1E",
-        config_path="third_party/freqtrade/user_data/config_jurobot_e0v1e.json",
-        venue_id="binance",
-        venue_label="바이낸스 현물",
-        market_tag="FREQTRADE_E0V1E",
-    ),
-    FreqtradeBotConfig(
-        bot_id="freqai_reforcexy",
-        label="FreqAI ReforceXY",
-        config_path="third_party/freqtrade/user_data/config_jurobot_freqai_reforcexy.json",
-        venue_id="binance",
-        venue_label="바이낸스 현물",
-        market_tag="FREQAI_REFORCEXY",
-    ),
-    FreqtradeBotConfig(
-        bot_id="freqai_reforcexy_futures",
-        label="FreqAI ReforceXY Futures",
-        config_path="third_party/freqtrade/user_data/config_jurobot_freqai_reforcexy_futures.json",
-        venue_id="binance_futures",
-        venue_label="바이낸스 선물",
-        market_tag="FREQAI_REFORCEXY_FUTURES",
-    ),
-    FreqtradeBotConfig(
-        bot_id="kis",
-        label="Freqtrade KIS",
-        config_path="third_party/freqtrade/user_data/config_kis_jurobot.json",
-        venue_id="kis",
-        venue_label="국장",
-        market_tag="FREQTRADE_KIS",
-    ),
-]
-freqtrade_bridge = FreqtradeBridge(
-    FreqtradeBridgeConfig(
-        timeout_sec=settings.freqtrade_timeout_sec,
-        bot_api_url_overrides=settings.freqtrade_bot_api_url_map,
-        bots=freqtrade_bot_configs,
-    )
-)
-freqtrade_process_manager = FreqtradeProcessManager(
-    FreqtradeProcessManagerConfig(
-        executable_path=settings.freqtrade_executable_path,
-        workdir=settings.freqtrade_workdir,
-        runtime_dir=settings.freqtrade_runtime_dir,
-        stop_timeout_sec=settings.freqtrade_stop_timeout_sec,
-    ),
-    bots=freqtrade_bot_configs,
-)
 fx_rates = FxRateService(
     FxRateConfig(
         upbit_base_url=settings.upbit_base_url,
@@ -255,6 +288,8 @@ fx_rates = FxRateService(
     )
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 RESEARCH_QUERY_LOG_PATH = Path(".runtime/research_query.log.jsonl")
 telegram_poller_task: asyncio.Task[None] | None = None
 telegram_update_offset: int | None = None
@@ -267,18 +302,19 @@ kis_secondary_cached_assets: list[dict[str, Any]] | None = None
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI):
     global telegram_poller_task
+    write_current_runner_pid("control")
     if telegram_poller_task is None and telegram.config.ready:
         await _prime_telegram_offset()
         telegram_poller_task = asyncio.create_task(_telegram_poll_worker())
     try:
         yield
     finally:
-        if telegram_poller_task is None:
-            return
-        telegram_poller_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await telegram_poller_task
-        telegram_poller_task = None
+        clear_current_runner_pid("control")
+        if telegram_poller_task is not None:
+            telegram_poller_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await telegram_poller_task
+            telegram_poller_task = None
 
 
 app = FastAPI(title="TradeCraft UI", version="0.1.0", lifespan=lifespan)
@@ -602,12 +638,27 @@ async def _build_dashboard_payload(include_telegram: bool = True) -> dict[str, A
     else:
         data["events"].append({"type": "kis", "message": "KIS 2번 키 미설정"})
 
-    runtime_sessions, runtime_status = runtime_reader.read_sessions()
-    runtime_sessions_applied = False
+    runtime_snapshot, runtime_status = runtime_reader.read_snapshot()
+    runtime_sessions = (
+        list(runtime_snapshot.get("sessions") or [])
+        if isinstance(runtime_snapshot, dict)
+        else None
+    )
     if runtime_sessions is not None:
         data["sessions"] = runtime_sessions
-        runtime_sessions_applied = True
-        data["events"].append({"type": "runtime", "message": "매매 런타임 모듈 연결됨"})
+        data["runtime"] = {
+            **dict(runtime_snapshot.get("runtime") or {}),
+            "updated_at": runtime_snapshot.get("updated_at"),
+            "status": runtime_status,
+            "age_sec": runtime_snapshot.get("age_sec"),
+            "max_age_sec": runtime_snapshot.get("max_age_sec"),
+        }
+        runtime_message = (
+            "매매 런타임 stale: 마지막 세션 상태 표시"
+            if runtime_status == "stale"
+            else "매매 런타임 모듈 연결됨"
+        )
+        data["events"].append({"type": "runtime", "message": runtime_message})
     else:
         if runtime_status == "missing":
             data["events"].append(
@@ -625,82 +676,94 @@ async def _build_dashboard_payload(include_telegram: bool = True) -> dict[str, A
                 {"type": "runtime", "message": "매매 런타임 상태 오류: mock 세션 사용"}
             )
 
-    research_payload, research_status = research_reader.read_feed()
-    if research_payload is not None:
-        data["research"] = research_payload
-        data["events"].append(
-            {"type": "research", "message": "최근 리서치 결과 반영됨"}
-        )
-    elif research_status == "missing":
+    if not settings.research_enabled:
         data["research"] = {
             "updated_at": None,
-            "source": "scheduled",
+            "source": "disabled",
             "query": "general",
-            "status": "missing",
+            "status": "disabled",
             "count": 0,
             "items": [],
+            "stale": False,
         }
         data["events"].append(
-            {"type": "research", "message": "리서치 스냅샷 미연결: no data"}
+            {
+                "type": "research",
+                "message": "요약리서치 비활성화: 전략 판단에서 제외",
+            }
         )
     else:
-        data["research"] = {
-            "updated_at": None,
-            "source": "scheduled",
-            "query": "general",
-            "status": research_status,
-            "count": 0,
-            "items": [],
-        }
-        data["events"].append(
-            {"type": "research", "message": f"리서치 상태 오류: {research_status}"}
-        )
-
-    try:
-        freqtrade_payload = await freqtrade_bridge.fetch_sessions(
-            usdt_krw_rate=usdt_krw
-        )
-    except Exception as exc:
-        logger.warning("freqtrade bridge fetch failed: %s", exc)
-        freqtrade_payload = {"bots": [], "sessions": []}
-
-    freqtrade_bots = list(freqtrade_payload.get("bots") or [])
-    freqtrade_sessions = [
-        row
-        for row in list(freqtrade_payload.get("sessions") or [])
-        if isinstance(row, dict)
-    ]
-    freqtrade_connected = any(
-        bool(bot.get("connected")) for bot in freqtrade_bots if isinstance(bot, dict)
-    )
-    if freqtrade_connected and not runtime_sessions_applied:
-        # When runtime snapshot is unavailable, prefer live freqtrade sessions over mock session cards.
-        data["sessions"] = []
-    if freqtrade_sessions:
-        data["sessions"] = [*list(data.get("sessions") or []), *freqtrade_sessions]
-
-    for bot in freqtrade_bots:
-        if not isinstance(bot, dict):
-            continue
-        label = str(bot.get("label") or bot.get("bot_id") or "freqtrade")
-        connected = bool(bot.get("connected"))
-        open_trades = int(bot.get("open_trades") or 0)
-        if connected:
+        research_payload, research_status = research_reader.read_feed(allow_stale=True)
+        if research_payload is not None:
+            data["research"] = research_payload
+            if research_status == "stale":
+                data["events"].append(
+                    {
+                        "type": "research",
+                        "message": "리서치 스냅샷 오래됨: 마지막 결과 표시",
+                    }
+                )
+            else:
+                data["events"].append(
+                    {"type": "research", "message": "최근 리서치 결과 반영됨"}
+                )
+        elif research_status == "missing":
+            data["research"] = {
+                "updated_at": None,
+                "source": "scheduled",
+                "query": "general",
+                "status": "missing",
+                "count": 0,
+                "items": [],
+            }
             data["events"].append(
-                {
-                    "type": "freqtrade",
-                    "message": f"{label} 연결됨: 오픈 포지션 {open_trades}건",
-                }
+                {"type": "research", "message": "리서치 스냅샷 미연결: no data"}
             )
-            continue
-        if bool(bot.get("configured")):
+        else:
+            data["research"] = {
+                "updated_at": None,
+                "source": "scheduled",
+                "query": "general",
+                "status": research_status,
+                "count": 0,
+                "items": [],
+            }
             data["events"].append(
-                {"type": "freqtrade", "message": f"{label} 연결 실패"}
+                {"type": "research", "message": f"리서치 상태 오류: {research_status}"}
             )
 
     if include_telegram:
         data["telegram"] = telegram.status()
     return data
+
+
+async def _build_investment_memory_context() -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        block_snapshot = await kis_block_trader.snapshot()
+        context["blocks"] = block_snapshot
+        context["account"] = block_snapshot.get("account") or {}
+        context["clock"] = (block_snapshot.get("summary") or {}).get("clock") or {}
+    except Exception as exc:
+        context["blocks"] = {"status": "error", "error_message": str(exc)}
+        context["account"] = {}
+    try:
+        context["market_judgment"] = market_judgment_engine.latest_judgment()
+        context["market_clock"] = market_judgment_engine.clock()
+    except Exception as exc:
+        context["market_judgment"] = {"status": "error", "error_message": str(exc)}
+    try:
+        research_feed = _read_strategy_research_feed()
+        context["research"] = research_feed if isinstance(research_feed, dict) else {}
+    except Exception as exc:
+        context["research"] = {"status": "error", "error_message": str(exc)}
+    try:
+        context["reports_status"] = naver_report_repository.status()
+    except Exception as exc:
+        context["reports_status"] = {"status": "error", "error_message": str(exc)}
+    return context
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -756,12 +819,96 @@ def _build_backtest_config(payload: dict[str, Any]) -> BacktestConfig:
 async def _process_telegram_text(text: str, chat_id: str) -> dict[str, Any]:
     if text:
         telegram.last_webhook_message = text
-    command, _ = telegram_cli.parse(text)
+    command, args = telegram_cli.parse(text)
     if not command:
         return {"handled": False, "sent": False}
 
     if command in {"start", "help"}:
         handled, reply = telegram_cli.execute(text)
+    elif command == "watchlist":
+        query = telegram_cli.strategy_query_text("strategy", args)
+        payload = await strategy_intelligence.build_brief(
+            query=query,
+            research_feed=_read_strategy_research_feed(),
+            use_llm=False,
+            limit=8,
+        )
+        handled, reply = True, telegram_cli.strategy_watchlist_text(payload)
+    elif command == "why":
+        symbol = str(args[0] if args else "").strip()
+        query = f"{symbol} 왜 후보인지 근거와 반론을 설명해줘" if symbol else telegram_cli.strategy_query_text("strategy", [])
+        payload = await strategy_intelligence.build_brief(
+            query=query,
+            research_feed=_read_strategy_research_feed(),
+            use_llm=True,
+            limit=8,
+        )
+        handled, reply = True, telegram_cli.strategy_why_text(payload, symbol)
+    elif command == "market":
+        payload = market_judgment_engine.latest_judgment()
+        handled, reply = True, telegram_cli.market_judgment_text(payload)
+    elif command == "judge":
+        if not settings.kis_primary_ready:
+            payload = {
+                "status": "kis_primary_not_configured",
+                "run": {
+                    "mode": "unavailable",
+                    "status": "kis_primary_not_configured",
+                },
+                "judgments": [],
+            }
+        else:
+            payload = await market_judgment_engine.run_once(use_llm=True)
+        handled, reply = True, telegram_cli.market_judgment_text(payload)
+    elif command == "why-now":
+        symbol = str(args[0] if args else "").strip()
+        payload = market_judgment_engine.latest_judgment()
+        handled, reply = True, telegram_cli.market_why_now_text(payload, symbol)
+    elif command == "memory":
+        payload = investment_memory_service.status()
+        handled, reply = True, telegram_cli.memory_status_text(payload)
+    elif command == "mindset":
+        today_payload = investment_memory_service.today()
+        journal = next(
+            (
+                row
+                for row in list(today_payload.get("journals") or [])
+                if str(row.get("slot") or "") == "pre_open"
+            ),
+            None,
+        )
+        if journal is None:
+            payload = await investment_memory_service.run_ritual(
+                slot="pre_open",
+                context=await _build_investment_memory_context(),
+                send_telegram=False,
+            )
+            journal = payload.get("journal") if isinstance(payload, dict) else None
+        handled, reply = True, telegram_cli.memory_journal_text(journal or {})
+    elif command == "reflect":
+        payload = await investment_memory_service.run_ritual(
+            slot="block_reflection",
+            context=await _build_investment_memory_context(),
+            send_telegram=False,
+            force=True,
+        )
+        handled, reply = True, telegram_cli.memory_journal_text(payload.get("journal") or {})
+    elif command == "journal":
+        payload = investment_memory_service.today()
+        handled, reply = True, telegram_cli.memory_today_text(payload)
+    elif command == "why-block":
+        block_id = str(args[0] if args else "").strip()
+        payload = investment_memory_service.block_memory(block_id)
+        handled, reply = True, telegram_cli.memory_block_text(payload)
+    elif command in {"ask", "strategy", "bot"}:
+        query = telegram_cli.strategy_query_text(command, args)
+        payload = await strategy_intelligence.build_brief(
+            query=query,
+            research_feed=_read_strategy_research_feed(),
+            use_llm=True,
+            limit=5,
+        )
+        handled, reply = True, telegram_cli.strategy_brief_text(payload)
     else:
         dashboard_data = await _build_dashboard_payload(include_telegram=False)
         handled, reply = telegram_cli.execute_with_dashboard(text, dashboard_data)
@@ -830,84 +977,30 @@ async def _telegram_poll_worker() -> None:
                 logger.info("telegram command handled by polling: %s", command)
 
 
-def _is_api_reachable(api_url: str) -> bool:
-    clean = api_url.strip().rstrip("/")
-    if not clean:
-        return False
-    parsed = urlparse(clean)
-    host = parsed.hostname
-    if not host:
-        return False
-    port = parsed.port
-    if port is None:
-        port = 443 if parsed.scheme == "https" else 80
-    try:
-        with socket.create_connection((host, int(port)), timeout=0.35):
-            return True
-    except OSError:
-        return False
-
-
-def _is_process_running(pattern: str) -> bool:
-    query = str(pattern or "").strip()
-    if not query:
-        return False
-    try:
-        proc = subprocess.run(
-            ["pgrep", "-f", query],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except Exception:
-        return False
-    if proc.returncode != 0:
-        return False
-    return bool(str(proc.stdout or "").strip())
-
-
-def _build_strategy_control_payload(
-    actions: list[dict[str, Any]] | None = None,
+def _runner_status_with_cover(
+    status: dict[str, Any],
+    *,
+    covered_by: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    statuses = freqtrade_process_manager.list_statuses()
-    resolved_api_urls: dict[str, str] = {}
-    for bot in freqtrade_bot_configs:
-        resolved = freqtrade_bridge._resolve_bot_config(bot)
-        resolved_api_urls[bot.bot_id] = resolved.api_url if resolved else ""
-
-    items: list[dict[str, Any]] = []
-    for row in statuses:
-        bot_id = str(row.get("bot_id") or "")
-        api_url = resolved_api_urls.get(bot_id, "")
-        enriched = dict(row)
-        enriched["api_url"] = api_url
-        enriched["api_reachable"] = _is_api_reachable(api_url)
-        items.append(enriched)
-
-    return {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "items": items,
-        "actions": list(actions or []),
-    }
+    payload = dict(status)
+    direct_alive = bool(payload.get("alive"))
+    payload["direct_alive"] = direct_alive
+    payload["effective_alive"] = direct_alive
+    if not direct_alive and covered_by and bool(covered_by.get("alive")):
+        payload["status"] = "covered"
+        payload["effective_alive"] = True
+        payload["covered_by"] = str(covered_by.get("key") or "")
+        payload["covered_by_label"] = str(covered_by.get("label") or "")
+    return payload
 
 
 async def _build_kis_rebalance_status_payload() -> dict[str, Any]:
     updated_at = datetime.now(timezone.utc).isoformat()
-    override_path = (
-        Path(settings.freqtrade_runtime_dir).expanduser().resolve()
-        / "kis.override.json"
-    )
+    trader_snapshot = kis_trader_store.read_snapshot() or {}
+    if not isinstance(trader_snapshot, dict):
+        trader_snapshot = {}
 
-    override_payload: dict[str, Any] = {}
-    if override_path.exists():
-        try:
-            loaded = json.loads(override_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                override_payload = loaded
-        except Exception:
-            override_payload = {}
-
-    target_weights_raw = override_payload.get("tradecraft_target_weights")
+    target_weights_raw = trader_snapshot.get("target_weights")
     target_weights: dict[str, float] = {}
     if isinstance(target_weights_raw, dict):
         for raw_ticker, raw_weight in target_weights_raw.items():
@@ -921,41 +1014,79 @@ async def _build_kis_rebalance_status_payload() -> dict[str, Any]:
             if weight > 0:
                 target_weights[ticker] = weight
 
+    target_symbols = [
+        str(code).strip()
+        for code in list(
+            trader_snapshot.get("target_symbols")
+            or trader_snapshot.get("target_codes")
+            or []
+        )
+        if re.fullmatch(r"\d{6}", str(code).strip())
+    ]
+    target_symbols = list(dict.fromkeys(target_symbols))
+
+    target_cash_weight = _safe_positive_float(trader_snapshot.get("target_cash_weight"))
+    target_cash_weight = max(0.0, min(1.0, target_cash_weight))
+
+    if not target_weights and target_symbols:
+        investable_ratio = max(1.0 - target_cash_weight, 0.0)
+        equal_weight = investable_ratio / float(len(target_symbols))
+        target_weights = {ticker: equal_weight for ticker in target_symbols}
+
     target_ticker_order = [
         ticker
         for ticker, _ in sorted(
             target_weights.items(), key=lambda item: item[1], reverse=True
         )
     ]
+    if not target_ticker_order and target_symbols:
+        target_ticker_order = target_symbols
 
-    target_cash_weight = float(
-        override_payload.get("tradecraft_target_cash_weight") or 0.0
+    target_invested_ratio = max(
+        0.0,
+        min(1.0, sum(float(weight) for weight in target_weights.values())),
     )
-    target_invested_ratio = max(0.0, min(1.0, 1.0 - target_cash_weight))
-    target_total_value_krw = float(
-        override_payload.get("tradecraft_portfolio_total_krw") or 0.0
+    if target_cash_weight > 0:
+        target_invested_ratio = max(0.0, min(1.0, 1.0 - target_cash_weight))
+    target_total_value_krw = _safe_positive_float(
+        trader_snapshot.get("portfolio_total_krw")
     )
     strategy_config: dict[str, Any] = {
-        "source": "freqtrade_show_config+override",
-        "bot_id": "kis",
-        "api_connected": False,
-        "show_config": {},
+        "source": "kis_direct+trader_state",
+        "bot_id": "kis_trader",
+        "api_connected": settings.kis_primary_ready,
+        "show_config": {
+            "bot_name": "KIS Direct Trader",
+            "state": "direct",
+            "runmode": (
+                "live"
+                if settings.kis_trader_enabled and settings.kis_trader_execute_orders
+                else "dry_run"
+                if settings.kis_trader_enabled
+                else "disabled"
+            ),
+            "strategy": "PortfolioCoach+ResearchTargets",
+            "strategy_version": "",
+            "timeframe": "daily/advice",
+            "trading_mode": "direct_kis",
+            "max_open_trades": int(settings.kis_trader_max_orders_per_cycle),
+            "stake_currency": "KRW",
+            "stake_amount": str(settings.kis_trader_max_budget_per_order_krw),
+            "available_capital": 0.0,
+            "force_entry_enable": False,
+            "position_adjustment_enable": False,
+            "max_entry_position_adjustment": 0,
+        },
         "override": {
             "target_weights_updated_at": str(
-                override_payload.get("tradecraft_target_weights_updated_at") or ""
+                trader_snapshot.get("target_weights_updated_at")
+                or trader_snapshot.get("target_symbols_updated_at")
+                or ""
             ),
-            "target_cash_weight": float(
-                override_payload.get("tradecraft_target_cash_weight") or 0.0
-            ),
-            "portfolio_total_krw": float(
-                override_payload.get("tradecraft_portfolio_total_krw") or 0.0
-            ),
-            "force_entry_enable": bool(override_payload.get("force_entry_enable")),
-            "pair_whitelist_count": len(
-                list(
-                    (override_payload.get("exchange") or {}).get("pair_whitelist") or []
-                )
-            ),
+            "target_cash_weight": target_cash_weight,
+            "portfolio_total_krw": target_total_value_krw,
+            "force_entry_enable": False,
+            "pair_whitelist_count": len(target_ticker_order),
         },
         "errors": [],
     }
@@ -966,177 +1097,62 @@ async def _build_kis_rebalance_status_payload() -> dict[str, Any]:
         "open_stake_total_krw": 0.0,
         "total_value_krw": target_total_value_krw,
         "actual_invested_ratio": 0.0,
+        "recent_order_count": len(list(trader_snapshot.get("orders") or [])),
         "errors": [],
     }
-    open_stake_by_ticker: dict[str, float] = {}
-    balance_qty_by_ticker: dict[str, float] = {}
     balance_value_by_ticker: dict[str, float] = {}
     krw_cash_balance = 0.0
 
-    kis_bot = next((row for row in freqtrade_bot_configs if row.bot_id == "kis"), None)
-    if kis_bot is not None:
-        resolved = freqtrade_bridge._resolve_bot_config(kis_bot)
-        if resolved is not None:
-            strategy_config["api_connected"] = True
-            auth = freqtrade_bridge._auth_tuple(resolved.username, resolved.password)
-            request_kwargs: dict[str, Any] = {"headers": {"Accept": "application/json"}}
-            if auth is not None:
-                request_kwargs["auth"] = auth
-            timeout = httpx.Timeout(3.5)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                try:
-                    show_config_res = await client.get(
-                        f"{resolved.api_url}/api/v1/show_config", **request_kwargs
-                    )
-                    show_config_res.raise_for_status()
-                    show_config_payload = show_config_res.json()
-                    if isinstance(show_config_payload, dict):
-                        strategy_config["show_config"] = {
-                            "bot_name": str(show_config_payload.get("bot_name") or ""),
-                            "state": str(show_config_payload.get("state") or ""),
-                            "runmode": str(show_config_payload.get("runmode") or ""),
-                            "strategy": str(show_config_payload.get("strategy") or ""),
-                            "strategy_version": str(
-                                show_config_payload.get("strategy_version") or ""
-                            ),
-                            "timeframe": str(
-                                show_config_payload.get("timeframe") or ""
-                            ),
-                            "trading_mode": str(
-                                show_config_payload.get("trading_mode") or ""
-                            ),
-                            "max_open_trades": int(
-                                show_config_payload.get("max_open_trades") or 0
-                            ),
-                            "stake_currency": str(
-                                show_config_payload.get("stake_currency") or ""
-                            ),
-                            "stake_amount": str(
-                                show_config_payload.get("stake_amount") or ""
-                            ),
-                            "available_capital": float(
-                                show_config_payload.get("available_capital") or 0.0
-                            ),
-                            "force_entry_enable": bool(
-                                show_config_payload.get("force_entry_enable")
-                            ),
-                            "position_adjustment_enable": bool(
-                                show_config_payload.get("position_adjustment_enable")
-                            ),
-                            "max_entry_position_adjustment": int(
-                                show_config_payload.get("max_entry_position_adjustment")
-                                or 0
-                            ),
-                        }
-                except Exception as exc:
-                    strategy_config["errors"].append(f"show_config: {exc}")
-
-                try:
-                    status_res = await client.get(
-                        f"{resolved.api_url}/api/v1/status", **request_kwargs
-                    )
-                    status_res.raise_for_status()
-                    status_rows = status_res.json()
-                    rows = [
-                        row for row in list(status_rows or []) if isinstance(row, dict)
-                    ]
-                    execution["open_trade_count"] = len(rows)
-                    execution["open_pairs"] = [
-                        str(row.get("pair") or "") for row in rows if row.get("pair")
-                    ]
-                    execution["open_stake_total_krw"] = sum(
-                        float(row.get("stake_amount") or 0.0)
-                        for row in rows
-                        if bool(row.get("is_open", True))
-                    )
-                    for row in rows:
-                        if not bool(row.get("is_open", True)):
-                            continue
-                        pair = str(row.get("pair") or "").strip()
-                        ticker = pair.split("/")[0].strip()
-                        if len(ticker) != 6 or not ticker.isdigit():
-                            continue
-                        stake = float(row.get("stake_amount") or 0.0)
-                        if stake <= 0:
-                            continue
-                        open_stake_by_ticker[ticker] = (
-                            float(open_stake_by_ticker.get(ticker) or 0.0) + stake
-                        )
-                except Exception as exc:
-                    execution["errors"].append(f"status: {exc}")
-                    strategy_config["errors"].append(f"status: {exc}")
-
-                try:
-                    balance_res = await client.get(
-                        f"{resolved.api_url}/api/v1/balance", **request_kwargs
-                    )
-                    balance_res.raise_for_status()
-                    balance_payload = balance_res.json()
-                    if isinstance(balance_payload, dict):
-                        total_value = float(
-                            balance_payload.get("total")
-                            or balance_payload.get("value")
-                            or 0.0
-                        )
-                        if total_value > 0:
-                            execution["total_value_krw"] = total_value
-                        currencies = balance_payload.get("currencies")
-                        if isinstance(currencies, list):
-                            for row in currencies:
-                                if not isinstance(row, dict):
-                                    continue
-                                currency = str(row.get("currency") or "").strip()
-                                if not currency:
-                                    continue
-                                if currency.upper() == "KRW":
-                                    krw_cash_balance = max(
-                                        krw_cash_balance,
-                                        _safe_positive_float(
-                                            row.get("balance") or row.get("free")
-                                        ),
-                                    )
-                                    continue
-                                if len(currency) != 6 or not currency.isdigit():
-                                    continue
-                                qty = max(
-                                    _safe_positive_float(row.get("balance")),
-                                    _safe_positive_float(row.get("free")),
-                                )
-                                if qty > 0:
-                                    balance_qty_by_ticker[currency] = (
-                                        float(
-                                            balance_qty_by_ticker.get(currency) or 0.0
-                                        )
-                                        + qty
-                                    )
-                                est_stake = _safe_positive_float(row.get("est_stake"))
-                                if est_stake > 0:
-                                    balance_value_by_ticker[currency] = max(
-                                        float(
-                                            balance_value_by_ticker.get(currency) or 0.0
-                                        ),
-                                        est_stake,
-                                    )
-                except Exception as exc:
-                    execution["errors"].append(f"balance: {exc}")
-                    strategy_config["errors"].append(f"balance: {exc}")
+    def _ingest_kis_assets(rows: list[dict[str, Any]]) -> None:
+        nonlocal krw_cash_balance
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            asset = str(row.get("asset") or "").strip()
+            value_krw = _safe_positive_float(row.get("value_krw"))
+            if str(row.get("kind") or "") == "cash" and asset.upper() == "KRW":
+                krw_cash_balance += value_krw
+                continue
+            if not re.fullmatch(r"\d{6}", asset) or value_krw <= 0:
+                continue
+            balance_value_by_ticker[asset] = (
+                balance_value_by_ticker.get(asset, 0.0) + value_krw
+            )
 
     if settings.kis_primary_ready:
-        for ticker, qty in balance_qty_by_ticker.items():
-            if _safe_positive_float(balance_value_by_ticker.get(ticker)) > 0:
-                continue
-            try:
-                quote = await kis_primary.fetch_domestic_quote(ticker)
-                price = _safe_positive_float((quote or {}).get("price"))
-            except Exception:
-                price = 0.0
-            if price <= 0:
-                continue
-            balance_value_by_ticker[ticker] = qty * price
+        try:
+            _ingest_kis_assets(await kis_primary.fetch_balance_assets())
+        except Exception as exc:
+            cached_rows = [
+                row
+                for row in list(kis_primary_cached_assets or [])
+                if isinstance(row, dict)
+            ]
+            if cached_rows:
+                _ingest_kis_assets(cached_rows)
+                strategy_config["errors"].append(f"kis_balance_cache_used: {exc}")
+            else:
+                execution["errors"].append(f"kis_balance: {exc}")
+                strategy_config["errors"].append(f"kis_balance: {exc}")
+    else:
+        execution["errors"].append("kis_primary_not_configured")
+        strategy_config["errors"].append("kis_primary_not_configured")
 
-    for ticker, stake in open_stake_by_ticker.items():
-        if stake > _safe_positive_float(balance_value_by_ticker.get(ticker)):
-            balance_value_by_ticker[ticker] = stake
+    if not balance_value_by_ticker and isinstance(
+        trader_snapshot.get("positions"), list
+    ):
+        for row in list(trader_snapshot.get("positions") or []):
+            if not isinstance(row, dict):
+                continue
+            ticker = str(row.get("ticker") or row.get("symbol") or "").strip()
+            if not re.fullmatch(r"\d{6}", ticker):
+                continue
+            value_krw = _safe_positive_float(row.get("value_krw"))
+            if value_krw <= 0:
+                continue
+            balance_value_by_ticker[ticker] = (
+                balance_value_by_ticker.get(ticker, 0.0) + value_krw
+            )
 
     holdings_total_krw = sum(
         _safe_positive_float(value) for value in balance_value_by_ticker.values()
@@ -1147,18 +1163,13 @@ async def _build_kis_rebalance_status_payload() -> dict[str, Any]:
         total_value_krw = computed_total_krw
         execution["total_value_krw"] = total_value_krw
 
-    open_stake_total_krw = float(execution.get("open_stake_total_krw") or 0.0)
     if total_value_krw > 0:
         execution["actual_invested_ratio"] = max(
             0.0, min(1.0, holdings_total_krw / total_value_krw)
         )
 
     all_tickers = list(
-        dict.fromkeys(
-            target_ticker_order
-            + list(balance_value_by_ticker.keys())
-            + list(open_stake_by_ticker.keys())
-        )
+        dict.fromkeys(target_ticker_order + list(balance_value_by_ticker.keys()))
     )
     symbol_name_map: dict[str, str] = {}
     if all_tickers:
@@ -1167,12 +1178,18 @@ async def _build_kis_rebalance_status_payload() -> dict[str, Any]:
         except Exception:
             symbol_name_map = {}
 
+    def _display_symbol_name(ticker: str) -> str:
+        cleaned = _clean_helper_text(symbol_name_map.get(ticker) or ticker, limit=40)
+        if not cleaned or "리포트 보기" in cleaned:
+            return ticker
+        return cleaned
+
     clamped_target_cash_weight = max(0.0, min(1.0, target_cash_weight))
 
     target_rows = [
         {
             "ticker": ticker,
-            "name": str(symbol_name_map.get(ticker) or ticker),
+            "name": _display_symbol_name(ticker),
             "weight": float(target_weights.get(ticker) or 0.0),
         }
         for ticker in target_ticker_order
@@ -1204,7 +1221,7 @@ async def _build_kis_rebalance_status_payload() -> dict[str, Any]:
         current_rows.append(
             {
                 "ticker": ticker,
-                "name": str(symbol_name_map.get(ticker) or ticker),
+                "name": _display_symbol_name(ticker),
                 "weight": current_weight,
             }
         )
@@ -1229,7 +1246,9 @@ async def _build_kis_rebalance_status_payload() -> dict[str, Any]:
         "updated_at": updated_at,
         "target": {
             "updated_at": str(
-                override_payload.get("tradecraft_target_weights_updated_at") or ""
+                trader_snapshot.get("target_weights_updated_at")
+                or trader_snapshot.get("target_symbols_updated_at")
+                or ""
             ),
             "target_cash_weight": target_cash_weight,
             "target_invested_ratio": target_invested_ratio,
@@ -1244,120 +1263,8 @@ async def _build_kis_rebalance_status_payload() -> dict[str, Any]:
     }
 
 
-async def _close_all_positions_before_stop(bot_id: str) -> dict[str, Any]:
-    bot = next((row for row in freqtrade_bot_configs if row.bot_id == bot_id), None)
-    if bot is None:
-        raise KeyError(f"unknown bot_id: {bot_id}")
-
-    resolved = freqtrade_bridge._resolve_bot_config(bot)
-    if resolved is None:
-        return {
-            "bot_id": bot_id,
-            "label": bot.label,
-            "action": "position_cleanup_skipped",
-            "reason": "freqtrade_api_not_configured",
-        }
-
-    auth = freqtrade_bridge._auth_tuple(resolved.username, resolved.password)
-    status_url = f"{resolved.api_url}/api/v1/status"
-    forceexit_url = f"{resolved.api_url}/api/v1/forceexit"
-    timeout = httpx.Timeout(3.5)
-    request_kwargs: dict[str, Any] = {"headers": {"Accept": "application/json"}}
-    if auth is not None:
-        request_kwargs["auth"] = auth
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            status_before = await client.get(status_url, **request_kwargs)
-            status_before.raise_for_status()
-            open_before = len(status_before.json() or [])
-        except Exception as exc:
-            return {
-                "bot_id": bot_id,
-                "label": bot.label,
-                "action": "position_cleanup_failed",
-                "reason": f"status_read_failed: {exc}",
-            }
-
-        if open_before <= 0:
-            return {
-                "bot_id": bot_id,
-                "label": bot.label,
-                "action": "positions_already_closed",
-                "closed_trades": 0,
-            }
-
-        try:
-            response = await client.post(
-                forceexit_url,
-                json={"tradeid": "all", "ordertype": "market"},
-                **request_kwargs,
-            )
-            response.raise_for_status()
-        except Exception:
-            response = await client.post(
-                forceexit_url,
-                json={"tradeid": "all"},
-                **request_kwargs,
-            )
-            response.raise_for_status()
-
-        for _ in range(20):
-            await asyncio.sleep(0.5)
-            status_after = await client.get(status_url, **request_kwargs)
-            status_after.raise_for_status()
-            open_after = len(status_after.json() or [])
-            if open_after <= 0:
-                return {
-                    "bot_id": bot_id,
-                    "label": bot.label,
-                    "action": "positions_closed",
-                    "closed_trades": open_before,
-                }
-
-        return {
-            "bot_id": bot_id,
-            "label": bot.label,
-            "action": "position_cleanup_failed",
-            "reason": "open_positions_remain_after_forceexit",
-        }
-
-
-async def _run_strategy_action(
-    action: str,
-    bot_id: str | None = None,
-) -> dict[str, Any]:
-    try:
-        if action == "start" and bot_id:
-            actions = [freqtrade_process_manager.start(bot_id)]
-        elif action == "stop" and bot_id:
-            cleanup = await _close_all_positions_before_stop(bot_id)
-            if cleanup.get("action") == "position_cleanup_failed":
-                raise HTTPException(status_code=400, detail=cleanup.get("reason"))
-            actions = [cleanup, freqtrade_process_manager.stop(bot_id)]
-        elif action == "start_all":
-            actions = freqtrade_process_manager.start_all()
-        elif action == "stop_all":
-            actions = []
-            for row in freqtrade_bot_configs:
-                cleanup = await _close_all_positions_before_stop(row.bot_id)
-                actions.append(cleanup)
-                if cleanup.get("action") == "position_cleanup_failed":
-                    continue
-                actions.append(freqtrade_process_manager.stop(row.bot_id))
-        else:
-            raise HTTPException(status_code=400, detail="invalid strategy action")
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return _build_strategy_control_payload(actions=actions)
-
-
 def _extract_symbol_hint(query: str) -> str:
     raw = str(query or "")
-    import re
 
     match = re.search(r"(?<!\d)(\d{6})(?!\d)", raw)
     return match.group(1) if match else ""
@@ -1379,50 +1286,303 @@ def _append_research_query_log(payload: dict[str, Any]) -> None:
         return
 
 
-@app.get("/api/research/ask")
-async def research_ask(
-    query: str,
-    symbol: str = "",
-    broker: str = "",
-    date_from: str = "",
-    date_to: str = "",
-    limit: int = 8,
-) -> dict[str, Any]:
-    text = str(query or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="query is required")
+def _clean_helper_text(value: Any, *, limit: int = 500) -> str:
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[: max(int(limit), 1)]
 
-    resolved_symbol = str(symbol or "").strip() or _extract_symbol_hint(text)
-    rows = naver_report_repository.search(
-        query=text,
-        symbol=resolved_symbol,
-        category="",
-        limit=max(min(int(limit), 20), 1) * 3,
+
+def _clean_report_title(row: dict[str, Any]) -> str:
+    title = _clean_helper_text(row.get("title"), limit=120)
+    if title and "리포트 보기" not in title:
+        return title
+    symbol = str(row.get("symbol") or "").strip()
+    category = str(row.get("category") or "report").strip() or "report"
+    return f"{symbol or 'Naver'} {category}"
+
+
+def _safe_helper_limit(value: Any) -> int:
+    try:
+        raw = int(value)
+    except (TypeError, ValueError):
+        raw = 8
+    return max(min(raw, 12), 1)
+
+
+def _safe_strategy_limit(value: Any) -> int:
+    try:
+        raw = int(value)
+    except (TypeError, ValueError):
+        raw = 8
+    return max(min(raw, 12), 3)
+
+
+def _default_strategy_query(query: Any = "") -> str:
+    text = str(query or "").strip()
+    return text or "다음 거래일 관심 후보를 전략적으로 정리해줘"
+
+
+def _read_strategy_research_feed() -> dict[str, Any] | None:
+    feed, _ = read_active_research_feed(settings)
+    return feed
+
+
+def _is_krx_symbol(value: Any) -> bool:
+    return bool(re.fullmatch(r"\d{6}", str(value or "").strip()))
+
+
+def _symbols_from_csv(value: Any) -> list[str]:
+    return [
+        symbol
+        for symbol in dict.fromkeys(
+            item.strip()
+            for item in re.split(r"[\s,;]+", str(value or ""))
+            if item.strip()
+        )
+        if _is_krx_symbol(symbol)
+    ]
+
+
+def _strategy_fundamental_targets(limit: int | None = None) -> list[str]:
+    max_items = max(int(limit or settings.valuation_max_symbols_per_collect), 1)
+    symbols: list[str] = []
+
+    symbols.extend(_symbols_from_csv(settings.valuation_watchlist))
+
+    feed = _read_strategy_research_feed()
+    if isinstance(feed, dict):
+        for row in list(feed.get("items") or [])[:30]:
+            if isinstance(row, dict):
+                symbols.extend(str(item or "").strip() for item in list(row.get("picks") or []))
+
+    try:
+        strategy_payload = strategy_intelligence.build_candidates(
+            query=_default_strategy_query(""),
+            research_feed=feed,
+            limit=12,
+        )
+    except Exception:
+        strategy_payload = {}
+    for row in list(strategy_payload.get("candidates") or []) + list(strategy_payload.get("exclusions") or []):
+        if isinstance(row, dict):
+            symbols.append(str(row.get("symbol") or "").strip())
+
+    try:
+        signal_payload = strategy_intelligence.list_external_signals(limit=300)
+    except Exception:
+        signal_payload = {}
+    for row in list(signal_payload.get("items") or []):
+        if isinstance(row, dict):
+            symbols.append(str(row.get("symbol") or "").strip())
+
+    try:
+        report_rows = naver_report_repository.search(
+            query="",
+            category="company_analysis",
+            limit=max_items,
+        )
+    except Exception:
+        report_rows = []
+    for row in report_rows:
+        symbols.append(str(row.get("symbol") or "").strip())
+
+    return [
+        symbol
+        for symbol in dict.fromkeys(symbols)
+        if _is_krx_symbol(symbol)
+    ][:max_items]
+
+
+def _helper_query_keywords(query: str) -> list[str]:
+    stopwords = {
+        "최근",
+        "리포트",
+        "보고서",
+        "긍정",
+        "부정",
+        "근거",
+        "리스크",
+        "위험",
+        "정리",
+        "알려줘",
+        "설명",
+        "요약",
+        "투자",
+        "전망",
+        "후보",
+    }
+    keywords: list[str] = []
+    for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", str(query or "")):
+        if token in stopwords or token.isdigit():
+            continue
+        if token not in keywords:
+            keywords.append(token)
+        if len(keywords) >= 5:
+            break
+    return keywords
+
+
+def _helper_report_sort_key(
+    row: dict[str, Any],
+    *,
+    query: str,
+    symbol: str,
+) -> tuple[int, int, int]:
+    category = str(row.get("category") or "")
+    category_score = {
+        "company_analysis": 0,
+        "industry_analysis": 6,
+        "invest_info": 10,
+        "market_info": 14,
+        "economy_analysis": 16,
+        "bond_analysis": 18,
+    }.get(category, 20)
+    row_symbol = str(row.get("symbol") or "").strip()
+    score = category_score
+    if symbol and row_symbol == symbol:
+        score -= 3
+    elif symbol:
+        score += 8
+    if symbol and category == "market_info":
+        score += 8
+
+    text = " ".join(
+        str(row.get(key) or "")
+        for key in ("title", "company_name", "snippet", "_sort_text", "broker")
+    )
+    compact_text = re.sub(r"\s+", "", text)
+    for keyword in _helper_query_keywords(query):
+        if keyword and keyword in text:
+            score -= 2
+        if symbol and f"{keyword}({symbol})" in compact_text:
+            score -= 25
+
+    published_digits = re.sub(r"\D", "", str(row.get("published_at") or ""))
+    published_rank = int(published_digits or "0")
+    report_id = int(row.get("report_id") or 0)
+    return (score, -published_rank, -report_id)
+
+
+def _helper_report_has_exact_symbol_match(
+    row: dict[str, Any],
+    *,
+    query: str,
+    symbol: str,
+) -> bool:
+    if not symbol:
+        return False
+    text = " ".join(
+        str(row.get(key) or "")
+        for key in ("title", "company_name", "snippet", "_sort_text")
+    )
+    compact_text = re.sub(r"\s+", "", text)
+    return any(
+        f"{keyword}({symbol})" in compact_text
+        for keyword in _helper_query_keywords(query)
     )
 
-    filtered: list[dict[str, Any]] = []
-    for row in rows:
-        if broker and str(row.get("broker") or "") != broker:
-            continue
-        published = str(row.get("published_at") or "")
-        if date_from and published and published < date_from:
-            continue
-        if date_to and published and published > date_to:
-            continue
-        filtered.append(row)
-        if len(filtered) >= max(min(int(limit), 20), 1):
-            break
 
+def _collect_helper_report_rows(
+    *,
+    query: str,
+    symbol: str,
+    broker: str,
+    date_from: str,
+    date_to: str,
+    limit: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    rows = naver_report_repository.search(
+        query=query,
+        symbol=symbol,
+        category="",
+        limit=limit * 3,
+    )
+
+    def apply_filters(candidate_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for row in candidate_rows:
+            if broker and str(row.get("broker") or "") != broker:
+                continue
+            published = str(row.get("published_at") or "")
+            if date_from and published and published < date_from:
+                continue
+            if date_to and published and published > date_to:
+                continue
+            out.append(row)
+        return out
+
+    filtered = apply_filters(rows)
+    for keyword in _helper_query_keywords(query):
+        if filtered:
+            break
+        rows = naver_report_repository.search(
+            query=keyword,
+            symbol=symbol,
+            category="",
+            limit=100,
+        )
+        filtered = apply_filters(rows)
+
+    if not filtered and symbol:
+        rows = naver_report_repository.search(
+            query="",
+            symbol=symbol,
+            category="",
+            limit=limit * 3,
+        )
+        filtered = apply_filters(rows)
+
+    if not filtered and not symbol:
+        for keyword in _helper_query_keywords(query) or [query]:
+            rows = naver_report_repository.search(
+                query=keyword,
+                symbol="",
+                category="",
+                limit=100,
+            )
+            filtered = apply_filters(rows)
+            if filtered:
+                break
+
+    enriched_rows: list[dict[str, Any]] = []
+    for row in filtered:
+        payload = dict(row)
+        report_id = int(payload.get("report_id") or 0)
+        if report_id > 0:
+            report = naver_report_repository.get_report(report_id)
+            if report:
+                payload["_sort_text"] = _clean_helper_text(
+                    report.get("content"), limit=2200
+                )
+        enriched_rows.append(payload)
+    filtered = enriched_rows
+
+    exact_rows = [
+        row
+        for row in filtered
+        if _helper_report_has_exact_symbol_match(row, query=query, symbol=symbol)
+    ]
+    if exact_rows:
+        filtered = exact_rows
+
+    filtered = sorted(
+        filtered,
+        key=lambda row: _helper_report_sort_key(row, query=query, symbol=symbol),
+    )[:limit]
     facts_rows: list[dict[str, Any]] = []
     citations: list[str] = []
     for row in filtered:
         report_id = int(row.get("report_id") or 0)
         facts = naver_report_repository.get_report_facts(report_id)
         facts_payload = dict(row)
+        facts_payload.pop("_sort_text", None)
+        facts_payload["title"] = _clean_report_title(facts_payload)
+        facts_payload["snippet"] = _clean_helper_text(
+            facts_payload.get("snippet"), limit=700
+        )
         if facts:
             facts_payload["facts"] = facts
-            evidence_quotes = list(facts.get("evidence_quotes") or [])
-            for quote in evidence_quotes[:2]:
+            for quote in list(facts.get("evidence_quotes") or [])[:2]:
                 page = str((quote or {}).get("page") or "?")
                 citations.append(
                     _format_citation(
@@ -1433,17 +1593,146 @@ async def research_ask(
                 )
         facts_rows.append(facts_payload)
 
-    summary_lines: list[str] = []
-    for row in facts_rows[:3]:
-        snippet = str(row.get("snippet") or "").strip()
-        if snippet:
-            summary_lines.append(f"- {snippet[:140]}")
+    return facts_rows, citations
 
+
+def _collect_helper_rag_rows(
+    *,
+    query: str,
+    symbol: str,
+    broker: str,
+    date_from: str,
+    date_to: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not settings.rag_enabled or rag_store is None:
+        return []
+    rows = rag_store.query(
+        query=query,
+        symbol=symbol,
+        broker=broker,
+        date_from=date_from,
+        date_to=date_to,
+        limit=min(limit, 8),
+    )
+    for keyword in _helper_query_keywords(query):
+        if rows:
+            break
+        rows = rag_store.query(
+            query=keyword,
+            symbol=symbol,
+            broker=broker,
+            date_from=date_from,
+            date_to=date_to,
+            limit=min(limit, 8),
+        )
+    if not rows and symbol:
+        for fallback_query in [*_helper_query_keywords(query), query]:
+            rows = rag_store.query(
+                query=fallback_query,
+                symbol="",
+                broker=broker,
+                date_from=date_from,
+                date_to=date_to,
+                limit=min(limit, 8),
+            )
+            if rows:
+                break
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row)
+        payload["title"] = _clean_report_title(payload)
+        payload["content"] = _clean_helper_text(payload.get("content"), limit=900)
+        if not payload["content"] or "편집상의 공백페이지" in payload["content"]:
+            continue
+        out.append(payload)
+    return out
+
+
+def _collect_helper_strategy_context(query: str, limit: int) -> dict[str, Any]:
+    try:
+        payload = strategy_intelligence.build_candidates(
+            query=_default_strategy_query(query),
+            research_feed=_read_strategy_research_feed(),
+            limit=_safe_strategy_limit(limit),
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc)[:240],
+            "candidates": [],
+            "source_status": [],
+        }
+
+    candidates: list[dict[str, Any]] = []
+    for row in list(payload.get("candidates") or [])[: max(min(int(limit), 8), 1)]:
+        if not isinstance(row, dict):
+            continue
+        candidates.append(
+            {
+                "symbol": str(row.get("symbol") or ""),
+                "name": str(row.get("name") or ""),
+                "score": int(row.get("score") or 0),
+                "confidence": int(row.get("confidence") or 0),
+                "confidence_label": str(row.get("confidence_label") or ""),
+                "stance": str(row.get("stance") or ""),
+                "reasons": list(row.get("reasons") or [])[:5],
+                "risks": list(row.get("risks") or [])[:4],
+                "checks": list(row.get("checks") or [])[:4],
+                "sources": list(row.get("sources") or [])[:6],
+                "citations": list(row.get("citations") or [])[:5],
+                "score_components": row.get("score_components") or {},
+            }
+        )
+
+    return {
+        "status": str(payload.get("status") or "ok"),
+        "query": str(payload.get("query") or query),
+        "candidates": candidates,
+        "source_status": strategy_intelligence.source_status(),
+    }
+
+
+def _build_helper_answer_fallback(
+    *,
+    query: str,
+    facts_rows: list[dict[str, Any]],
+    rag_rows: list[dict[str, Any]],
+    strategy_context: dict[str, Any] | None = None,
+) -> str:
+    summary_lines: list[str] = []
     evidence_lines: list[str] = []
     risk_lines: list[str] = []
+    strategy_lines: list[str] = []
     rating_counts: dict[str, int] = {}
     target_values: list[int] = []
+
+    for item in list((strategy_context or {}).get("candidates") or [])[:5]:
+        symbol = str(item.get("symbol") or "").strip()
+        name = str(item.get("name") or symbol or "후보").strip()
+        score = int(item.get("score") or 0)
+        stance = str(item.get("stance") or "watch")
+        reasons = [
+            _clean_helper_text(value, limit=90)
+            for value in list(item.get("reasons") or [])[:2]
+            if _clean_helper_text(value, limit=90)
+        ]
+        risks = [
+            _clean_helper_text(value, limit=70)
+            for value in list(item.get("risks") or [])[:1]
+            if _clean_helper_text(value, limit=70)
+        ]
+        reason_text = "; ".join(reasons) if reasons else "근거 추가 확인 필요"
+        risk_text = f" / 리스크: {risks[0]}" if risks else ""
+        strategy_lines.append(
+            f"- {name}({symbol}) score {score}, {stance}: {reason_text}{risk_text}"
+        )
+
     for row in facts_rows:
+        snippet = _clean_helper_text(row.get("snippet"), limit=180)
+        if snippet and len(summary_lines) < 3:
+            summary_lines.append(f"- {snippet}")
+
         facts = row.get("facts")
         if not isinstance(facts, dict):
             continue
@@ -1455,54 +1744,68 @@ async def research_ask(
             if value > 0:
                 target_values.append(value)
         for bullet in list(facts.get("summary_bullets") or [])[:1]:
-            quote_text = str(bullet or "").strip()
+            quote_text = _clean_helper_text(bullet, limit=160)
             if not quote_text:
                 continue
             evidence_quote = list(facts.get("evidence_quotes") or [])
             page = str((evidence_quote[0] if evidence_quote else {}).get("page") or "?")
             evidence_lines.append(
-                f"- {quote_text[:140]} {_format_citation(str(row.get('broker') or ''), str(row.get('published_at') or ''), page)}"
+                f"- {quote_text} "
+                f"{_format_citation(str(row.get('broker') or ''), str(row.get('published_at') or ''), page)}"
             )
         for risk in list(facts.get("risks") or [])[:2]:
-            risk_text = str(risk or "").strip()
+            risk_text = _clean_helper_text(risk, limit=160)
             if risk_text:
-                risk_lines.append(f"- {risk_text[:140]}")
+                risk_lines.append(f"- {risk_text}")
+
+    for row in rag_rows[:3]:
+        content = _clean_helper_text(row.get("content"), limit=160)
+        if content:
+            evidence_lines.append(
+                "- "
+                f"{content} "
+                f"{_format_citation(str(row.get('broker') or ''), str(row.get('published_at') or ''), str(row.get('page_start') or '?'))}"
+            )
+
+    if not summary_lines and strategy_lines:
+        summary_lines = [
+            "- 전략 후보 엔진의 교차 신호를 우선 요약합니다.",
+            "- 후보는 매수 지시가 아니라 다음 거래일 확인용 감시 리스트입니다.",
+            "- 시초가 갭, 거래대금, 섹터 수급, 리포트 리스크를 함께 확인해야 합니다.",
+        ]
+
+    while len(summary_lines) < 3:
+        summary_lines.append("- 리포트에 명시 근거 없음/추가 자료 필요")
 
     consensus_line = "- 리포트에 명시 근거 없음/추가 자료 필요"
     if rating_counts:
-        top_rating = sorted(rating_counts.items(), key=lambda x: x[1], reverse=True)[0][
+        top_rating = sorted(rating_counts.items(), key=lambda item: item[1], reverse=True)[
             0
-        ]
+        ][0]
+        consensus_line = f"- 투자의견 다수: {top_rating}"
         if target_values:
             avg_target = int(round(sum(target_values) / len(target_values)))
             consensus_line = (
                 f"- 투자의견 다수: {top_rating}, 목표주가 평균: {avg_target:,} KRW"
             )
-        else:
-            consensus_line = f"- 투자의견 다수: {top_rating}"
-
-    if not summary_lines:
-        summary_lines = [
-            "- 리포트에 명시 근거 없음/추가 자료 필요",
-            "- 리포트에 명시 근거 없음/추가 자료 필요",
-            "- 리포트에 명시 근거 없음/추가 자료 필요",
-        ]
-    else:
-        while len(summary_lines) < 3:
-            summary_lines.append("- 리포트에 명시 근거 없음/추가 자료 필요")
 
     if not evidence_lines:
-        evidence_lines = ["- 리포트에 명시 근거 없음/추가 자료 필요"]
+        evidence_lines = ["- 리포트/RAG에 명시 근거 없음"]
     if not risk_lines:
-        risk_lines = ["- 리포트에 명시 근거 없음/추가 자료 필요"]
+        risk_lines = ["- 명시 리스크 부족. 원문 리포트와 최신 공시/시황 교차 확인 필요"]
 
-    answer = "\n".join(
+    return "\n".join(
         [
+            f"질문: {query}",
+            "",
             "요약(3줄)",
             *summary_lines[:3],
             "",
+            "전략 후보/감시 리스트",
+            *(strategy_lines[:5] or ["- 전략 후보 엔진에 충분한 교차 신호 없음"]),
+            "",
             "핵심 근거(인용 포함)",
-            *evidence_lines[:5],
+            *evidence_lines[:6],
             "",
             "리포트 간 차이/컨센서스",
             consensus_line,
@@ -1511,40 +1814,437 @@ async def research_ask(
             *risk_lines[:5],
             "",
             "근거 부족 시 안내",
-            "- 리포트에 명시 근거 없음/추가 자료 필요",
+            "- 수집 리포트와 RAG 문단 기반 정보 제공이며 매매 추천이 아닙니다.",
         ]
     )
 
-    used_report_ids = [
-        int(row.get("report_id") or 0)
-        for row in facts_rows
-        if int(row.get("report_id") or 0) > 0
+
+def _parse_helper_llm_content(content: str) -> dict[str, Any] | None:
+    text = str(content or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {"answer_md": text}
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_helper_answer_contract(answer: str) -> str:
+    replacements = {
+        "요약": "요약(3줄)",
+        "핵심 근거": "핵심 근거(인용 포함)",
+        "컨센서스": "리포트 간 차이/컨센서스",
+        "리스크/반론": "리스크/반론 체크리스트",
+        "안내": "근거 부족 시 안내",
+    }
+    out: list[str] = []
+    for raw_line in str(answer or "").splitlines():
+        stripped = raw_line.strip()
+        out.append(replacements.get(stripped, raw_line))
+    return "\n".join(out).strip()
+
+
+async def _build_helper_llm_answer(
+    *,
+    query: str,
+    symbol: str,
+    facts_rows: list[dict[str, Any]],
+    rag_rows: list[dict[str, Any]],
+    strategy_context: dict[str, Any] | None,
+    fallback_answer: str,
+) -> dict[str, Any]:
+    strategy_refs = list((strategy_context or {}).get("candidates") or [])[:8]
+    if not helper_llm_bridge.ready or not (facts_rows or rag_rows or strategy_refs):
+        return {
+            "answer": fallback_answer,
+            "mode": "deterministic",
+            "followups": [],
+            "limitations": ["LLM bridge unavailable or evidence missing"],
+        }
+
+    report_refs = [
+        {
+            "report_id": int(row.get("report_id") or 0),
+            "title": _clean_report_title(row),
+            "broker": str(row.get("broker") or ""),
+            "published_at": str(row.get("published_at") or ""),
+            "symbol": str(row.get("symbol") or ""),
+            "snippet": _clean_helper_text(row.get("snippet"), limit=500),
+            "facts": row.get("facts") if isinstance(row.get("facts"), dict) else {},
+        }
+        for row in facts_rows[:8]
     ]
+    rag_refs = [
+        {
+            "report_id": int(row.get("report_id") or 0),
+            "chunk_index": int(row.get("chunk_index") or 0),
+            "title": _clean_report_title(row),
+            "broker": str(row.get("broker") or ""),
+            "published_at": str(row.get("published_at") or ""),
+            "symbol": str(row.get("symbol") or ""),
+            "page_start": int(row.get("page_start") or 0),
+            "content": _clean_helper_text(row.get("content"), limit=650),
+        }
+        for row in rag_rows[:8]
+    ]
+    prompt = {
+        "question": query,
+        "symbol_hint": symbol,
+        "report_facts": report_refs,
+        "rag_chunks": rag_refs,
+        "strategy_candidates": strategy_refs,
+        "strategy_source_status": list(
+            (strategy_context or {}).get("source_status") or []
+        )[:8],
+        "fallback_answer": fallback_answer,
+        "rules": [
+            "Use report_facts, rag_chunks, and strategy_candidates as evidence.",
+            "For open-ended candidate questions, provide a ranked watchlist, "
+            "entry validation conditions, and invalidation checks instead of only "
+            "saying evidence is weak.",
+            "Treat Whale Insight and after-close sources as 참고 신호, not standalone proof.",
+            "If evidence is weak, say so explicitly.",
+            "Do not give direct buy/sell/order instructions.",
+            "Use these section headings when applicable: 요약(3줄), 전략 후보/감시 리스트, "
+            "핵심 근거(인용 포함), 리포트 간 차이/컨센서스, 리스크/반론 체크리스트, 근거 부족 시 안내.",
+            "Write in Korean.",
+        ],
+        "output_schema": {
+            "answer_md": "string",
+            "confidence": "low|medium|high",
+            "followups": ["string"],
+            "limitations": ["string"],
+        },
+    }
+    payload = {
+        "model": helper_llm_bridge.resolved_model,
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Return only one JSON object. You are an evidence-bound "
+                    "investment research assistant. This is information only, not "
+                    "trading advice."
+                ),
+            },
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+    }
+    timeout_ms = min(max(int(settings.llm_bridge_timeout_ms), 1000), 120000)
+    result = await helper_llm_bridge.complete(payload, timeout_ms=timeout_ms)
+    if not bool(result.get("ok")):
+        return {
+            "answer": fallback_answer,
+            "mode": "deterministic",
+            "followups": [],
+            "limitations": [str(result.get("error") or "llm_bridge_failed")[:240]],
+        }
+
+    parsed = _parse_helper_llm_content(str(result.get("content") or ""))
+    if not parsed:
+        return {
+            "answer": fallback_answer,
+            "mode": "deterministic",
+            "followups": [],
+            "limitations": ["LLM response was empty"],
+        }
+    answer = str(parsed.get("answer_md") or parsed.get("answer") or "").strip()
+    if not answer:
+        answer = fallback_answer
+    answer = _normalize_helper_answer_contract(answer)
+    return {
+        "answer": answer,
+        "mode": "llm",
+        "confidence": str(parsed.get("confidence") or "medium"),
+        "followups": [
+            str(item).strip()
+            for item in list(parsed.get("followups") or [])
+            if str(item).strip()
+        ][:5],
+        "limitations": [
+            str(item).strip()
+            for item in list(parsed.get("limitations") or [])
+            if str(item).strip()
+        ][:5],
+        "usage": result.get("usage"),
+    }
+
+
+@app.post("/api/helper/ask")
+async def helper_ask(payload: dict[str, Any]) -> dict[str, Any]:
+    query = str(payload.get("query") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    query = query[:600]
+    limit = _safe_helper_limit(payload.get("limit"))
+    symbol = str(payload.get("symbol") or "").strip() or _extract_symbol_hint(query)
+    broker = str(payload.get("broker") or "").strip()
+    date_from = str(payload.get("date_from") or "").strip()
+    date_to = str(payload.get("date_to") or "").strip()
+
+    facts_rows, citations = _collect_helper_report_rows(
+        query=query,
+        symbol=symbol,
+        broker=broker,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+    rag_rows = _collect_helper_rag_rows(
+        query=query,
+        symbol=symbol,
+        broker=broker,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+    for row in rag_rows[:8]:
+        citations.append(
+            _format_citation(
+                str(row.get("broker") or ""),
+                str(row.get("published_at") or ""),
+                str(row.get("page_start") or "?"),
+            )
+        )
+
+    strategy_context = _collect_helper_strategy_context(query, limit)
+    for row in list(strategy_context.get("candidates") or [])[:5]:
+        for citation in list(row.get("citations") or [])[:2]:
+            citations.append(str(citation))
+
+    fallback_answer = _build_helper_answer_fallback(
+        query=query,
+        facts_rows=facts_rows,
+        rag_rows=rag_rows,
+        strategy_context=strategy_context,
+    )
+    answer_payload = await _build_helper_llm_answer(
+        query=query,
+        symbol=symbol,
+        facts_rows=facts_rows,
+        rag_rows=rag_rows,
+        strategy_context=strategy_context,
+        fallback_answer=fallback_answer,
+    )
+
+    used_report_ids = sorted(
+        {
+            int(row.get("report_id") or 0)
+            for row in [*facts_rows, *rag_rows]
+            if int(row.get("report_id") or 0) > 0
+        }
+    )
     _append_research_query_log(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
-            "query": text,
-            "symbol": resolved_symbol,
+            "source": "helper_ask",
+            "query": query,
+            "symbol": symbol,
             "filters": {
                 "broker": broker,
                 "date_from": date_from,
                 "date_to": date_to,
             },
-            "top_k": max(min(int(limit), 20), 1),
+            "top_k": limit,
+            "answer_mode": answer_payload.get("mode"),
             "used_report_ids": used_report_ids,
-            "citations": citations[:20],
+            "citations": citations[:24],
+            "strategy_candidate_count": len(strategy_context.get("candidates") or []),
         }
     )
 
     return {
         "status": "ok",
-        "query": text,
-        "symbol": resolved_symbol,
+        "query": query,
+        "intent": classify_strategy_intent(query),
+        "symbol": symbol,
+        "model": helper_llm_bridge.resolved_model,
+        "mode": answer_payload.get("mode"),
+        "confidence": answer_payload.get("confidence", "medium"),
+        "answer": answer_payload.get("answer") or fallback_answer,
+        "citations": citations[:24],
+        "followups": answer_payload.get("followups") or [],
+        "limitations": answer_payload.get("limitations") or [],
         "count": len(facts_rows),
-        "answer": answer,
-        "citations": citations[:20],
+        "rag_count": len(rag_rows),
+        "strategy": strategy_context,
         "items": facts_rows,
+        "rag_items": rag_rows,
     }
+
+
+@app.post("/api/strategy/intent")
+async def strategy_intent(payload: dict[str, Any]) -> dict[str, Any]:
+    query = _default_strategy_query(payload.get("query"))
+    return {
+        "status": "ok",
+        "query": query,
+        "intent": classify_strategy_intent(query),
+    }
+
+
+@app.get("/api/strategy/insights")
+async def strategy_insights() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "sources": strategy_intelligence.source_status(),
+        "schema": {
+            "symbol": "005930",
+            "name": "삼성전자",
+            "signal_type": "large_holder_change | after_close_flow",
+            "direction": "positive | negative | neutral",
+            "strength": 0,
+            "summary": "근거 요약",
+            "as_of": "ISO-8601 timestamp",
+            "tags": ["optional"],
+        },
+    }
+
+
+@app.get("/api/strategy/insights/signals")
+async def strategy_insight_signals(
+    source_id: str = "",
+    symbol: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    limit: int = 200,
+) -> dict[str, Any]:
+    return strategy_intelligence.list_external_signals(
+        source_id=source_id,
+        symbol=symbol,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+
+
+@app.post("/api/strategy/insights/collect")
+async def strategy_insights_collect(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    sources_payload = payload.get("sources") if isinstance(payload, dict) else None
+    sources = sources_payload if isinstance(sources_payload, list) else None
+    try:
+        return await _build_strategy_insight_collector(sources).collect_once()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/strategy/insights/{source_id}")
+async def strategy_insight_append(
+    source_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return strategy_intelligence.append_external_signals(
+            source_id=source_id,
+            payload=payload,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/symbols/fundamentals/collect")
+async def symbol_fundamentals_collect(
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    body = payload or {}
+    raw_symbols = body.get("symbols") if isinstance(body, dict) else None
+    if isinstance(raw_symbols, list):
+        symbols = [str(item or "").strip() for item in raw_symbols]
+        target_source = "explicit"
+    elif isinstance(raw_symbols, str) and raw_symbols.strip():
+        symbols = _symbols_from_csv(raw_symbols)
+        target_source = "explicit"
+    else:
+        symbols = _strategy_fundamental_targets()
+        target_source = "strategy_targets"
+    force = bool(body.get("force")) if isinstance(body, dict) else False
+    result = await symbol_fundamentals_service.collect_symbols(symbols, force=force)
+    result["target_source"] = target_source
+    result["target_symbols"] = symbols[: settings.valuation_max_symbols_per_collect]
+    return result
+
+
+@app.get("/api/symbols/{symbol}/fundamentals")
+async def symbol_fundamentals(symbol: str) -> dict[str, Any]:
+    code = str(symbol or "").strip()
+    if not _is_krx_symbol(code):
+        raise HTTPException(status_code=400, detail="symbol must be a 6-digit KRX code")
+    latest = symbol_fundamentals_service.latest(code)
+    if latest is None:
+        return {"status": "missing", "symbol": code}
+    return latest
+
+
+@app.get("/api/strategy/candidates")
+async def strategy_candidates(
+    query: str = "",
+    limit: int = 8,
+) -> dict[str, Any]:
+    return strategy_intelligence.build_candidates(
+        query=_default_strategy_query(query),
+        research_feed=_read_strategy_research_feed(),
+        limit=_safe_strategy_limit(limit),
+    )
+
+
+@app.post("/api/strategy/candidates")
+async def strategy_candidates_post(payload: dict[str, Any]) -> dict[str, Any]:
+    return strategy_intelligence.build_candidates(
+        query=_default_strategy_query(payload.get("query")),
+        research_feed=_read_strategy_research_feed(),
+        limit=_safe_strategy_limit(payload.get("limit")),
+    )
+
+
+@app.get("/api/strategy/brief")
+async def strategy_brief(
+    query: str = "",
+    limit: int = 8,
+    use_llm: bool = False,
+) -> dict[str, Any]:
+    return await strategy_intelligence.build_brief(
+        query=_default_strategy_query(query),
+        research_feed=_read_strategy_research_feed(),
+        use_llm=bool(use_llm),
+        limit=_safe_strategy_limit(limit),
+    )
+
+
+@app.post("/api/strategy/brief")
+async def strategy_brief_post(payload: dict[str, Any]) -> dict[str, Any]:
+    return await strategy_intelligence.build_brief(
+        query=_default_strategy_query(payload.get("query")),
+        research_feed=_read_strategy_research_feed(),
+        use_llm=bool(payload.get("use_llm")),
+        limit=_safe_strategy_limit(payload.get("limit")),
+    )
+
+
+@app.get("/api/research/ask")
+async def research_ask(
+    query: str,
+    symbol: str = "",
+    broker: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    limit: int = 8,
+) -> dict[str, Any]:
+    result = await helper_ask(
+        {
+            "query": query,
+            "symbol": symbol,
+            "broker": broker,
+            "date_from": date_from,
+            "date_to": date_to,
+            "limit": limit,
+        }
+    )
+    result["source"] = "research_ask"
+    return result
 
 
 @app.get("/")
@@ -1554,19 +2254,57 @@ async def index() -> FileResponse:
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    _, runtime_status = runtime_reader.read_sessions()
-    _, research_status = research_reader.read_feed()
-    runtime_runner_alive = _is_process_running(
-        r"tradecraft-runtime|tradecraft\.runtime\.runner|runtime/runner\.py"
+    runtime_snapshot, runtime_status = runtime_reader.read_snapshot()
+    _, research_status = read_active_research_feed(settings)
+    control_process = _runner_status_with_cover(
+        runner_process_status("control")
     )
-    research_runner_alive = _is_process_running(
-        r"tradecraft-research|tradecraft\.runtime\.research_runner|research_runner\.py"
+    runtime_process = _runner_status_with_cover(
+        runner_process_status("runtime")
     )
-    kis_trader_runner_alive = _is_process_running(
-        r"tradecraft-kis-trader|tradecraft\.runtime\.kis_trader_runner|kis_trader_runner\.py"
+    intelligence_process = _runner_status_with_cover(
+        runner_process_status("intelligence")
     )
-    naver_reports_runner_alive = _is_process_running(
-        r"tradecraft-naver-reports|tradecraft\.runtime\.naver_reports_runner|naver_reports_runner\.py"
+    research_process = _runner_status_with_cover(
+        runner_process_status("research"),
+        covered_by=intelligence_process,
+    )
+    kis_trader_process = _runner_status_with_cover(
+        runner_process_status("kis_trader")
+    )
+    kis_block_trader_process = _runner_status_with_cover(
+        runner_process_status("kis_block_trader")
+    )
+    investment_memory_process = _runner_status_with_cover(
+        runner_process_status("investment_memory")
+    )
+    naver_reports_process = _runner_status_with_cover(
+        runner_process_status("naver_reports"),
+        covered_by=intelligence_process,
+    )
+    strategy_insight_process = _runner_status_with_cover(
+        runner_process_status("strategy_insights")
+    )
+    market_judge_process = _runner_status_with_cover(
+        runner_process_status("market_judge")
+    )
+    runner_processes = {
+        "control": control_process,
+        "runtime": runtime_process,
+        "intelligence": intelligence_process,
+        "research": research_process,
+        "kis_trader": kis_trader_process,
+        "kis_block_trader": kis_block_trader_process,
+        "investment_memory": investment_memory_process,
+        "naver_reports": naver_reports_process,
+        "strategy_insights": strategy_insight_process,
+        "market_judge": market_judge_process,
+    }
+    kis_readiness = _build_kis_trader_readiness(process=kis_trader_process)
+    runtime_meta = (
+        dict(runtime_snapshot.get("runtime") or {})
+        if isinstance(runtime_snapshot, dict)
+        else {}
     )
     return {
         "status": "ok",
@@ -1579,22 +2317,147 @@ async def health() -> dict[str, Any]:
         "kis_secondary_ready": settings.kis_secondary_ready,
         "runtime_connected": runtime_status == "ok",
         "runtime_status": runtime_status,
+        "runtime_role": runtime_meta.get("role") or "",
+        "runtime_execution_mode": runtime_meta.get("execution_mode") or "",
+        "runtime_executes_orders": bool(runtime_meta.get("executes_orders")),
         "research_connected": research_status == "ok",
+        "research_enabled": settings.research_enabled,
         "research_status": research_status,
-        "runtime_runner_alive": runtime_runner_alive,
-        "research_runner_alive": research_runner_alive,
-        "kis_trader_runner_alive": kis_trader_runner_alive,
-        "naver_reports_runner_alive": naver_reports_runner_alive,
+        "runtime_runner_alive": bool(runtime_process.get("direct_alive")),
+        "intelligence_runner_alive": bool(intelligence_process.get("direct_alive")),
+        "research_runner_alive": bool(research_process.get("direct_alive")),
+        "research_service_alive": bool(research_process.get("effective_alive")),
+        "kis_trader_runner_alive": bool(kis_trader_process.get("direct_alive")),
+        "kis_block_trader_runner_alive": bool(
+            kis_block_trader_process.get("direct_alive")
+        ),
+        "investment_memory_runner_alive": bool(
+            investment_memory_process.get("direct_alive")
+        ),
+        "naver_reports_runner_alive": bool(naver_reports_process.get("direct_alive")),
+        "naver_reports_service_alive": bool(
+            naver_reports_process.get("effective_alive")
+        ),
+        "strategy_insight_runner_alive": bool(
+            strategy_insight_process.get("direct_alive")
+        ),
+        "market_judge_runner_alive": bool(
+            market_judge_process.get("direct_alive")
+        ),
+        "runner_processes": runner_processes,
         "kis_trader_enabled": settings.kis_trader_enabled,
+        "kis_trader_execution_mode": kis_readiness["execution_mode"],
+        "kis_trader_ready_to_plan": kis_readiness["ready_to_plan"],
+        "kis_trader_ready_to_execute": kis_readiness["ready_to_execute"],
+        "kis_trader_blockers": kis_readiness["blockers"],
+        "kis_trader_warnings": kis_readiness["warnings"],
+        "kis_trader_readiness": kis_readiness,
+        "kis_block_trader_enabled": settings.kis_block_trader_enabled,
+        "kis_block_trader_execution_mode": (
+            "live" if settings.kis_block_trader_execute_orders else "paper"
+        ),
+        "kis_block_trader": kis_block_trader.status(),
+        "investment_memory_enabled": settings.investment_memory_enabled,
+        "investment_memory": investment_memory_service.status(),
         "naver_reports_enabled": settings.naver_reports_enabled,
+        "naver_reports_llm_facts_enabled": settings.naver_reports_llm_facts_enabled,
+        "naver_reports_llm_facts_active": settings.naver_reports_llm_facts_active,
         "llm_bridge_mode": settings.llm_bridge_mode,
         "llm_bridge_ready": settings.llm_bridge_ready,
+        "market_judge_enabled": settings.market_judge_enabled,
+        "market_judge": market_judgment_engine.status(),
     }
 
 
 @app.get("/api/dashboard")
 async def dashboard() -> dict[str, Any]:
     return await _build_dashboard_payload(include_telegram=True)
+
+
+@app.get("/api/market/clock")
+async def market_clock() -> dict[str, Any]:
+    return market_judgment_engine.clock()
+
+
+@app.get("/api/market/quotes")
+async def market_quotes(limit: int = 100) -> dict[str, Any]:
+    return market_judgment_engine.latest_quotes(limit=max(min(int(limit), 300), 1))
+
+
+@app.get("/api/market/account")
+async def market_account() -> dict[str, Any]:
+    return market_judgment_engine.latest_account()
+
+
+@app.get("/api/market/judgments/latest")
+async def market_judgment_latest() -> dict[str, Any]:
+    return market_judgment_engine.latest_judgment()
+
+
+@app.post("/api/market/judgments/run-once")
+async def market_judgment_run_once(use_llm: bool = True) -> dict[str, Any]:
+    if not settings.kis_primary_ready:
+        raise HTTPException(
+            status_code=400,
+            detail="kis primary account not configured",
+        )
+    return await market_judgment_engine.run_once(use_llm=bool(use_llm))
+
+
+@app.get("/api/memory/status")
+async def investment_memory_status() -> dict[str, Any]:
+    return investment_memory_service.status()
+
+
+@app.get("/api/memory/today")
+async def investment_memory_today() -> dict[str, Any]:
+    return investment_memory_service.today()
+
+
+@app.get("/api/memory/symbols/{symbol}")
+async def investment_memory_symbol(symbol: str) -> dict[str, Any]:
+    result = investment_memory_service.symbol_memory(symbol)
+    if result.get("status") == "invalid_symbol":
+        raise HTTPException(status_code=400, detail="invalid symbol")
+    return result
+
+
+@app.get("/api/memory/blocks/{block_id}")
+async def investment_memory_block(block_id: str) -> dict[str, Any]:
+    result = investment_memory_service.block_memory(block_id)
+    if result.get("status") == "invalid_block_id":
+        raise HTTPException(status_code=400, detail="invalid block id")
+    return result
+
+
+@app.post("/api/memory/init")
+async def investment_memory_init(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return investment_memory_service.initialize(force=bool((payload or {}).get("force")))
+
+
+@app.post("/api/memory/rituals/run-once")
+async def investment_memory_ritual_run_once(
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    body = payload or {}
+    slot = str(body.get("slot") or "pre_open")
+    return await investment_memory_service.run_ritual(
+        slot=slot,
+        context=await _build_investment_memory_context(),
+        send_telegram=bool(body.get("send_telegram", False)),
+        force=bool(body.get("force", True)),
+    )
+
+
+@app.post("/api/memory/update/run-once")
+async def investment_memory_update_run_once(
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    body = payload or {}
+    return await investment_memory_service.run_update(
+        context=await _build_investment_memory_context(),
+        force=bool(body.get("force", True)),
+    )
 
 
 @app.get("/api/telegram/status")
@@ -1611,70 +2474,114 @@ async def telegram_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, **result}
 
 
-@app.get("/api/freqtrade/strategies")
-async def freqtrade_strategy_status() -> dict[str, Any]:
-    return _build_strategy_control_payload()
-
-
-@app.post("/api/freqtrade/strategies/start-all")
-async def freqtrade_strategy_start_all() -> dict[str, Any]:
-    return await _run_strategy_action(action="start_all")
-
-
-@app.post("/api/freqtrade/strategies/stop-all")
-async def freqtrade_strategy_stop_all() -> dict[str, Any]:
-    return await _run_strategy_action(action="stop_all")
-
-
-@app.post("/api/freqtrade/strategies/{bot_id}/start")
-async def freqtrade_strategy_start(bot_id: str) -> dict[str, Any]:
-    return await _run_strategy_action(action="start", bot_id=bot_id)
-
-
-@app.post("/api/freqtrade/strategies/{bot_id}/stop")
-async def freqtrade_strategy_stop(bot_id: str) -> dict[str, Any]:
-    return await _run_strategy_action(action="stop", bot_id=bot_id)
-
-
-@app.post("/api/freqtrade/strategies/{bot_id}/usdt-limit")
-async def freqtrade_strategy_set_usdt_limit(
-    bot_id: str,
-    payload: dict[str, Any],
+def _build_kis_trader_readiness(
+    *,
+    process: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    usdt_raw = payload.get("usdt_limit")
-    if usdt_raw is None:
-        raise HTTPException(status_code=400, detail="usdt_limit is required")
-    try:
-        usdt_limit = float(usdt_raw)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="invalid usdt_limit") from exc
+    _, research_status = research_reader.read_feed(allow_stale=True)
+    llm_ready = bool(
+        settings.llm_bridge_ready or settings.kis_trader_llm_command.strip()
+    )
+    execution_enabled = bool(settings.kis_trader_execute_orders)
+    process_payload = (
+        dict(process)
+        if process is not None
+        else _runner_status_with_cover(runner_process_status("kis_trader"))
+    )
 
-    try:
-        action = freqtrade_process_manager.set_usdt_limit(bot_id, usdt_limit)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if not settings.kis_trader_enabled:
+        blockers.append("kis_trader_disabled")
+    if not settings.kis_primary_ready:
+        blockers.append("kis_primary_not_configured")
+    if research_status != "ok":
+        blockers.append(f"research_{research_status}")
+    if not execution_enabled:
+        warnings.append("dry_run_mode")
+    if not llm_ready:
+        warnings.append("llm_unavailable_fallback_only")
+    if not bool(process_payload.get("direct_alive")):
+        warnings.append("runner_not_running")
 
-    return _build_strategy_control_payload(actions=[action])
+    ready_to_plan = (
+        bool(settings.kis_trader_enabled)
+        and bool(settings.kis_primary_ready)
+        and research_status == "ok"
+    )
+    ready_to_execute = (
+        ready_to_plan
+        and execution_enabled
+        and bool(process_payload.get("direct_alive"))
+    )
+    return {
+        "enabled": settings.kis_trader_enabled,
+        "primary_ready": settings.kis_primary_ready,
+        "research_status": research_status,
+        "llm_ready": llm_ready,
+        "execution_enabled": execution_enabled,
+        "execution_mode": "live" if execution_enabled else "dry_run",
+        "runner": process_payload,
+        "ready_to_plan": ready_to_plan,
+        "ready_to_execute": ready_to_execute,
+        "blockers": blockers,
+        "warnings": warnings,
+        "limits": {
+            "interval_sec": int(settings.kis_trader_interval_sec),
+            "max_orders_per_cycle": int(settings.kis_trader_max_orders_per_cycle),
+            "max_budget_per_order_krw": float(
+                settings.kis_trader_max_budget_per_order_krw
+            ),
+            "min_confidence": float(settings.kis_trader_min_confidence),
+            "allow_sell": bool(settings.kis_trader_allow_sell),
+            "report_context_top_k": int(settings.kis_trader_report_context_top_k),
+        },
+    }
+
+
+def _runtime_storage_policy() -> RuntimeStoragePolicy:
+    runtime_dir = Path(settings.runtime_state_path).parent
+    return RuntimeStoragePolicy(
+        runtime_dir=str(runtime_dir or Path(".runtime")),
+        reports_db_path=settings.naver_reports_db_path,
+        pdf_archive_dir=settings.naver_reports_pdf_archive_dir,
+        large_file_threshold_mb=settings.runtime_storage_large_file_threshold_mb,
+        prune_unreferenced_pdfs=settings.runtime_storage_prune_unreferenced_pdfs,
+    )
+
+
+@app.get("/api/runtime/storage")
+async def runtime_storage_status() -> dict[str, Any]:
+    return build_runtime_storage_report(_runtime_storage_policy())
+
+
+@app.post("/api/runtime/storage/cleanup")
+async def runtime_storage_cleanup(dry_run: bool = True) -> dict[str, Any]:
+    result = cleanup_runtime_storage(_runtime_storage_policy(), dry_run=dry_run)
+    result["after"] = build_runtime_storage_report(_runtime_storage_policy())
+    return result
 
 
 @app.get("/api/kis/trader/status")
 async def kis_trader_status() -> dict[str, Any]:
     snapshot = kis_trader_store.read_snapshot()
+    readiness = _build_kis_trader_readiness()
     if not snapshot:
         return {
             "status": "missing",
             "enabled": settings.kis_trader_enabled,
+            "readiness": readiness,
         }
     if not isinstance(snapshot, dict):
         return {
             "status": "invalid",
             "enabled": settings.kis_trader_enabled,
+            "readiness": readiness,
         }
     return {
         "status": "ok",
         "enabled": settings.kis_trader_enabled,
+        "readiness": readiness,
         "snapshot": snapshot,
     }
 
@@ -1695,6 +2602,114 @@ async def kis_trader_run_once() -> dict[str, Any]:
         "status": "ok",
         "snapshot": snapshot,
     }
+
+
+@app.get("/api/kis/blocks/status")
+async def kis_blocks_status() -> dict[str, Any]:
+    return kis_block_trader.status()
+
+
+@app.get("/api/kis/blocks")
+async def kis_blocks() -> dict[str, Any]:
+    return await kis_block_trader.snapshot()
+
+
+@app.post("/api/kis/blocks/manager/run-once")
+async def kis_blocks_manager_run_once() -> dict[str, Any]:
+    if not settings.kis_primary_ready:
+        raise HTTPException(
+            status_code=400, detail="kis primary account not configured"
+        )
+    return await kis_block_trader.run_manager_once()
+
+
+@app.post("/api/kis/blocks/adopt-existing/run-once")
+async def kis_blocks_adopt_existing_run_once() -> dict[str, Any]:
+    if not settings.kis_primary_ready:
+        raise HTTPException(
+            status_code=400, detail="kis primary account not configured"
+        )
+    return await kis_block_trader.run_adoption_once()
+
+
+@app.post("/api/kis/blocks/executor/tick")
+async def kis_blocks_executor_tick() -> dict[str, Any]:
+    if not settings.kis_primary_ready:
+        raise HTTPException(
+            status_code=400, detail="kis primary account not configured"
+        )
+    return await kis_block_trader.executor_tick(manual=True)
+
+
+@app.post("/api/kis/blocks/kill-switch")
+async def kis_blocks_kill_switch(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    reason = str((payload or {}).get("reason") or "manual")
+    return {
+        "status": "ok",
+        "kill_switch": kis_block_trader.set_kill_switch(True, reason=reason),
+    }
+
+
+@app.post("/api/kis/blocks/kill-switch/release")
+async def kis_blocks_kill_switch_release(
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    reason = str((payload or {}).get("reason") or "manual_release")
+    return {
+        "status": "ok",
+        "kill_switch": kis_block_trader.set_kill_switch(False, reason=reason),
+    }
+
+
+@app.post("/api/kis/blocks/orders/{order_id}/cancel")
+async def kis_block_order_cancel(
+    order_id: int,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    reason = str((payload or {}).get("reason") or "manual_cancel")
+    result = await kis_block_trader.cancel_order(order_id, reason=reason)
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail="order not found")
+    return result
+
+
+@app.get("/api/kis/blocks/{block_id}")
+async def kis_block_detail(block_id: str) -> dict[str, Any]:
+    result = kis_block_trader.block_detail(block_id)
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail="block not found")
+    return result
+
+
+@app.post("/api/kis/blocks/{block_id}/pause")
+async def kis_block_pause(block_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    reason = str((payload or {}).get("reason") or "manual_pause")
+    result = kis_block_trader.pause_block(block_id, reason=reason)
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail="block not found")
+    return result
+
+
+@app.post("/api/kis/blocks/{block_id}/resume")
+async def kis_block_resume(block_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    reason = str((payload or {}).get("reason") or "manual_resume")
+    result = kis_block_trader.resume_block(block_id, reason=reason)
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail="block not found")
+    return result
+
+
+@app.post("/api/kis/blocks/{block_id}/close")
+async def kis_block_close(block_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not settings.kis_primary_ready:
+        raise HTTPException(
+            status_code=400, detail="kis primary account not configured"
+        )
+    reason = str((payload or {}).get("reason") or "manual_close")
+    result = await kis_block_trader.close_block(block_id, reason=reason)
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail="block not found")
+    return result
 
 
 @app.get("/api/portfolio-coach/review-queue")
@@ -1774,23 +2789,51 @@ async def reports_status() -> dict[str, Any]:
         "status": "ok",
         "enabled": settings.naver_reports_enabled,
         "repository": naver_report_repository.status(),
+        "intelligence": build_report_intelligence_status(settings),
         "rag": rag_status,
+        "fundamentals": symbol_fundamentals_service.status(),
     }
 
 
 @app.post("/api/reports/crawl-once")
 async def reports_crawl_once() -> dict[str, Any]:
-    snapshot = await naver_report_crawler.crawl_once()
-    rag_sync: dict[str, Any] | None = None
-    if settings.rag_enabled and rag_store is not None:
-        docs = naver_report_repository.list_chunks_for_rag(
-            limit=settings.rag_sync_chunk_limit
-        )
-        rag_sync = rag_store.sync_documents(docs)
+    result = await run_report_collection_cycle(
+        crawler=naver_report_crawler,
+        repository=naver_report_repository,
+        rag_store=rag_store,
+        rag_enabled=settings.rag_enabled,
+        rag_sync_chunk_limit=settings.rag_sync_chunk_limit,
+        refresh_symbol_directory=False,
+    )
     return {
         "status": "ok",
-        "snapshot": snapshot,
-        "rag_sync": rag_sync,
+        "snapshot": result.get("snapshot"),
+        "metadata_repair": result.get("metadata_repair"),
+        "rag_sync": result.get("rag_sync"),
+        "rag_metadata_sync": result.get("rag_metadata_sync"),
+    }
+
+
+@app.post("/api/reports/repair-metadata")
+async def reports_repair_metadata(
+    sync_rag_after: bool = True,
+    prune_orphans: bool = True,
+) -> dict[str, Any]:
+    repair = naver_report_repository.repair_metadata_quality()
+    rag_sync_result: dict[str, Any] | None = None
+    if sync_rag_after:
+        rag_sync_result = sync_report_rag(
+            repository=naver_report_repository,
+            rag_store=rag_store,
+            enabled=settings.rag_enabled,
+            limit=settings.rag_sync_chunk_limit,
+            metadata_only=True,
+            prune_missing=prune_orphans,
+        )
+    return {
+        "status": "ok",
+        "repair": repair,
+        "rag_sync": rag_sync_result,
     }
 
 
@@ -1846,7 +2889,11 @@ async def rag_status() -> dict[str, Any]:
 
 
 @app.post("/api/rag/sync")
-async def rag_sync() -> dict[str, Any]:
+async def rag_sync(
+    force: bool = False,
+    metadata_only: bool = False,
+    prune_orphans: bool = False,
+) -> dict[str, Any]:
     if not settings.rag_enabled:
         return {
             "status": "ok",
@@ -1865,14 +2912,19 @@ async def rag_sync() -> dict[str, Any]:
                 "reason": "rag_store_missing",
             },
         }
-    docs = naver_report_repository.list_chunks_for_rag(
-        limit=settings.rag_sync_chunk_limit
+    result = sync_report_rag(
+        repository=naver_report_repository,
+        rag_store=rag_store,
+        enabled=settings.rag_enabled,
+        limit=settings.rag_sync_chunk_limit,
+        force_update=force,
+        metadata_only=metadata_only,
+        prune_missing=prune_orphans,
     )
-    result = rag_store.sync_documents(docs)
     return {
         "status": "ok",
         "enabled": True,
-        "result": result,
+        "result": result or {"status": "skipped", "reason": "rag_store_missing"},
     }
 
 

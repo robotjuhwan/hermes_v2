@@ -69,6 +69,62 @@ def _strip_bot_suffix(command_token: str) -> str:
     return core.split("@", 1)[0].strip().lower()
 
 
+def _strategy_horizon(row: dict[str, Any], key: str) -> dict[str, Any]:
+    suitability = row.get("suitability") if isinstance(row.get("suitability"), dict) else {}
+    horizon = suitability.get(key) if isinstance(suitability.get(key), dict) else {}
+    return {
+        "score": int(float(horizon.get("score") or row.get("score") or 0)),
+        "grade": str(horizon.get("grade") or "-"),
+        "drivers": list(horizon.get("drivers") or []) if isinstance(horizon.get("drivers"), list) else [],
+        "risks": list(horizon.get("risks") or []) if isinstance(horizon.get("risks"), list) else [],
+    }
+
+
+def _strategy_suitability_line(row: dict[str, Any]) -> str:
+    balanced = _strategy_horizon(row, "balanced")
+    short = _strategy_horizon(row, "short_term")
+    mid = _strategy_horizon(row, "mid_term")
+    long = _strategy_horizon(row, "long_term")
+    return (
+        f"균형 {balanced['grade']} {balanced['score']} · "
+        f"단기 {short['grade']} / 중기 {mid['grade']} / 장기 {long['grade']}"
+    )
+
+
+def _strategy_warning_line(row: dict[str, Any]) -> str:
+    warnings = [
+        str(item)
+        for item in list(row.get("data_warnings") or [])
+        if str(item).strip()
+    ][:4]
+    if not warnings:
+        coverage = row.get("data_coverage") if isinstance(row.get("data_coverage"), dict) else {}
+        missing = [
+            str(item)
+            for item in list(coverage.get("missing") or [])
+            if str(item).strip()
+        ][:3]
+        if missing:
+            warnings.append(f"미수집 {', '.join(missing)}")
+    identity = row.get("identity_status") if isinstance(row.get("identity_status"), dict) else {}
+    if str(identity.get("status") or "") and str(identity.get("status") or "") != "ok":
+        warnings.insert(0, str(identity.get("label") or "종목명 검증 필요"))
+    return " · ".join(list(dict.fromkeys(warnings))[:4])
+
+
+def _market_action_label(value: Any) -> str:
+    labels = {
+        "hold": "유지",
+        "watch_add": "추가 관심",
+        "avoid_add": "추가 보류",
+        "trim_watch": "비중 점검",
+        "risk_check": "리스크 관리",
+        "new_watch": "신규 관심",
+    }
+    key = str(value or "").strip()
+    return labels.get(key, key or "-")
+
+
 def _char_display_width(ch: str) -> int:
     return 1
 
@@ -149,6 +205,14 @@ class TelegramCLI:
             return True, self._sessions_text(dashboard)
         if command == "session":
             return True, self._session_detail_text(dashboard, args)
+        if command in {"ask", "strategy", "bot"}:
+            return True, self._strategy_usage_text(args)
+        if command in {"watchlist", "why"}:
+            return True, self._strategy_usage_text(args)
+        if command in {"market", "judge", "why-now"}:
+            return True, self._market_usage_text(args)
+        if command in {"memory", "mindset", "journal", "reflect", "why-block"}:
+            return True, self._memory_usage_text(args)
 
         return (
             True,
@@ -168,7 +232,446 @@ class TelegramCLI:
                 "/upbit /bithumb /binance /binancef /krx /kr2 /us - 거래소 바로가기",
                 "/sessions - 전체 세션 요약",
                 "/session <session_id> - 특정 세션 상세",
+                "/ask <질문> - 전략 인텔리전스에 질문",
+                "/strategy <질문> - 다음 거래일 후보/시장 판단",
+                "/bot <질문> - 매매봇 전략 질문",
+                "/watchlist - 전략 인텔리전스 관심 후보",
+                "/why <종목코드> - 후보 근거/반론 상세",
+                "/market - 최신 장중 시세/판단 요약",
+                "/judge - 장중 LLM 판단 실행",
+                "/why-now <종목코드> - 현재 시세와 계좌 기준 상세",
+                "/memory - 활성 메모리/운용 원칙 요약",
+                "/mindset - 오늘 장전 마음가짐",
+                "/journal - 오늘 메모리 저널",
+                "/reflect - 최근 블록 거래 반성 실행",
+                "/why-block <block_id> - 블록별 기억/교훈",
             ]
+        )
+
+    def strategy_query_text(self, command: str, args: list[str]) -> str:
+        text = " ".join(str(item) for item in args).strip()
+        if text:
+            return text[:600]
+        if command == "strategy":
+            return "다음 거래일 관심 후보를 전략적으로 정리해줘"
+        return "현재 시장과 내 전략 기준으로 볼 후보와 피해야 할 조건을 알려줘"
+
+    def strategy_brief_text(self, payload: dict[str, Any]) -> str:
+        candidates = list(payload.get("candidates") or [])
+        sources = list(payload.get("sources") or [])
+        regime = payload.get("regime") if isinstance(payload.get("regime"), dict) else {}
+        lines = [
+            "HERMES 전략 인텔리전스",
+            f"질문: {payload.get('query') or '-'}",
+            f"모델: {payload.get('model') or '-'} · 모드: {payload.get('brief_mode') or '-'}",
+            f"시장: {regime.get('label') or '-'} · {regime.get('stance') or '-'}",
+            "",
+        ]
+        brief = str(payload.get("brief_md") or "").strip()
+        if brief:
+            lines.extend([brief[:1800], ""])
+        if candidates:
+            lines.append("상위 후보")
+            for row in candidates[:5]:
+                lines.append(
+                    "- "
+                    f"{row.get('name') or row.get('symbol')}({row.get('symbol')}): "
+                    f"{_strategy_suitability_line(row)}"
+                )
+        if sources:
+            lines.extend(["", "소스 상태"])
+            for row in sources[:5]:
+                lines.append(
+                    f"- {row.get('label') or row.get('source_id')}: "
+                    f"{row.get('status')} · {row.get('count', 0)}"
+                )
+        lines.extend(
+            [
+                "",
+                "정보 제공용이며 매매 추천이 아닙니다.",
+            ]
+        )
+        text = "\n".join(lines)
+        if len(text) > 3600:
+            text = text[:3580].rstrip() + "\n..."
+        return self._html_pre(text)
+
+    def strategy_watchlist_text(self, payload: dict[str, Any]) -> str:
+        candidates = list(payload.get("candidates") or [])
+        regime = payload.get("regime") if isinstance(payload.get("regime"), dict) else {}
+        lines = [
+            "HERMES 전략 Watchlist",
+            f"기준: {payload.get('query') or '-'}",
+            f"시장: {regime.get('label') or '-'} · {regime.get('stance') or '-'}",
+            f"모델: {payload.get('model') or '-'} · 모드: {payload.get('brief_mode') or '-'}",
+            "",
+        ]
+        if not candidates:
+            lines.append("현재 근거 기준으로 관심 후보가 부족합니다.")
+        for idx, row in enumerate(candidates[:8], start=1):
+            reason = "; ".join(list(row.get("reasons") or [])[:2]) or "근거 보강 필요"
+            check = "; ".join(list(row.get("checks") or [])[:1]) or "진입 조건 확인 필요"
+            warning = _strategy_warning_line(row)
+            lines.extend(
+                [
+                    f"{idx}. {row.get('name') or row.get('symbol')}({row.get('symbol')})",
+                    f"   {_strategy_suitability_line(row)}",
+                    *([f"   자료: {warning}"] if warning else []),
+                    f"   근거: {reason}",
+                    f"   체크: {check}",
+                ]
+            )
+        lines.extend(["", "상세는 /why <종목코드> 로 확인하세요.", "정보 제공용이며 매매 추천이 아닙니다."])
+        text = "\n".join(lines)
+        if len(text) > 3600:
+            text = text[:3580].rstrip() + "\n..."
+        return self._html_pre(text)
+
+    def strategy_why_text(self, payload: dict[str, Any], symbol: str) -> str:
+        target = str(symbol or "").strip()
+        candidates = list(payload.get("candidates") or [])
+        row = next(
+            (
+                item
+                for item in candidates
+                if str(item.get("symbol") or "").strip() == target
+            ),
+            None,
+        )
+        if not row:
+            known = ", ".join(
+                str(item.get("symbol") or "")
+                for item in candidates[:8]
+                if str(item.get("symbol") or "").strip()
+            )
+            return self._html_pre(
+                f"{target or '-'} 후보 상세를 찾지 못했습니다.\n"
+                f"현재 watchlist: {known or '없음'}"
+            )
+
+        components = row.get("score_components") or {}
+        short = _strategy_horizon(row, "short_term")
+        mid = _strategy_horizon(row, "mid_term")
+        long = _strategy_horizon(row, "long_term")
+        balanced = _strategy_horizon(row, "balanced")
+        reasons = list(row.get("reasons") or [])
+        checks = list(row.get("checks") or [])
+        risks = list(row.get("risks") or [])
+        facts = list(row.get("facts") or [])
+        citations = list(row.get("citations") or [])
+        report_ids = list(row.get("report_ids") or [])
+        warning = _strategy_warning_line(row)
+        lines = [
+            "HERMES 후보 상세",
+            f"{row.get('name') or target}({target})",
+            (
+                f"균형 {balanced['grade']} {balanced['score']} · confidence {row.get('confidence')} · "
+                f"stance {row.get('stance')}"
+            ),
+            (
+                f"기간별: 단기 {short['grade']} {short['score']} / "
+                f"중기 {mid['grade']} {mid['score']} / 장기 {long['grade']} {long['score']}"
+            ),
+            (
+                "점수: "
+                f"report {components.get('report', '-')} / research {components.get('research', '-')} / "
+                f"whale {components.get('whale', '-')} / close {components.get('after_close', '-')} / "
+                f"value {components.get('valuation', '-')} / risk {components.get('risk_penalty', '-')}"
+            ),
+        ]
+        if warning:
+            lines.append(f"자료 상태: {warning}")
+        lines.extend(
+            [
+                "",
+                "기간별 핵심 근거",
+                f"- 단기: {'; '.join(short['drivers'][:2]) or '근거 보강 필요'}",
+                f"- 중기: {'; '.join(mid['drivers'][:2]) or '근거 보강 필요'}",
+                f"- 장기: {'; '.join(long['drivers'][:2]) or '근거 보강 필요'}",
+                "",
+                "왜 보는가",
+            ]
+        )
+        lines.extend(f"- {item}" for item in (reasons[:5] or ["근거 보강 필요"]))
+        lines.append("")
+        lines.append("확인 조건")
+        lines.extend(f"- {item}" for item in (checks[:4] or ["가격/거래대금/섹터 수급 확인"]))
+        lines.append("")
+        lines.append("반론")
+        lines.extend(f"- {item}" for item in (risks[:4] or ["리스크 추가 점검"]))
+        if facts:
+            lines.extend(["", "근거 문장"])
+            lines.extend(f"- {item}" for item in facts[:4])
+        if report_ids:
+            lines.extend(["", f"리포트: {', '.join(str(item) for item in report_ids[:6])}"])
+        if citations:
+            lines.extend(["근거 위치"])
+            lines.extend(f"- {item}" for item in citations[:4])
+        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        text = "\n".join(lines)
+        if len(text) > 3600:
+            text = text[:3580].rstrip() + "\n..."
+        return self._html_pre(text)
+
+    def _strategy_usage_text(self, args: list[str]) -> str:
+        if args:
+            return self._html_pre(
+                "전략 인텔리전스 질문은 서버에서 처리됩니다.\n"
+                "텔레그램 웹훅/폴링 경로로 /ask 또는 /strategy 명령을 보내주세요."
+            )
+        return self._html_pre(
+            "사용법:\n"
+            "/ask 다음 거래일 관심 후보를 전략적으로 정리해줘\n"
+            "/strategy 고래 포지션과 종가 수급이 겹치는 후보를 봐줘\n"
+            "/bot 오늘 시장에서 피해야 할 조건은?\n"
+            "/watchlist\n"
+            "/why 005930\n"
+            "/market\n"
+            "/judge\n"
+            "/why-now 005930\n"
+            "/memory\n"
+            "/mindset\n"
+            "/journal\n"
+            "/reflect\n"
+            "/why-block blk_005930_..."
+        )
+
+    def _memory_usage_text(self, args: list[str]) -> str:
+        _ = args
+        return self._html_pre(
+            "메모리 명령은 서버에서 처리됩니다.\n"
+            "/memory - 활성 메모리/운용 원칙\n"
+            "/mindset - 오늘 장전 마음가짐\n"
+            "/journal - 오늘 메모리 저널\n"
+            "/reflect - 최근 블록 거래 반성 실행\n"
+            "/why-block <block_id> - 블록별 기억/교훈"
+        )
+
+    def memory_status_text(self, payload: dict[str, Any]) -> str:
+        policies = list(payload.get("active_policies") or [])
+        journals = list(payload.get("today_journals") or [])
+        latest = payload.get("latest_run") if isinstance(payload.get("latest_run"), dict) else {}
+        lines = [
+            "HERMES 메모리",
+            f"상태: {payload.get('status') or '-'} · 모델 {payload.get('model') or '-'}",
+            (
+                f"저널 {int(payload.get('journal_count') or 0)}개 · "
+                f"기억 {int(payload.get('insight_count') or 0)}개 · "
+                f"활성 원칙 {int(payload.get('active_policy_count') or 0)}개"
+            ),
+            f"최근 실행: {latest.get('slot') or latest.get('status') or '-'} · {latest.get('run_at') or '-'}",
+            "",
+            "오늘 저널",
+        ]
+        if journals:
+            for row in journals[:4]:
+                lines.append(f"- {row.get('slot_label') or row.get('slot')}: {row.get('title') or '-'}")
+        else:
+            lines.append("- 아직 오늘 저널이 없습니다.")
+        lines.append("")
+        lines.append("활성 운용 원칙")
+        if policies:
+            for row in policies[:6]:
+                lines.append(
+                    f"- {row.get('policy_id')}: {row.get('reason') or row.get('action')}"
+                )
+        else:
+            lines.append("- 아직 활성화된 메모리 정책이 없습니다.")
+        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        return self._html_pre("\n".join(lines)[:3600])
+
+    def memory_journal_text(self, journal: dict[str, Any]) -> str:
+        if not journal:
+            return self._html_pre("아직 표시할 메모리 저널이 없습니다.")
+        message = str(journal.get("message_md") or "").strip()
+        title = str(journal.get("title") or journal.get("slot_label") or "메모리 저널")
+        lines = [
+            f"HERMES {title}",
+            f"날짜: {journal.get('trading_day') or '-'} · 슬롯: {journal.get('slot') or '-'}",
+            "",
+            message or "내용이 비어 있습니다.",
+        ]
+        text = "\n".join(lines)
+        if len(text) > 3600:
+            text = text[:3580].rstrip() + "\n..."
+        return self._html_pre(text)
+
+    def memory_today_text(self, payload: dict[str, Any]) -> str:
+        journals = list(payload.get("journals") or [])
+        policies = list(payload.get("active_policies") or [])
+        lines = [
+            "HERMES 오늘의 메모리 저널",
+            f"날짜: {payload.get('trading_day') or '-'}",
+            "",
+        ]
+        if not journals:
+            lines.append("아직 오늘 생성된 저널이 없습니다. /mindset 으로 장전 마음가짐을 만들 수 있습니다.")
+        for row in journals:
+            message = str(row.get("message_md") or "").strip()
+            lines.extend(
+                [
+                    f"[{row.get('slot_label') or row.get('slot')}] {row.get('title') or '-'}",
+                    _truncate_display(message, 420),
+                    "",
+                ]
+            )
+        if policies:
+            lines.append("활성 운용 원칙")
+            for row in policies[:5]:
+                lines.append(f"- {row.get('policy_id')}: {row.get('reason') or row.get('action')}")
+        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        text = "\n".join(lines)
+        if len(text) > 3600:
+            text = text[:3580].rstrip() + "\n..."
+        return self._html_pre(text)
+
+    def memory_block_text(self, payload: dict[str, Any]) -> str:
+        block_id = str(payload.get("block_id") or "-")
+        if payload.get("status") != "ok":
+            return self._html_pre(f"{block_id} 블록 메모리를 찾을 수 없습니다.")
+        content = str(payload.get("content") or "").strip()
+        insights = list(payload.get("insights") or [])
+        lines = [
+            "HERMES 블록 기억",
+            f"블록: {block_id}",
+            f"파일: {'있음' if payload.get('exists') else '없음'}",
+            "",
+        ]
+        if content:
+            lines.append(_truncate_display(content, 1800))
+        elif insights:
+            lines.extend(f"- {row.get('summary_md')}" for row in insights[:5])
+        else:
+            lines.append("아직 이 블록에 쌓인 반성 메모리가 없습니다.")
+        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        text = "\n".join(lines)
+        if len(text) > 3600:
+            text = text[:3580].rstrip() + "\n..."
+        return self._html_pre(text)
+
+    def market_judgment_text(self, payload: dict[str, Any]) -> str:
+        run = payload.get("run") if isinstance(payload.get("run"), dict) else {}
+        judgments = list(payload.get("judgments") or [])
+        account = payload.get("account") if isinstance(payload.get("account"), dict) else {}
+        clock = payload.get("clock") if isinstance(payload.get("clock"), dict) else {}
+        source_snapshot = run.get("source_snapshot") if isinstance(run.get("source_snapshot"), dict) else {}
+        if not clock and isinstance(source_snapshot.get("clock"), dict):
+            clock = source_snapshot["clock"]
+        lines = [
+            "HERMES 장중 판단",
+            f"시장: {clock.get('session') or run.get('market_session') or '-'} · {clock.get('now') or run.get('run_at') or '-'}",
+            f"모드: {run.get('mode') or '-'} · 상태: {payload.get('status') or run.get('status') or '-'}",
+        ]
+        if account:
+            lines.append(
+                f"국장1: 현금 {_fmt_krw_won(account.get('cash_krw'))} · "
+                f"보유 {_fmt_krw_won(account.get('position_value_krw'))} · "
+                f"{int(account.get('position_count') or 0)}종목"
+            )
+        lines.append("")
+        if not judgments:
+            lines.append("아직 저장된 장중 판단이 없습니다.")
+        for row in judgments[:8]:
+            reasons = "; ".join(list(row.get("reasons") or [])[:2]) or "근거 보강 필요"
+            risks = "; ".join(list(row.get("risks") or [])[:1]) or "리스크 점검"
+            quote = row.get("quote") if isinstance(row.get("quote"), dict) else {}
+            price = quote.get("price")
+            change_pct = quote.get("change_pct")
+            price_line = ""
+            if price:
+                price_line = f" · {int(float(price)):,.0f}원 / {float(change_pct or 0):+.2f}%"
+            lines.extend(
+                [
+                    f"- {row.get('name') or row.get('symbol')}({row.get('symbol')}){price_line}",
+                    (
+                        f"  {_market_action_label(row.get('account_action'))} · "
+                        f"{row.get('stance') or '-'} · confidence {float(row.get('confidence') or 0):.2f}"
+                    ),
+                    f"  근거: {reasons}",
+                    f"  반론: {risks}",
+                ]
+            )
+        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        text = "\n".join(lines)
+        if len(text) > 3600:
+            text = text[:3580].rstrip() + "\n..."
+        return self._html_pre(text)
+
+    def market_why_now_text(self, payload: dict[str, Any], symbol: str) -> str:
+        target = str(symbol or "").strip()
+        judgments = list(payload.get("judgments") or [])
+        row = next(
+            (
+                item
+                for item in judgments
+                if str(item.get("symbol") or "").strip() == target
+            ),
+            None,
+        )
+        if not row:
+            known = ", ".join(
+                str(item.get("symbol") or "")
+                for item in judgments[:10]
+                if str(item.get("symbol") or "").strip()
+            )
+            return self._html_pre(
+                f"{target or '-'} 장중 판단을 찾지 못했습니다.\n"
+                f"현재 판단 종목: {known or '없음'}"
+            )
+        quote = row.get("quote") if isinstance(row.get("quote"), dict) else {}
+        position = row.get("position") if isinstance(row.get("position"), dict) else {}
+        strategy = row.get("strategy") if isinstance(row.get("strategy"), dict) else {}
+        lines = [
+            "HERMES 왜 지금?",
+            f"{row.get('name') or target}({target})",
+            f"판단: {_market_action_label(row.get('account_action'))} · {row.get('stance')} · {row.get('horizon')}",
+            f"confidence: {float(row.get('confidence') or 0):.2f}",
+            "",
+            "현재 시세",
+            f"- 가격: {_fmt_krw_won(quote.get('price'))} · 등락률 {float(quote.get('change_pct') or 0):+.2f}%",
+            f"- 소스: {quote.get('source') or '-'} · 상태 {quote.get('status') or '-'}",
+        ]
+        if position:
+            lines.extend(
+                [
+                    "",
+                    "국장1 보유",
+                    f"- 평가금액: {_fmt_krw_won(position.get('value_krw'))}",
+                    f"- 손익: {_fmt_signed_krw_won(position.get('unrealized_pnl_krw'))} / {float(position.get('unrealized_pnl_pct') or 0):+.2f}%",
+                    f"- 비중: {float(position.get('position_weight') or 0) * 100:.1f}%",
+                ]
+            )
+        if strategy:
+            lines.extend(
+                [
+                    "",
+                    "전략 레이어",
+                    f"- 균형 적합도: {strategy.get('score', '-')}",
+                    f"- confidence: {strategy.get('confidence', '-')}",
+                ]
+            )
+        lines.extend(["", "근거"])
+        lines.extend(f"- {item}" for item in (list(row.get("reasons") or [])[:5] or ["근거 보강 필요"]))
+        lines.append("")
+        lines.append("반론")
+        lines.extend(f"- {item}" for item in (list(row.get("risks") or [])[:4] or ["리스크 추가 점검"]))
+        gaps = list(row.get("data_gaps") or [])
+        if gaps:
+            lines.extend(["", "자료 공백"])
+            lines.extend(f"- {item}" for item in gaps[:4])
+        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        text = "\n".join(lines)
+        if len(text) > 3600:
+            text = text[:3580].rstrip() + "\n..."
+        return self._html_pre(text)
+
+    def _market_usage_text(self, args: list[str]) -> str:
+        _ = args
+        return self._html_pre(
+            "장중 판단 명령은 서버에서 처리됩니다.\n"
+            "/market - 최신 장중 판단 요약\n"
+            "/judge - 새 장중 판단 실행\n"
+            "/why-now 005930 - 현재 시세/계좌 기준 상세"
         )
 
     def _status_text(self, dashboard: dict[str, Any]) -> str:

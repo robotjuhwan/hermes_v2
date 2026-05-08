@@ -141,9 +141,27 @@ class RuntimeEngine:
                 "service": self.service_name,
                 "status": "running",
                 "cycle": cycle,
-                "engine": "skeleton",
+                "engine": "session_heartbeat",
+                "role": "session_state_monitor",
+                "role_label": "세션 상태/heartbeat",
+                "description": (
+                    "거래소별 전략 세션의 heartbeat, risk, skeleton execution "
+                    "상태를 기록한다."
+                ),
+                "execution_mode": "skeleton_noop",
+                "executes_orders": False,
                 "base_interval_sec": self.base_interval_sec,
                 "sessions": self.session_count,
+                "managed_capabilities": [
+                    "session_heartbeat",
+                    "strategy_skeleton",
+                    "risk_state_snapshot",
+                ],
+                "externalized_capabilities": [
+                    "research_and_reports:intelligence",
+                    "market_signals:strategy_insights",
+                    "kis_trading:kis_trader",
+                ],
             },
             "sessions": session_rows,
         }

@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -130,7 +130,8 @@ class ResearchPipelineConfig:
     llm_bridge_url: str = ""
     llm_bridge_token: str = ""
     llm_bridge_timeout_ms: int = 60000
-    llm_model: str = "gpt-5.3-codex"
+    llm_model: str = "gpt-5.5"
+    market_intelligence_sources: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ResearchPipeline:
@@ -146,6 +147,7 @@ class ResearchPipeline:
                 RAGStoreConfig(
                     persist_path=config.rag_persist_path,
                     collection_name=config.rag_collection_name,
+                    query_oversample_factor=4,
                 )
             )
             if bool(config.rag_enabled)
@@ -243,11 +245,18 @@ class ResearchPipeline:
         prompt = {
             "market": self.config.market_scope,
             "query": query,
-            "task": "Summarize KRX market context and suggest candidate 6-digit stock codes.",
+            "task": (
+                "Summarize KRX market context and suggest candidate 6-digit stock "
+                "codes. Treat reference_sources as a source playbook only; do not "
+                "claim live whale/flow values unless they are explicitly present in "
+                "the collected items."
+            ),
+            "reference_sources": self.config.market_intelligence_sources,
             "output_schema": {
                 "query": "string",
                 "summary": "string",
                 "picks": ["6-digit string"],
+                "source_signals_to_watch": ["string"],
                 "self_score_100": "integer 0-100",
                 "self_score_reason": "string",
             },
@@ -625,6 +634,49 @@ class ResearchPipeline:
             )
         return out
 
+    def _collect_market_intelligence_source_items(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for row in self.config.market_intelligence_sources:
+            if not isinstance(row, dict):
+                continue
+            source_id = str(row.get("source_id") or "").strip()
+            label = str(row.get("label") or source_id).strip()
+            role = str(row.get("role") or "").strip()
+            caution = str(row.get("caution") or "").strip()
+            coverage = [
+                str(item).strip()
+                for item in list(row.get("coverage") or [])
+                if str(item).strip()
+            ]
+            signal_types = [
+                str(item).strip()
+                for item in list(row.get("signal_types") or [])
+                if str(item).strip()
+            ]
+            if not source_id or not label:
+                continue
+            summary_parts = [role]
+            if signal_types:
+                summary_parts.append("signals=" + ", ".join(signal_types))
+            if coverage:
+                summary_parts.append("coverage=" + ", ".join(coverage))
+            if caution:
+                summary_parts.append("caution=" + caution)
+            out.append(
+                {
+                    "source": "market_intelligence_source",
+                    "source_id": source_id,
+                    "status": "reference_only",
+                    "title": label,
+                    "summary": " | ".join(part for part in summary_parts if part),
+                    "picks": [],
+                    "coverage": coverage,
+                    "signal_types": signal_types,
+                    "caution": caution,
+                }
+            )
+        return out
+
     def _read_existing_lessons(self, path: Path) -> list[str]:
         if not path.exists():
             return []
@@ -740,7 +792,32 @@ class ResearchPipeline:
         lines.append(f"- Focus Query: {snapshot.get('query')}")
         if all_picks:
             lines.append(f"- Watchlist Codes: {', '.join(all_picks[:12])}")
+        source_rows = list(snapshot.get("market_intelligence_sources") or [])
+        if source_rows:
+            labels = [
+                str(row.get("label") or row.get("source_id") or "").strip()
+                for row in source_rows
+                if isinstance(row, dict)
+            ]
+            labels = [label for label in labels if label]
+            if labels:
+                lines.append(f"- Reference Sources: {', '.join(labels[:6])}")
         lines.append("")
+        if source_rows:
+            lines.append("## Source Playbook")
+            lines.append("")
+            for row in source_rows[:8]:
+                if not isinstance(row, dict):
+                    continue
+                label = str(row.get("label") or row.get("source_id") or "").strip()
+                role = str(row.get("role") or "").strip()
+                caution = str(row.get("caution") or "").strip()
+                if not label:
+                    continue
+                lines.append(f"- {label}: {role[:180]}")
+                if caution:
+                    lines.append(f"  - Caution: {caution[:180]}")
+            lines.append("")
         lines.append("## Core Insights")
         lines.append("")
 
@@ -786,6 +863,7 @@ class ResearchPipeline:
 
     async def run_once(self) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
+        source_items = self._collect_market_intelligence_source_items()
 
         previous_snapshot = self.store.read_snapshot() or {}
         previous_total_learning = _safe_non_negative_int(
@@ -795,6 +873,9 @@ class ResearchPipeline:
         codex_item = await self._collect_codex_item()
         if codex_item:
             items.append(codex_item)
+
+        if source_items:
+            items.extend(source_items)
 
         rag_items = self._collect_rag_items()
         if rag_items:
@@ -819,6 +900,7 @@ class ResearchPipeline:
             "status": "ok",
             "count": len(deduped),
             "learning_total_count": previous_total_learning + 1,
+            "market_intelligence_sources": self.config.market_intelligence_sources,
             "items": deduped,
             "agent_self_score_100": agent_self_score_100,
             "agent_self_score_note": agent_self_score_note,

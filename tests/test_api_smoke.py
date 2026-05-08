@@ -1,13 +1,14 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fastapi.testclient import TestClient
-from datetime import datetime, timezone
 
+import tradecraft.main as tradecraft_main
 from tradecraft.main import (
     app,
     research_reader,
     binance,
     bithumb,
-    freqtrade_bridge,
     fx_rates,
     kis_primary,
     kis_secondary,
@@ -30,12 +31,6 @@ def _mock_fx_snapshot(monkeypatch):
         }
 
     monkeypatch.setattr(fx_rates, "get_snapshot", fake_get_snapshot)
-
-    async def fake_fetch_sessions(usdt_krw_rate: float) -> dict:
-        _ = usdt_krw_rate
-        return {"bots": [], "sessions": []}
-
-    monkeypatch.setattr(freqtrade_bridge, "fetch_sessions", fake_fetch_sessions)
 
 
 def test_health_and_dashboard(monkeypatch) -> None:
@@ -84,6 +79,174 @@ def test_health_and_dashboard(monkeypatch) -> None:
         assert any(
             session["mode"] == "mid_long_term" for session in payload["sessions"]
         )
+
+
+def test_health_distinguishes_runner_process_from_covered_service(
+    monkeypatch,
+) -> None:
+    def fake_runner_process_status(key: str) -> dict:
+        alive = key == "intelligence"
+        return {
+            "key": key,
+            "label": key,
+            "status": "running" if alive else "stopped",
+            "alive": alive,
+            "pid": 123 if alive else None,
+            "pid_file": f".runtime/pids/{key}.pid",
+            "pid_file_pid": 123 if alive else None,
+            "pid_file_status": "ok" if alive else "missing",
+            "matched_count": 1 if alive else 0,
+            "matches": [],
+        }
+
+    monkeypatch.setattr(
+        tradecraft_main,
+        "runner_process_status",
+        fake_runner_process_status,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["intelligence_runner_alive"] is True
+    assert payload["research_runner_alive"] is False
+    assert payload["research_service_alive"] is True
+    assert payload["naver_reports_runner_alive"] is False
+    assert payload["naver_reports_service_alive"] is True
+    assert payload["runner_processes"]["research"]["status"] == "covered"
+
+
+def test_symbol_fundamentals_api_routes(monkeypatch) -> None:
+    class FakeSymbolFundamentalsService:
+        def __init__(self) -> None:
+            self.collected_symbols: list[str] = []
+
+        def latest(self, symbol: str) -> dict:
+            return {
+                "status": "ok",
+                "symbol": symbol,
+                "valuation": {"per": 7.0, "pbr": 0.9, "industry_per": 28.9},
+                "score": {"label": "undervalued", "undervalued_score": 82},
+                "financials": [],
+            }
+
+        async def collect_symbols(
+            self,
+            symbols: list[str],
+            *,
+            force: bool = False,
+        ) -> dict:
+            self.collected_symbols = list(symbols)
+            return {
+                "status": "ok",
+                "target_count": len(symbols),
+                "force": force,
+                "items": [{"symbol": symbol, "status": "ok"} for symbol in symbols],
+            }
+
+        def status(self) -> dict:
+            return {
+                "status": "ok",
+                "db_path": ".runtime/symbol_fundamentals.db",
+                "total_snapshots": 1,
+                "error_count": 0,
+                "latest_crawled_at": "2026-05-06T00:00:00+00:00",
+            }
+
+    fake_service = FakeSymbolFundamentalsService()
+    monkeypatch.setattr(
+        tradecraft_main,
+        "symbol_fundamentals_service",
+        fake_service,
+    )
+
+    with TestClient(app) as client:
+        latest = client.get("/api/symbols/005930/fundamentals")
+        assert latest.status_code == 200
+        assert latest.json()["score"]["label"] == "undervalued"
+
+        invalid = client.get("/api/symbols/ABC/fundamentals")
+        assert invalid.status_code == 400
+
+        collected = client.post(
+            "/api/symbols/fundamentals/collect",
+            json={"symbols": ["005930", "000660"], "force": True},
+        )
+        assert collected.status_code == 200
+        assert collected.json()["target_count"] == 2
+        assert fake_service.collected_symbols == ["005930", "000660"]
+
+        status = client.get("/api/reports/status")
+        assert status.status_code == 200
+        assert status.json()["fundamentals"]["total_snapshots"] == 1
+
+
+def test_market_judgment_api_routes(monkeypatch) -> None:
+    class FakeMarketJudgmentEngine:
+        def clock(self) -> dict:
+            return {"status": "ok", "session": "regular", "is_market_open": True}
+
+        def latest_quotes(self, limit: int = 100) -> dict:
+            return {
+                "status": "ok",
+                "count": 1,
+                "limit": limit,
+                "items": [{"symbol": "005930", "price": 76000}],
+            }
+
+        def latest_account(self) -> dict:
+            return {
+                "status": "ok",
+                "account_label": "국장1",
+                "cash_krw": 1_000_000,
+                "positions": [{"symbol": "005930"}],
+            }
+
+        def latest_judgment(self) -> dict:
+            return {
+                "status": "ok",
+                "run": {"mode": "llm"},
+                "judgments": [{"symbol": "005930", "account_action": "hold"}],
+            }
+
+        async def run_once(self, *, use_llm: bool = True) -> dict:
+            return {
+                "status": "ok",
+                "use_llm": use_llm,
+                "judgments": [{"symbol": "005930"}],
+            }
+
+        def status(self) -> dict:
+            return {"status": "ok", "run_count": 1}
+
+    monkeypatch.setattr(
+        tradecraft_main,
+        "market_judgment_engine",
+        FakeMarketJudgmentEngine(),
+    )
+    monkeypatch.setattr(settings, "kis_primary_app_key", "app")
+    monkeypatch.setattr(settings, "kis_primary_app_secret", "secret")
+    monkeypatch.setattr(settings, "kis_primary_account_no", "12345678")
+    monkeypatch.setattr(settings, "kis_primary_product_code", "01")
+
+    with TestClient(app) as client:
+        clock = client.get("/api/market/clock")
+        assert clock.status_code == 200
+        assert clock.json()["session"] == "regular"
+
+        account = client.get("/api/market/account")
+        assert account.status_code == 200
+        assert account.json()["account_label"] == "국장1"
+
+        latest = client.get("/api/market/judgments/latest")
+        assert latest.status_code == 200
+        assert latest.json()["judgments"][0]["symbol"] == "005930"
+
+        run = client.post("/api/market/judgments/run-once")
+        assert run.status_code == 200
+        assert run.json()["use_llm"] is True
 
 
 def test_dashboard_uses_upbit_adapter_when_key_exists(monkeypatch) -> None:
@@ -431,86 +594,6 @@ def test_telegram_status_endpoint(monkeypatch) -> None:
         assert "ready" in res.json()
 
 
-def test_dashboard_uses_freqtrade_sessions_when_runtime_unavailable(
-    monkeypatch,
-) -> None:
-    async def fake_fetch_sessions(usdt_krw_rate: float) -> dict:
-        _ = usdt_krw_rate
-        return {
-            "bots": [
-                {
-                    "bot_id": "spot",
-                    "label": "Freqtrade Spot",
-                    "connected": True,
-                    "configured": True,
-                    "open_trades": 1,
-                }
-            ],
-            "sessions": [
-                {
-                    "session_id": "freqtrade_spot_1",
-                    "venue_id": "binance",
-                    "venue_label": "바이낸스 현물",
-                    "name": "Freqtrade Spot 포지션",
-                    "bot_name": "jurobot",
-                    "mode": "short_term",
-                    "status": "RUNNING",
-                    "cycle_sec": 5,
-                    "active_markets": ["FREQTRADE_SPOT"],
-                    "strategy_count": 1,
-                    "trade_count_today": 1,
-                    "realized_pnl_krw": 0.0,
-                    "unrealized_pnl_krw": 1000.0,
-                    "fees_paid_krw": -20.0,
-                    "volume_traded_krw": 10_000.0,
-                    "trade_symbol": "BTC/USDT",
-                    "position_side": "LONG",
-                    "entry_price": 140_000_000.0,
-                    "stop_loss_price": None,
-                    "take_profit_price": None,
-                    "max_notional_krw": 10_000.0,
-                    "holding_limit_min": 0,
-                    "win_rate_pct": 50.0,
-                    "avg_holding_min": 10.0,
-                    "intraday_drawdown_pct": 0.0,
-                    "fee_breakdown": {"maker_krw": -20.0, "taker_krw": 0.0},
-                    "display_note": "Freqtrade spot open trade mirror",
-                    "risk_guard": "ON",
-                    "last_heartbeat": "2026-02-15T00:00:00+00:00",
-                }
-            ],
-        }
-
-    monkeypatch.setattr(freqtrade_bridge, "fetch_sessions", fake_fetch_sessions)
-    monkeypatch.setattr(settings, "upbit_access_key", "")
-    monkeypatch.setattr(settings, "upbit_secret_key", "")
-    monkeypatch.setattr(settings, "bithumb_access_key", "")
-    monkeypatch.setattr(settings, "bithumb_secret_key", "")
-    monkeypatch.setattr(settings, "binance_spot_api_key", "")
-    monkeypatch.setattr(settings, "binance_spot_api_secret", "")
-    monkeypatch.setattr(settings, "binance_futures_api_key", "")
-    monkeypatch.setattr(settings, "binance_futures_api_secret", "")
-    monkeypatch.setattr(settings, "kis_primary_app_key", "")
-    monkeypatch.setattr(settings, "kis_primary_app_secret", "")
-    monkeypatch.setattr(settings, "kis_primary_account_no", "")
-    monkeypatch.setattr(settings, "kis_primary_product_code", "")
-    monkeypatch.setattr(settings, "kis_secondary_app_key", "")
-    monkeypatch.setattr(settings, "kis_secondary_app_secret", "")
-    monkeypatch.setattr(settings, "kis_secondary_account_no", "")
-    monkeypatch.setattr(settings, "kis_secondary_product_code", "")
-
-    with TestClient(app) as client:
-        res = client.get("/api/dashboard")
-        assert res.status_code == 200
-        payload = res.json()
-        sessions = payload.get("sessions") or []
-        assert any(str(row.get("session_id")) == "freqtrade_spot_1" for row in sessions)
-        assert any(
-            "Freqtrade Spot" in str(event.get("message") or "")
-            for event in payload.get("events") or []
-        )
-
-
 def test_dashboard_includes_research_feed(monkeypatch, tmp_path) -> None:
     path = tmp_path / "research.json"
     RuntimeStateStore(path).write_snapshot(
@@ -533,6 +616,7 @@ def test_dashboard_includes_research_feed(monkeypatch, tmp_path) -> None:
         "tradecraft.main.research_reader",
         type(research_reader)(str(path), max_age_sec=60),
     )
+    monkeypatch.setattr(settings, "research_enabled", True)
 
     monkeypatch.setattr(settings, "upbit_access_key", "")
     monkeypatch.setattr(settings, "upbit_secret_key", "")
@@ -560,3 +644,57 @@ def test_dashboard_includes_research_feed(monkeypatch, tmp_path) -> None:
         assert payload["research"]["source"] == "openai"
         assert payload["research"]["count"] == 1
         assert payload["research"]["items"][0]["title"] == "Daily brief"
+
+
+def test_dashboard_includes_stale_research_cache(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "research.json"
+    RuntimeStateStore(path).write_snapshot(
+        {
+            "updated_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+            "source": "openai",
+            "query": "crypto",
+            "items": [
+                {
+                    "title": "Old daily brief",
+                    "summary": "old but visible as stale cache",
+                    "source": "openai",
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr(
+        "tradecraft.main.research_reader",
+        type(research_reader)(str(path), max_age_sec=60),
+    )
+    monkeypatch.setattr(settings, "research_enabled", True)
+
+    monkeypatch.setattr(settings, "upbit_access_key", "")
+    monkeypatch.setattr(settings, "upbit_secret_key", "")
+    monkeypatch.setattr(settings, "bithumb_access_key", "")
+    monkeypatch.setattr(settings, "bithumb_secret_key", "")
+    monkeypatch.setattr(settings, "binance_spot_api_key", "")
+    monkeypatch.setattr(settings, "binance_spot_api_secret", "")
+    monkeypatch.setattr(settings, "binance_futures_api_key", "")
+    monkeypatch.setattr(settings, "binance_futures_api_secret", "")
+    monkeypatch.setattr(settings, "kis_primary_app_key", "")
+    monkeypatch.setattr(settings, "kis_primary_app_secret", "")
+    monkeypatch.setattr(settings, "kis_primary_account_no", "")
+    monkeypatch.setattr(settings, "kis_primary_product_code", "")
+    monkeypatch.setattr(settings, "kis_secondary_app_key", "")
+    monkeypatch.setattr(settings, "kis_secondary_app_secret", "")
+    monkeypatch.setattr(settings, "kis_secondary_account_no", "")
+    monkeypatch.setattr(settings, "kis_secondary_product_code", "")
+
+    with TestClient(app) as client:
+        dashboard = client.get("/api/dashboard")
+        assert dashboard.status_code == 200
+        payload = dashboard.json()
+        assert payload["research"]["status"] == "stale"
+        assert payload["research"]["stale"] is True
+        assert payload["research"]["count"] == 1
+        assert payload["research"]["items"][0]["title"] == "Old daily brief"
+        assert any(
+            "리서치 스냅샷 오래됨" in str(event.get("message") or "")
+            for event in payload.get("events") or []
+        )

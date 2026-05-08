@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import signal
 import shlex
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
-DEFAULT_LLM_MODEL = "gpt-5.3-codex"
+DEFAULT_LLM_MODEL = "gpt-5.5"
 
 
 def _split_command_line(raw: str) -> list[str]:
@@ -204,7 +206,9 @@ class LLMBridge:
             env={
                 **os.environ,
                 "LLM_BRIDGE_TIMEOUT_MS": str(raw_timeout_ms),
+                "OPENAI_MODEL": self.resolved_model,
             },
+            start_new_session=True,
         )
 
         timeout_sec = max(float(raw_timeout_ms) / 1000.0, 1.0)
@@ -215,8 +219,7 @@ class LLMBridge:
                 timeout=timeout_sec,
             )
         except asyncio.TimeoutError as exc:
-            proc.kill()
-            await proc.wait()
+            await self._terminate_command_process(proc)
             raise RuntimeError(
                 f"llm bridge command timed out after {timeout_sec:.1f}s"
             ) from exc
@@ -230,6 +233,29 @@ class LLMBridge:
             )
 
         return stdout.decode("utf-8", errors="replace")
+
+    async def _terminate_command_process(self, proc: Any) -> None:
+        pid = int(getattr(proc, "pid", 0) or 0)
+        if pid > 0:
+            with contextlib.suppress(Exception):
+                os.killpg(pid, signal.SIGTERM)
+        else:
+            with contextlib.suppress(Exception):
+                proc.terminate()
+
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        if pid > 0:
+            with contextlib.suppress(Exception):
+                os.killpg(pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
 
     async def _call_url(
         self,

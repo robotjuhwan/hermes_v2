@@ -77,7 +77,8 @@ class KISLLMTraderConfig:
     llm_bridge_url: str = ""
     llm_bridge_token: str = ""
     llm_bridge_timeout_ms: int = 60000
-    llm_model: str = "gpt-5.3-codex"
+    llm_model: str = "gpt-5.5"
+    execute_orders: bool = False
     max_orders_per_cycle: int = 3
     max_budget_per_order_krw: float = 1_000_000.0
     min_confidence: float = 0.65
@@ -143,6 +144,7 @@ class KISLLMTrader:
         snapshot = {
             "updated_at": utc_now_iso(),
             "status": "ok",
+            "execution_mode": "live" if self.config.execute_orders else "dry_run",
             "research_updated_at": str(research.get("updated_at") or ""),
             "cash_krw": cash_krw,
             "target_symbols": target_symbols,
@@ -302,6 +304,15 @@ class KISLLMTrader:
                 "positions": positions,
             },
             "research": research,
+            "market_intelligence_policy": {
+                "sources": list(research.get("market_intelligence_sources") or []),
+                "rule": (
+                    "Use whale-position and after-close flow sources as 참고 신호 only. "
+                    "Do not treat them as live data unless concrete rows are present "
+                    "in research or report_context. Combine them with account state, "
+                    "report evidence, liquidity, and the user's strategy rules."
+                ),
+            },
             "report_context": report_context,
             "quotes": quotes,
             "output_schema": {
@@ -503,11 +514,13 @@ class KISLLMTrader:
         positions: dict[str, float],
     ) -> list[dict[str, Any]]:
         orders: list[dict[str, Any]] = []
-        if not self._is_krx_open():
+        market_open = self._is_krx_open()
+        if self.config.execute_orders and not market_open:
             return [
                 {
                     "status": "skipped",
                     "reason": "market_closed",
+                    "execution_mode": "live",
                 }
             ]
 
@@ -544,6 +557,23 @@ class KISLLMTrader:
                 if qty <= 0:
                     continue
                 spend = qty * price
+                if not self.config.execute_orders:
+                    remaining_cash = max(remaining_cash - spend, 0.0)
+                    order_count += 1
+                    orders.append(
+                        {
+                            "status": "planned",
+                            "execution_mode": "dry_run",
+                            "market_open": market_open,
+                            "symbol": symbol,
+                            "side": "buy",
+                            "qty": qty,
+                            "budget_krw": spend,
+                            "confidence": confidence,
+                            "reason": str(row.get("reason") or ""),
+                        }
+                    )
+                    continue
                 try:
                     result = await self.kis.submit_domestic_order(
                         symbol=symbol,
@@ -592,6 +622,21 @@ class KISLLMTrader:
                 )
                 qty = min(qty, int(math.floor(available)))
                 if qty <= 0:
+                    continue
+                if not self.config.execute_orders:
+                    order_count += 1
+                    orders.append(
+                        {
+                            "status": "planned",
+                            "execution_mode": "dry_run",
+                            "market_open": market_open,
+                            "symbol": symbol,
+                            "side": "sell",
+                            "qty": qty,
+                            "confidence": confidence,
+                            "reason": str(row.get("reason") or ""),
+                        }
+                    )
                     continue
                 try:
                     result = await self.kis.submit_domestic_order(

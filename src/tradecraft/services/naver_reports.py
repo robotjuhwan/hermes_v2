@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import io
 import json
 import re
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -24,20 +28,217 @@ def _is_six_digit_symbol(value: Any) -> bool:
 
 
 def _clean_company_name(value: Any) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = _clean_metadata_text(value, limit=80)
     if not text:
         return ""
     if _is_six_digit_symbol(text):
+        return ""
+    if re.fullmatch(r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:\.[a-z]{2,})?", text.lower()):
+        return ""
+    if (
+        _is_html_artifact(text)
+        or _is_generic_company_name(text)
+        or _has_company_name_boilerplate(text)
+    ):
         return ""
     return text[:80]
 
 
 def _to_text(raw: str) -> str:
-    text = re.sub(r"<script[\s\S]*?</script>", " ", raw, flags=re.IGNORECASE)
+    text = html.unescape(str(raw or ""))
+    text = re.sub(r"<script[\s\S]*?</script>", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _is_html_artifact(value: Any) -> bool:
+    text = html.unescape(str(value or "")).strip()
+    lower = text.lower()
+    return any(
+        marker in lower
+        for marker in (
+            "<",
+            ">",
+            "btn_report.gif",
+            "static/nfinance",
+            "리포트 보기",
+            "align=",
+            "absmiddle",
+            "alt=",
+        )
+    )
+
+
+def _clean_metadata_text(value: Any, *, limit: int = 120) -> str:
+    text = _to_text(str(value or ""))
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"\s+", " ", text).strip(" \t\r\n\"'`|")
+    if not text:
+        return ""
+    return text[: max(int(limit), 1)].strip()
+
+
+def _is_generic_company_name(value: Any) -> bool:
+    text = _clean_metadata_text(value, limit=80).lower()
+    return text in {
+        "brief",
+        "report",
+        "리포트",
+        "기업분석",
+        "산업분석",
+        "시황",
+        "market",
+        "daily",
+        "review",
+        "preview",
+        "comment",
+        "update",
+        "earnings",
+        "company",
+        "company brief",
+        "ks",
+        "kq",
+        "kospi",
+        "kosdaq",
+        "현재가",
+        "액면가",
+        "자본금",
+        "시가총액",
+        "원",
+        "억원",
+        "십억원",
+        "주",
+        "unknown",
+        "정보",
+        "테마",
+        "네이버",
+        "네이버에",
+        "콘텐츠",
+        "제공",
+        "코스콤",
+        "국내",
+        "시세",
+        "국내 시세 정보",
+        "코스콤 국내 시세 정보",
+        "테마 정보 네이버에 콘텐츠 제공 코스콤 국내 시세 정보",
+    }
+
+
+def _has_company_name_boilerplate(value: Any) -> bool:
+    compact = re.sub(r"\s+", "", str(value or "")).lower()
+    return any(
+        re.sub(r"\s+", "", marker).lower() in compact
+        for marker in (
+            "코스콤 국내 시세 정보",
+            "네이버에 콘텐츠 제공",
+            "테마 정보",
+        )
+    )
+
+
+_AUTHORITATIVE_SYMBOL_DIRECTORY_SOURCES = {"pykrx", "krx", "krx_lookup"}
+
+
+def _company_names_overlap(left: Any, right: Any) -> bool:
+    left_name = _clean_company_candidate(left)
+    right_name = _clean_company_candidate(right)
+    if not left_name or not right_name:
+        return False
+    left_compact = re.sub(r"\s+", "", left_name).lower()
+    right_compact = re.sub(r"\s+", "", right_name).lower()
+    return (
+        left_compact == right_compact
+        or left_compact in right_compact
+        or right_compact in left_compact
+    )
+
+
+def _is_authoritative_symbol_source(source: Any, confidence: Any) -> bool:
+    name = str(source or "").strip().lower()
+    try:
+        score = float(confidence)
+    except (TypeError, ValueError):
+        score = 0.0
+    return name in _AUTHORITATIVE_SYMBOL_DIRECTORY_SOURCES and score >= 0.99
+
+
+def _choose_identity_company(
+    *,
+    symbol: str,
+    inferred_company: str,
+    mapped_company: str,
+    mapped_source: str,
+    mapped_confidence: float,
+) -> str:
+    inferred = _clean_company_candidate(inferred_company)
+    mapped = _clean_company_candidate(mapped_company)
+    if inferred and mapped and not _company_names_overlap(inferred, mapped):
+        if _is_authoritative_symbol_source(mapped_source, mapped_confidence):
+            return mapped
+        return inferred
+    if mapped:
+        return mapped
+    return inferred
+
+
+def _is_probable_short_date_symbol(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not _is_six_digit_symbol(text):
+        return False
+    year = int(text[:2])
+    month = int(text[2:4])
+    day = int(text[4:6])
+    return 24 <= year <= 35 and 1 <= month <= 12 and 1 <= day <= 31
+
+
+def _is_report_date_symbol(value: Any, published_at: Any = "") -> bool:
+    text = str(value or "").strip()
+    if not _is_six_digit_symbol(text):
+        return False
+    published = str(published_at or "").strip()
+    match = re.match(r"(\d{4})-(\d{2})-(\d{2})", published)
+    if match and text == f"{match.group(1)[2:]}{match.group(2)}{match.group(3)}":
+        return True
+    return False
+
+
+def _clean_report_symbol(value: Any, *, published_at: Any = "") -> str:
+    text = str(value or "").strip()
+    if not _is_six_digit_symbol(text):
+        return ""
+    if _is_report_date_symbol(text, published_at):
+        return ""
+    return text
+
+
+def _derive_title_from_content(content: Any, *, category: str = "") -> str:
+    text = _clean_metadata_text(content, limit=320)
+    if not text:
+        return ""
+    text = re.sub(r"^(?:▶|■|●|▪|[-–—])\s*", "", text).strip()
+    if len(text) < 4:
+        return ""
+    if len(text) > 96:
+        text = text[:96].rstrip()
+    return text
+
+
+def _clean_report_title(value: Any, *, content: Any = "", category: str = "") -> str:
+    title = _clean_metadata_text(value, limit=140)
+    bad_title = (
+        not title
+        or _is_html_artifact(value)
+        or title.lower() in {"report", "리포트", "brief"}
+    )
+    if bad_title:
+        derived = _derive_title_from_content(content, category=category)
+        if derived:
+            return derived
+        label = str(category or "report").strip() or "report"
+        return label[:120]
+    return title[:140]
 
 
 def _parse_date(text: str) -> str:
@@ -48,8 +249,819 @@ def _parse_date(text: str) -> str:
 
 
 def _parse_symbol(text: str) -> str:
-    match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
-    return match.group(1) if match else ""
+    for match in re.finditer(r"(?<!\d)(\d{6})(?!\d)", str(text or "")):
+        candidate = match.group(1)
+        if not _is_probable_short_date_symbol(candidate):
+            return candidate
+    return ""
+
+
+def _clean_company_candidate(value: Any) -> str:
+    text = _clean_company_name(value)
+    if not text:
+        return ""
+    text = re.sub(r"(?<=기술분석보고서)\s+", "", text)
+    noisy_markers = (
+        "www.",
+        ".com",
+        "issue",
+        "news",
+        "earnings",
+        "preview",
+        "review",
+        "comment",
+        "update",
+        "earnings review",
+        "기업코멘트",
+        "기업분석",
+        "기술분석보고서",
+        "리서치센터",
+        "price trend",
+        "investment",
+        "securities",
+        "판단",
+        "예상",
+        "수혜",
+        "stock data",
+        "company data",
+    )
+    if any(marker in text.lower() for marker in noisy_markers):
+        company_tokens = re.findall(r"[가-힣A-Za-z][가-힣A-Za-z0-9&.\-]{1,24}", text)
+        company_tokens = [
+            token
+            for token in company_tokens
+            if token.lower()
+            not in {
+                "기업분석",
+                "기업코멘트",
+                "산업분석",
+                "리포트",
+                "목표주가",
+                "현재주가",
+                "리서치센터",
+                "price",
+                "trend",
+                "earnings",
+                "preview",
+                "review",
+                "comment",
+                "update",
+                "investment",
+                "securities",
+                "ds",
+            }
+            and not re.fullmatch(r"\d+", token)
+            and not (re.search(r"\d", token) and not re.search(r"[가-힣]", token))
+            and "@" not in token
+            and not re.fullmatch(
+                r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:\.[a-z]{2,})?",
+                token.lower(),
+            )
+            and not any(
+                marker in token
+                for marker in ("기업분석", "기업코멘트", "산업분석", "리서치센터")
+            )
+        ]
+        if company_tokens:
+            suffix = company_tokens[-1].rstrip(".").lower()
+            if (
+                suffix in {"ent", "inc", "corp", "co", "ltd"}
+                and len(company_tokens) >= 2
+            ):
+                text = f"{company_tokens[-2]} {company_tokens[-1]}".strip()
+            else:
+                text = company_tokens[-1]
+        else:
+            return ""
+    if len(text) > 36:
+        return ""
+    lower = text.lower()
+    bad_markers = (
+        "목표주가",
+        "현재가",
+        "현재주가",
+        "액면가",
+        "자본금",
+        "시가총액",
+        "투자의견",
+        "영업이익",
+        "매출액",
+        "컨센서스",
+        "수익모델",
+        "구조적",
+        "계절적",
+        "analyst",
+        "research",
+        "company data",
+        "stock data",
+        "buy",
+        "hold",
+        "sell",
+        "not rated",
+        "trading buy",
+    )
+    if any(marker in lower for marker in bad_markers):
+        return ""
+    if re.search(r"[0-9][0-9,]{2,}\s*(?:원|억원|조원|%)", text):
+        return ""
+    text = re.split(
+        r"\s+(?:\d{4}[./-]\d{1,2}[./-]\d{1,2}|20\d{2}|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    text = re.split(
+        r"\s+(?:투자의견|목표주가|현재주가|Analyst|BUY|HOLD|SELL|Not Rated|Trading Buy|매수|중립)",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    tokens = text.split()
+    if len(tokens) > 1 and any(
+        token.lower().strip(":/_-")
+        in {"earnings", "preview", "review", "results", "comment", "company", "brief"}
+        for token in tokens[:-1]
+    ):
+        text = tokens[-1]
+    if re.fullmatch(r"[가-힣](?:\s+[가-힣]){2,}[가-힣A-Za-z0-9&.\-]*", text):
+        text = re.sub(r"(?<=[가-힣])\s+(?=[가-힣])", "", text)
+    text = re.sub(r"(?<=[A-Za-z])\s+(?=[가-힣])", "", text)
+    if not text or _is_generic_company_name(text):
+        return ""
+    return text[:36]
+
+
+def _clean_broker_name(value: Any) -> str:
+    text = _clean_metadata_text(value, limit=60)
+    if not text or _is_html_artifact(text):
+        return ""
+    text = text.replace("㈜", "(주)")
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"^\(주\)", "", text)
+    text = re.sub(r"\(주\)$", "", text)
+    if not text:
+        return ""
+    aliases = {
+        "KIRS": "한국IR협의회",
+        "한국IR협의회": "한국IR협의회",
+        "나이스평가정보": "나이스평가정보",
+        "NICE평가정보": "나이스평가정보",
+        "서울평가정보": "서울평가정보",
+    }
+    if text in aliases:
+        return aliases[text]
+    if re.search(r"(증권|평가정보|신용평가|IR협의회)$", text):
+        return text[:40]
+    return ""
+
+
+_BROKER_DOMAIN_HINTS: tuple[tuple[str, str], ...] = (
+    ("kirs.or.kr", "한국IR협의회"),
+    ("ibks.com", "IBK투자증권"),
+    ("sks.co.kr", "SK증권"),
+    ("eugenefn.com", "유진투자증권"),
+    ("kiwoom.com", "키움증권"),
+    ("daishin.com", "대신증권"),
+    ("miraeasset.com", "미래에셋증권"),
+    ("hanwha.com", "한화투자증권"),
+    ("hanafn.com", "하나증권"),
+    ("shinhan.com", "신한투자증권"),
+    ("nhqv.com", "NH투자증권"),
+    ("yuantakorea.com", "유안타증권"),
+    ("ds-sec.co.kr", "DS투자증권"),
+)
+
+_STRONG_BROKER_TEXT_HINTS: tuple[tuple[str, str], ...] = (
+    ("yuantakorea.com", "유안타증권"),
+    ("yuanta morning snapshot", "유안타증권"),
+    ("yuanta securities", "유안타증권"),
+    ("yuanta research", "유안타증권"),
+    ("miraeasset.com", "미래에셋증권"),
+    ("mirae asset securities research", "미래에셋증권"),
+    ("mirae asset equity research", "미래에셋증권"),
+)
+
+_ANALYST_EMAIL_HINTS: tuple[tuple[str, str], ...] = (
+    ("younggun.kim", "김영건"),
+    ("un.kim.a@miraeasset.com", "김영건"),
+    ("joohee.kim", "김주희"),
+    ("jinsuk.kim", "김진석"),
+)
+
+
+def _extract_strong_broker_from_text(text: Any) -> str:
+    raw = _to_text(str(text or ""))
+    if not raw:
+        return ""
+    raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", raw)
+    lowered = re.sub(r"\s+", " ", raw).strip().lower()
+    compact_no_space = re.sub(r"\s+", "", lowered)
+    for marker, broker in _STRONG_BROKER_TEXT_HINTS:
+        marker_lower = marker.lower()
+        marker_compact = re.sub(r"\s+", "", marker_lower)
+        if marker_lower in lowered or marker_compact in compact_no_space:
+            return broker
+    return ""
+
+
+def _looks_like_garbled_pdf_text(text: Any) -> bool:
+    sample = str(text or "")[:12000]
+    if len(sample) < 120:
+        return False
+    controls = sum(
+        1 for char in sample if ord(char) < 32 and char not in {"\n", "\r", "\t"}
+    )
+    unusual_ranges = (
+        ("\u0500", "\u052f"),
+        ("\u0580", "\u05ff"),
+        ("\u0980", "\u09ff"),
+        ("\u0a00", "\u0a7f"),
+        ("\u0b00", "\u0b7f"),
+        ("\u0f00", "\u0fff"),
+    )
+    unusual = sum(
+        1
+        for char in sample
+        if any(start <= char <= end for start, end in unusual_ranges)
+    )
+    hangul = sum(1 for char in sample if "\uac00" <= char <= "\ud7a3")
+    length = max(len(sample), 1)
+    return (
+        controls / length > 0.01
+        or (unusual > 30 and hangul / length < 0.04)
+        or ("\x01" in sample and unusual > 10)
+    )
+
+
+def _extract_analyst_from_email_hint(text: Any) -> str:
+    compact = re.sub(r"\s+", "", _to_text(str(text or "")).lower())
+    if not compact:
+        return ""
+    for marker, analyst in _ANALYST_EMAIL_HINTS:
+        if marker in compact:
+            return analyst
+    return ""
+
+
+def _extract_broker_from_text(text: Any) -> str:
+    raw = _to_text(str(text or ""))
+    if not raw:
+        return ""
+    raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", raw)
+    compact = re.sub(r"\s+", " ", raw).strip()
+    compact_no_space = re.sub(r"\s+", "", raw).lower()
+    strong_broker = _extract_strong_broker_from_text(raw)
+    if strong_broker:
+        return strong_broker
+    for marker, broker in _BROKER_DOMAIN_HINTS:
+        if marker in compact_no_space:
+            return broker
+
+    match = re.search(
+        r"([가-힣A-Za-z0-9]+(?:투자)?증권)",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        broker = _clean_broker_name(match.group(1))
+        if broker:
+            return broker
+
+    institution_patterns = (
+        r"작\s*성\s*기\s*관\s*([가-힣A-Za-z0-9()㈜.\s]{0,24}?평가정보(?:\(주\)|㈜)?)",
+        r"작\s*성\s*기\s*관\s*([가-힣A-Za-z0-9()㈜.\s]{0,24}?신용평가(?:\(주\)|㈜)?)",
+        r"(한국\s*IR\s*협의회|KIRS)",
+    )
+    for pattern in institution_patterns:
+        match = re.search(pattern, compact, flags=re.IGNORECASE)
+        if match:
+            broker = _clean_broker_name(match.group(1))
+            if broker:
+                return broker
+    return ""
+
+
+def _company_from_symbol_map(symbol: str, symbol_names: dict[str, str]) -> str:
+    code = str(symbol or "").strip()
+    if not code:
+        return ""
+    return _clean_company_candidate(symbol_names.get(code, ""))
+
+
+def _extract_company_symbol_from_text(
+    text: Any,
+    *,
+    symbol_names: dict[str, str] | None = None,
+    published_at: str = "",
+) -> tuple[str, str]:
+    raw = _to_text(str(text or ""))
+    if not raw:
+        return "", ""
+    raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        return "", ""
+
+    known = dict(symbol_names or {})
+
+    def _valid_symbol(value: Any) -> str:
+        return _clean_report_symbol(value, published_at=published_at)
+
+    def _pick(symbol: Any, company: Any = "") -> tuple[str, str] | None:
+        code = _valid_symbol(symbol)
+        if not code:
+            return None
+        mapped_company = _company_from_symbol_map(code, known)
+        candidate_company = _clean_company_candidate(company)
+        if candidate_company:
+            if mapped_company and (
+                mapped_company in candidate_company or candidate_company in mapped_company
+            ):
+                return code, mapped_company
+            return code, candidate_company
+        if mapped_company:
+            return code, mapped_company
+        return code, ""
+
+    patterns: tuple[re.Pattern[str], ...] = (
+        re.compile(
+            r"기술분석보고서\s*([가-힣A-Za-z][가-힣A-Za-z0-9&.\- ]{1,30})"
+            r"\s*\(\s*(\d{6})\s*(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?\s*\)",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"([가-힣A-Za-z][가-힣A-Za-z0-9&.\- ]{1,30})\s*"
+            r"\(\s*(\d{6})\s*(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?\s*\)",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"\(\s*(\d{6})\s*(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?\s*\)\s*"
+            r"([가-힣A-Za-z][가-힣A-Za-z0-9&.\- ]{1,30})",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?<!\d)(\d{6})(?!\d)\s*[·|/]\s*"
+            r"(?:[가-힣A-Za-z&/\-]{1,24}\s+)?"
+            r"([가-힣A-Za-z][가-힣A-Za-z0-9&.\-]{1,30})",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"([가-힣][가-힣A-Za-z0-9&.\-]{1,24})\s+"
+            r"(?<!\d)(\d{6})(?!\d)"
+            r"(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?",
+            flags=re.IGNORECASE,
+        ),
+    )
+
+    for pattern in patterns:
+        for match in pattern.finditer(raw[:12000]):
+            if pattern.pattern.startswith(("([가-힣", "기술분석보고서")):
+                result = _pick(match.group(2), match.group(1))
+            else:
+                result = _pick(match.group(1), match.group(2))
+            if result and (result[1] or result[0] in known):
+                return result
+
+    for match in re.finditer(r"(?<!\d)(\d{6})(?!\d)", raw[:12000]):
+        code = _valid_symbol(match.group(1))
+        if code and code in known:
+            return code, _company_from_symbol_map(code, known)
+
+    company_matches: list[tuple[int, int, str, str]] = []
+    head = raw[:1200]
+    for code, name in known.items():
+        company = _clean_company_candidate(name)
+        if not _is_six_digit_symbol(code) or len(company) < 2:
+            continue
+        idx = head.find(company)
+        if idx >= 0:
+            company_matches.append((idx, -len(company), code, company))
+    if company_matches:
+        company_matches.sort()
+        _, _, code, company = company_matches[0]
+        return code, company
+    return "", ""
+
+
+def _clean_analyst_name(value: Any) -> str:
+    text = _clean_metadata_text(value, limit=60)
+    if not text:
+        return ""
+    if text.startswith("부서:"):
+        return _clean_department_author_label(text[3:])
+    if re.fullmatch(r"[가-힣](?:\s*[가-힣]){1,4}", text):
+        text = re.sub(r"\s+", "", text)
+    match = re.search(r"[가-힣]{2,5}|[A-Za-z][A-Za-z .]{2,30}", text)
+    if not match:
+        return ""
+    name = str(match.group(0) or "").strip(" .")
+    if name in {
+        "Analyst",
+        "애널리스트",
+        "Research",
+        "센터",
+        "자료",
+        "리서치",
+        "리서치센터",
+        "리서치본부",
+        "투자전략",
+        "작성자",
+        "연구원",
+        "책임",
+        "정보",
+        "평가정보",
+        "본인의",
+        "당사는",
+        "당사",
+        "외부",
+        "경제",
+        "중동",
+        "전망",
+        "우라늄",
+        "재생에너지",
+        "시장",
+        "채권",
+        "금리",
+        "반도체",
+        "원자재",
+        "개발",
+        "발간일자",
+        "금융",
+        "서비스",
+        "미드",
+        "스몰캡",
+        "종합",
+        "글로벌",
+        "정보팀",
+        "지표는",
+        "전망의",
+        "본읶의",
+        "세계경제는",
+        "대성의",
+        "충격의",
+        "전반의",
+        "비축유",
+        "목표는",
+        "영향",
+        "여파로",
+        "전망치는",
+        "산업으로의",
+        "사태의",
+        "성장률은",
+        "사절단은",
+        "성장률",
+        "전반은",
+    }:
+        return ""
+    if any(marker in name for marker in ("리서치", "센터", "본부", "본인의", "본읶")):
+        return ""
+    if name.endswith(("의", "는", "로")):
+        return ""
+    if len(name) >= 4 and name.endswith("은"):
+        return ""
+    if len(name) < 2:
+        return ""
+    return name[:40]
+
+
+def _clean_department_author_label(value: Any, *, broker: str = "") -> str:
+    text = _clean_metadata_text(value, limit=100)
+    if not text:
+        return ""
+    text = re.sub(r"^(?:작성자|작성\s*자)\s*[:：]?\s*", "", text).strip()
+    text = text.strip("()[]{} ")
+    text = text.replace("Research Center", "리서치센터")
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*[・·]\s*", "·", text)
+    text = re.sub(r"^(?:당사|본사)\s*", "", text).strip()
+    text = re.sub(r"\s*(?:에서|가|는|은|의)$", "", text).strip()
+
+    allowed_markers = (
+        "리서치센터",
+        "리서치본부",
+        "투자분석부",
+        "투자전략정보팀",
+        "기간산업분석부",
+        "혁신기업분석부",
+        "글로벌전략팀",
+        "FICC 리서치부",
+        "해외주식분석실",
+    )
+    if not any(marker in text for marker in allowed_markers):
+        return ""
+    if re.search(r"[A-Za-z0-9._%+-]+@", text):
+        return ""
+
+    clean_broker = _clean_broker_name(broker)
+    if clean_broker and clean_broker not in text:
+        text = f"{clean_broker} {text}".strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) < 4:
+        return ""
+    return f"부서: {text[:80]}"
+
+
+def _extract_analyst_from_text(text: Any) -> str:
+    raw = _to_text(str(text or ""))
+    if not raw:
+        return ""
+    raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        return ""
+
+    patterns: tuple[tuple[str, int], ...] = (
+        (
+            r"(?:애널리스트|Analyst|책임연구위원|선임연구위원|연구위원|연구원|RA)"
+            r"\s*[:：]?\s*([가-힣]{2,5})\s*"
+            r"(?:0\d{1,2}|[A-Za-z0-9._%+-]+\s*@)",
+            1,
+        ),
+        (
+            r"(?:Strategist|Economist|Analyst|Quant|RA)\s+"
+            r"([가-힣]\s*[가-힣]\s*[가-힣]?(?:\s*[가-힣])?)"
+            r"\s*,?\s*(?:CFA|Ph\.?D\.?)?\s+"
+            r"[A-Za-z0-9._%+-]+\s*@",
+            1,
+        ),
+        (
+            r"(?:애널리스트|금융투자분석사|조사분석담당자)\s*"
+            r"\(\s*([가-힣]{2,5})\s*\)",
+            1,
+        ),
+        (r"(?:작성자|작성\s*자)\s*\(\s*([가-힣]{2,5})\s*\)", 1),
+        (
+            r"([가-힣]{2,5})\s*(?:책임\s*)?(?:책임연구원|연구원|연구위원)\s*"
+            r"(?:발간일자|작성일|[0-9]{4}).{0,90}?"
+            r"[A-Za-z0-9._%+-]+\s*@",
+            1,
+        ),
+        (
+            r"(?:[가-힣A-Za-z/·\s]{2,30}팀)\s+([가-힣]{2,5})\s+"
+            r"\d{2,4}\)?\s*\d{3,4}[-_\s]*\d{4}[_\s/]*"
+            r"[A-Za-z0-9._%+-]+\s*@",
+            1,
+        ),
+        (
+            r"(?:[가-힣A-Za-z&·/\- ]{1,30}팀)\s+([가-힣]{2,5})\s+"
+            r"(?:Analyst|Strategist|Economist|RA)\s+"
+            r"[A-Za-z0-9._%+-]+\s*@",
+            1,
+        ),
+        (
+            r"(?:미드\s*/\s*스몰캡|미드스몰캡|스몰캡|퀀트|전략)\s+"
+            r"([가-힣]{2,5})\s+[A-Za-z0-9._%+-]+\s*@",
+            1,
+        ),
+        (
+            r"(?:리서치센터|투자전략팀|Research Center).{0,40}?"
+            r"(?:채권전략|투자전략|경제|FX|퀀트|Quant|시황|전략)\s*([가-힣]{2,5})",
+            1,
+        ),
+        (
+            r"(?:채권전략|투자전략|경제|FX|퀀트|Quant|시황|전략)\s+([가-힣]{2,5})\s*(?:/|\\||\d{4}|$)",
+            1,
+        ),
+        (r"(?:작성자|작성\s*자)\s*[:：]?\s*([가-힣]{2,5})", 1),
+        (
+            r"작\s*성\s*기\s*관.{0,60}?([가-힣]{2,5})\s*(?:책임\s*)?작\s*성\s*자",
+            1,
+        ),
+        (
+            r"작\s*성\s*기\s*관.{0,60}?([가-힣]{2,5})\s*(?:책임)?\s*연구원",
+            1,
+        ),
+        (
+            r"([가-힣]{2,5})\s*/\s*[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Za-z]{2,}",
+            1,
+        ),
+        (
+            r"(?<![가-힣/])([가-힣]{2,5})\s*/\s*"
+            r"(?:Strategist|Economist|Analyst|RA|Researcher|Quant|Global|EM|DM)"
+            r"[A-Za-z .&\-]{0,30}\s+"
+            r"[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+",
+            1,
+        ),
+        (
+            r"([가-힣]{2,5})\s+\d{2,4}(?:[-)]?\s*\d{3,4})?(?:-\d{4})?\s*/?\s*[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Za-z]{2,}",
+            1,
+        ),
+        (
+            r"(?<![가-힣])([가-힣]\s*[가-힣]\s*[가-힣]?(?:\s*[가-힣])?)\s+\d{2,4}(?:[-)]?\s*\d{3,4})?(?:-\d{4})?\s*/?\s*[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Za-z]{2,}",
+            1,
+        ),
+        (
+            r"(?<![가-힣])([가-힣]{2,5})\s+"
+            r"[가-힣A-Za-z&·/.\- ]{2,42}\s+"
+            r"\d{2,4}(?:[-)]?\s*\d{3,4})?(?:-\d{4})?\s*/?\s*"
+            r"[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+",
+            1,
+        ),
+        (
+            r"([가-힣]{2,5})\s+\d{3,4}\s*/\s*[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Za-z]{2,}",
+            1,
+        ),
+        (
+            r"(?:[가-힣A-Za-z/&.\- ]{0,24})\s([가-힣]{2,5})\s+[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+",
+            1,
+        ),
+        (
+            r"([가-힣]{2,5})\s+[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Za-z]{2,}",
+            1,
+        ),
+        (
+            r"([가-힣]{2,5})\s*(?:Ph\.?D\.?)?\s+[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+",
+            1,
+        ),
+        (r"담당자\s*[:：]\s*([가-힣]{2,5})(?:\s*[,/]\s*[가-힣]{2,5})?", 1),
+    )
+    windows = [raw[:12000]]
+    if len(raw) > 12000:
+        windows.append(raw[-12000:])
+    for keyword in (
+        "작성자",
+        "작성 자",
+        "@",
+        "Analyst",
+        "애널리스트",
+        "연구위원",
+        "연구원",
+        "담당자",
+        "Strategist",
+        "스몰캡",
+        "작성자(",
+    ):
+        start = 0
+        while True:
+            idx = raw.find(keyword, start)
+            if idx < 0:
+                break
+            windows.append(raw[max(idx - 300, 0) : idx + 700])
+            start = idx + len(keyword)
+            if len(windows) >= 24:
+                break
+        if len(windows) >= 24:
+            break
+
+    seen: set[str] = set()
+    for window in windows:
+        if not window or window in seen:
+            continue
+        seen.add(window)
+        for pattern, group_idx in patterns:
+            match = re.search(pattern, window, flags=re.IGNORECASE)
+            if match:
+                name = _clean_analyst_name(match.group(group_idx))
+                if name:
+                    return name
+        name = _extract_analyst_from_email_hint(window)
+        if name:
+            return name
+    return ""
+
+
+def _extract_department_author_from_text(text: Any, *, broker: str = "") -> str:
+    raw = _to_text(str(text or ""))
+    if not raw:
+        return ""
+    raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        return ""
+
+    patterns: tuple[tuple[str, int], ...] = (
+        (r"작성자\s*\(\s*([^)]+?리서치(?:센터|본부)[^)]*)\)", 1),
+        (r"\[(리서치본부\s*[가-힣A-Za-z0-9/\s]{0,30}팀)\]", 1),
+        (
+            r"(?:│|\|)\s*\d{4}\.?\s*\d{1,2}\.?\s*\d{1,2}\s*(?:│|\|)\s*"
+            r"([가-힣A-Za-z・·/\s]{2,60}부)\b",
+            1,
+        ),
+        (r"(기간산업분석부\s*[・·]\s*혁신기업분석부)", 1),
+        (
+            r"(투자분석부|투자전략정보팀|글로벌전략팀|FICC\s+리서치부|해외주식분석실)",
+            1,
+        ),
+        (r"(?:당사|본사)?\s*(리서치센터|리서치본부)", 1),
+        (r"(Research Center)", 1),
+    )
+    windows = [raw[:12000]]
+    if len(raw) > 12000:
+        windows.append(raw[-12000:])
+    for keyword in (
+        "작성자(",
+        "리서치센터",
+        "리서치본부",
+        "투자분석부",
+        "투자전략정보팀",
+        "Research Center",
+        "기간산업분석부",
+        "FICC",
+    ):
+        start = 0
+        while True:
+            idx = raw.find(keyword, start)
+            if idx < 0:
+                break
+            windows.append(raw[max(idx - 260, 0) : idx + 520])
+            start = idx + len(keyword)
+            if len(windows) >= 24:
+                break
+        if len(windows) >= 24:
+            break
+
+    seen: set[str] = set()
+    for window in windows:
+        if not window or window in seen:
+            continue
+        seen.add(window)
+        for pattern, group_idx in patterns:
+            match = re.search(pattern, window, flags=re.IGNORECASE)
+            if not match:
+                continue
+            label = _clean_department_author_label(match.group(group_idx), broker=broker)
+            if label:
+                return label
+    return ""
+
+
+def _infer_default_department_author_from_context(
+    *,
+    broker: Any,
+    category: Any,
+    text: Any,
+) -> str:
+    clean_broker = _clean_broker_name(broker)
+    category_text = str(category or "").strip()
+    if not clean_broker or category_text == "company_analysis":
+        return ""
+    raw = _to_text(str(text or ""))
+    if not raw:
+        return ""
+    lowered = raw.lower()
+
+    rules: tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...] = (
+        (
+            "SK증권",
+            ("market_info", "invest_info", "economy_analysis"),
+            "리서치센터",
+            ("SK증권", "SK 증권", "sks.co.kr", "Quantiwise, SK"),
+        ),
+        (
+            "다올투자증권",
+            ("market_info",),
+            "리서치센터",
+            ("buly.kr", "daolfn.com", "Daol", "다올"),
+        ),
+        (
+            "다올투자증권",
+            ("bond_analysis",),
+            "리서치센터",
+            ("KR Market KR Bond", "KR Credit", "daolfn.com"),
+        ),
+        (
+            "유안타증권",
+            ("market_info",),
+            "리서치센터",
+            ("Yuanta Morning Snapshot", "Yuanta", "유안타"),
+        ),
+        (
+            "유안타증권",
+            ("bond_analysis",),
+            "리서치센터",
+            ("금융투자분석사의 확인", "Appendix"),
+        ),
+        (
+            "IBK투자증권",
+            ("market_info", "invest_info"),
+            "투자분석부",
+            ("IBKS RESEARCH", "IBK투자증권", "Quantiwise"),
+        ),
+        (
+            "IBK투자증권",
+            ("bond_analysis", "economy_analysis"),
+            "리서치본부",
+            ("IBKS RESEARCH", "IBKS Bond"),
+        ),
+        (
+            "키움증권",
+            ("invest_info",),
+            "리서치센터",
+            ("키움", "Kiwoom"),
+        ),
+        (
+            "하나증권",
+            ("invest_info",),
+            "해외주식분석실",
+            ("해외주식분석실",),
+        ),
+    )
+    for rule_broker, categories, department, markers in rules:
+        if clean_broker != rule_broker or category_text not in categories:
+            continue
+        if any(marker.lower() in lowered for marker in markers):
+            return _clean_department_author_label(department, broker=clean_broker)
+    return ""
 
 
 def _canonical_url(url: str) -> str:
@@ -434,7 +1446,8 @@ class NaverReportCrawlerConfig:
     llm_bridge_url: str = ""
     llm_bridge_token: str = ""
     llm_bridge_timeout_ms: int = 60000
-    llm_model: str = "gpt-5.3-codex"
+    llm_model: str = "gpt-5.5"
+    llm_facts_enabled: bool = False
 
 
 class NaverReportRepository:
@@ -446,6 +1459,7 @@ class NaverReportRepository:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
@@ -517,6 +1531,12 @@ class NaverReportRepository:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_reports_symbol_date ON reports(symbol, published_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reports_broker_date ON reports(broker, published_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reports_analyst_date ON reports(analyst, published_at)"
             )
             conn.execute(
                 """
@@ -730,6 +1750,13 @@ class NaverReportRepository:
     ) -> int:
         now = utc_now_iso()
         text = content.strip()
+        normalized_title = _clean_report_title(
+            title,
+            content=text,
+            category=category,
+        )
+        normalized_company_name = _clean_company_name(company_name)
+        normalized_symbol = _clean_report_symbol(symbol, published_at=published_at)
         chunk_rows = list(chunks or [])
         if not chunk_rows:
             plain_chunks = _split_chunks(
@@ -749,6 +1776,45 @@ class NaverReportRepository:
             or hashlib.sha256(str(pdf_url or "").encode("utf-8")).hexdigest()
         )
         with self._connect() as conn:
+            if category == "company_analysis":
+                symbol_rows = conn.execute(
+                    "SELECT symbol, company_name, source, confidence FROM symbol_directory"
+                ).fetchall()
+                symbol_names: dict[str, str] = {}
+                symbol_meta: dict[str, tuple[str, float]] = {}
+                for symbol_row in symbol_rows:
+                    code = str(symbol_row["symbol"] or "").strip()
+                    name = _clean_company_candidate(symbol_row["company_name"])
+                    if not _is_six_digit_symbol(code) or not name:
+                        continue
+                    symbol_names[code] = name
+                    symbol_meta[code] = (
+                        str(symbol_row["source"] or ""),
+                        float(symbol_row["confidence"] or 0.0),
+                    )
+                inferred_symbol, inferred_company = _extract_company_symbol_from_text(
+                    f"{normalized_title}\n{text[:12000]}\n{text[-12000:] if len(text) > 12000 else ''}",
+                    symbol_names=symbol_names,
+                    published_at=published_at,
+                )
+                if inferred_symbol and inferred_symbol == normalized_symbol:
+                    mapped_source, mapped_confidence = symbol_meta.get(
+                        inferred_symbol,
+                        ("", 0.0),
+                    )
+                    selected_company = _choose_identity_company(
+                        symbol=inferred_symbol,
+                        inferred_company=inferred_company,
+                        mapped_company=symbol_names.get(inferred_symbol, ""),
+                        mapped_source=mapped_source,
+                        mapped_confidence=mapped_confidence,
+                    )
+                    if selected_company:
+                        normalized_company_name = selected_company
+            elif category != "company_analysis":
+                normalized_symbol = ""
+                normalized_company_name = ""
+
             row = conn.execute(
                 "SELECT report_id, created_at FROM reports WHERE doc_id = ? OR pdf_url = ?",
                 (doc_id, pdf_url),
@@ -769,11 +1835,11 @@ class NaverReportRepository:
                         source_url,
                         detail_url,
                         pdf_url,
-                        title,
-                        company_name,
+                        normalized_title,
+                        normalized_company_name,
                         broker,
                         analyst,
-                        symbol,
+                        normalized_symbol,
                         published_at,
                         crawled_at,
                         pdf_sha256,
@@ -804,11 +1870,11 @@ class NaverReportRepository:
                         category,
                         source_url,
                         detail_url,
-                        title,
-                        company_name,
+                        normalized_title,
+                        normalized_company_name,
                         broker,
                         analyst,
-                        symbol,
+                        normalized_symbol,
                         published_at,
                         crawled_at,
                         pdf_sha256,
@@ -826,8 +1892,8 @@ class NaverReportRepository:
 
             self._upsert_symbol_directory_with_conn(
                 conn=conn,
-                symbol=symbol,
-                company_name=company_name,
+                symbol=normalized_symbol,
+                company_name=normalized_company_name,
                 market="",
                 source="naver_reports",
                 confidence=0.8,
@@ -895,7 +1961,17 @@ class NaverReportRepository:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 company_name=CASE
-                    WHEN excluded.company_name <> '' THEN excluded.company_name
+                    WHEN excluded.company_name <> ''
+                      AND (
+                        TRIM(COALESCE(symbol_directory.company_name, '')) = ''
+                        OR excluded.confidence >= symbol_directory.confidence
+                        OR (
+                          symbol_directory.source NOT IN ('pykrx', 'krx', 'krx_lookup')
+                          AND excluded.source IN ('metadata_repair', 'pykrx', 'krx', 'krx_lookup')
+                          AND excluded.confidence >= 0.85
+                        )
+                      )
+                    THEN excluded.company_name
                     ELSE symbol_directory.company_name
                 END,
                 market=CASE
@@ -907,7 +1983,9 @@ class NaverReportRepository:
                     ELSE symbol_directory.status
                 END,
                 source=CASE
-                    WHEN excluded.source <> '' THEN excluded.source
+                    WHEN excluded.source <> ''
+                      AND excluded.confidence >= symbol_directory.confidence
+                    THEN excluded.source
                     ELSE symbol_directory.source
                 END,
                 confidence=CASE
@@ -1043,6 +2121,31 @@ class NaverReportRepository:
                 "updated": 0,
             }
 
+        if not rows:
+            try:
+                with self._connect() as conn:
+                    existing_rows = conn.execute(
+                        """
+                        SELECT DISTINCT symbol FROM reports
+                        WHERE TRIM(COALESCE(symbol, '')) <> ''
+                        UNION
+                        SELECT DISTINCT symbol FROM symbol_directory
+                        WHERE TRIM(COALESCE(symbol, '')) <> ''
+                        """
+                    ).fetchall()
+                for row in existing_rows:
+                    code = str(row["symbol"] or "").strip()
+                    if not _is_six_digit_symbol(code):
+                        continue
+                    try:
+                        name = _clean_company_name(stock.get_market_ticker_name(code))
+                    except Exception:
+                        name = ""
+                    if name:
+                        rows.append((code, name, "KRX_LOOKUP"))
+            except Exception as exc:
+                errors.append(f"known_symbols: {exc}")
+
         merged: dict[str, tuple[str, str]] = {}
         for code, name, market in rows:
             if not _is_six_digit_symbol(code) or not name:
@@ -1076,6 +2179,279 @@ class NaverReportRepository:
             "errors": errors[:12],
             "as_of": as_of_date,
             "updated_at": now,
+        }
+
+    def repair_metadata_quality(self, limit: int = 0) -> dict[str, Any]:
+        max_rows = max(int(limit), 0)
+        now = utc_now_iso()
+        updated_reports = 0
+        cleaned_titles = 0
+        cleaned_company_names = 0
+        cleaned_brokers = 0
+        cleaned_analysts = 0
+        cleared_symbols = 0
+        backfilled_symbols = 0
+        backfilled_company_names = 0
+        backfilled_brokers = 0
+        backfilled_analysts = 0
+        corrected_symbols = 0
+        corrected_company_names = 0
+        corrected_brokers = 0
+        cleaned_symbol_directory = 0
+        deleted_symbol_directory = 0
+
+        with self._connect() as conn:
+            symbol_rows = conn.execute(
+                "SELECT symbol, company_name, source, confidence FROM symbol_directory"
+            ).fetchall()
+            clean_symbol_map: dict[str, str] = {}
+            clean_symbol_meta: dict[str, tuple[str, float]] = {}
+            for row in symbol_rows:
+                code = str(row["symbol"] or "").strip()
+                name = _clean_company_candidate(row["company_name"])
+                if not _is_six_digit_symbol(code) or not name:
+                    conn.execute("DELETE FROM symbol_directory WHERE symbol = ?", (code,))
+                    deleted_symbol_directory += 1
+                    continue
+                clean_symbol_map[code] = name
+                clean_symbol_meta[code] = (
+                    str(row["source"] or ""),
+                    float(row["confidence"] or 0.0),
+                )
+                if name != str(row["company_name"] or ""):
+                    conn.execute(
+                        """
+                        UPDATE symbol_directory
+                        SET company_name = ?, updated_at = ?
+                        WHERE symbol = ?
+                        """,
+                        (name, now, code),
+                    )
+                    cleaned_symbol_directory += 1
+
+            sql = """
+                SELECT report_id, category, title, company_name, broker, analyst,
+                       symbol, published_at, content, pdf_url
+                FROM reports
+                ORDER BY report_id ASC
+            """
+            params: tuple[Any, ...] = ()
+            if max_rows > 0:
+                sql += " LIMIT ?"
+                params = (max_rows,)
+
+            report_rows = conn.execute(sql, params).fetchall()
+            for row in report_rows:
+                report_id = int(row["report_id"])
+                category = str(row["category"] or "unknown")
+                current_title = str(row["title"] or "")
+                current_company_name = str(row["company_name"] or "")
+                current_broker = str(row["broker"] or "")
+                current_analyst = str(row["analyst"] or "")
+                current_symbol = str(row["symbol"] or "").strip()
+                published_at = str(row["published_at"] or "")
+                content = str(row["content"] or "")
+                content_tail = content[-12000:] if len(content) > 12000 else ""
+                metadata_text = f"{current_title}\n{content[:12000]}\n{content_tail}"
+
+                title = _clean_report_title(
+                    current_title,
+                    content=content,
+                    category=category,
+                )
+                symbol = _clean_report_symbol(
+                    current_symbol,
+                    published_at=published_at,
+                )
+                company_name = _clean_company_candidate(current_company_name)
+                broker = _clean_broker_name(current_broker)
+                analyst = _clean_analyst_name(current_analyst)
+
+                if category != "company_analysis":
+                    symbol = ""
+                    company_name = ""
+
+                inferred_symbol = ""
+                inferred_company = ""
+                if category == "company_analysis":
+                    inferred_symbol, inferred_company = _extract_company_symbol_from_text(
+                        metadata_text,
+                        symbol_names=clean_symbol_map,
+                        published_at=published_at,
+                    )
+                    mapped_source, mapped_confidence = clean_symbol_meta.get(
+                        inferred_symbol,
+                        ("", 0.0),
+                    )
+                    resolved_inferred_company = _choose_identity_company(
+                        symbol=inferred_symbol,
+                        inferred_company=inferred_company,
+                        mapped_company=clean_symbol_map.get(inferred_symbol, ""),
+                        mapped_source=mapped_source,
+                        mapped_confidence=mapped_confidence,
+                    )
+                    if inferred_symbol and not symbol:
+                        symbol = inferred_symbol
+                        backfilled_symbols += 1
+                    elif inferred_symbol and symbol != inferred_symbol:
+                        symbol = inferred_symbol
+                        corrected_symbols += 1
+
+                    if resolved_inferred_company:
+                        if not company_name:
+                            company_name = resolved_inferred_company
+                            backfilled_company_names += 1
+                        elif company_name != resolved_inferred_company:
+                            company_name = resolved_inferred_company
+                            corrected_company_names += 1
+
+                    if symbol and symbol in clean_symbol_map:
+                        mapped_company = clean_symbol_map[symbol]
+                        mapped_source, mapped_confidence = clean_symbol_meta.get(
+                            symbol,
+                            ("", 0.0),
+                        )
+                        prefer_mapped = (
+                            mapped_company
+                            and not _company_names_overlap(company_name, mapped_company)
+                            and _is_authoritative_symbol_source(
+                                mapped_source,
+                                mapped_confidence,
+                            )
+                        )
+                        if mapped_company and (
+                            not company_name
+                            or _company_names_overlap(company_name, mapped_company)
+                            or prefer_mapped
+                        ) and company_name != mapped_company:
+                            if company_name:
+                                corrected_company_names += 1
+                            else:
+                                backfilled_company_names += 1
+                            company_name = mapped_company
+
+                    if symbol and symbol not in clean_symbol_map and not company_name:
+                        symbol = ""
+
+                strong_broker = _extract_strong_broker_from_text(metadata_text)
+                if strong_broker and broker != strong_broker:
+                    broker = strong_broker
+                    corrected_brokers += 1
+                elif not broker:
+                    inferred_broker = _extract_broker_from_text(metadata_text)
+                    if inferred_broker:
+                        broker = inferred_broker
+                        backfilled_brokers += 1
+
+                if not analyst:
+                    inferred_analyst = _extract_analyst_from_text(metadata_text)
+                    if inferred_analyst:
+                        analyst = inferred_analyst
+                        backfilled_analysts += 1
+                if not analyst:
+                    inferred_department_author = _extract_department_author_from_text(
+                        metadata_text,
+                        broker=broker or current_broker,
+                    )
+                    if inferred_department_author:
+                        analyst = inferred_department_author
+                        backfilled_analysts += 1
+                if not analyst:
+                    inferred_default_author = _infer_default_department_author_from_context(
+                        broker=broker or current_broker,
+                        category=category,
+                        text=metadata_text,
+                    )
+                    if inferred_default_author:
+                        analyst = inferred_default_author
+                        backfilled_analysts += 1
+
+                identity_verified = bool(
+                    category == "company_analysis"
+                    and symbol
+                    and company_name
+                    and (symbol in clean_symbol_map or inferred_symbol == symbol)
+                )
+
+                if title != current_title:
+                    cleaned_titles += 1
+                if company_name != current_company_name:
+                    cleaned_company_names += 1
+                if broker != current_broker:
+                    cleaned_brokers += 1
+                if symbol != current_symbol:
+                    cleared_symbols += 1
+                if analyst != current_analyst:
+                    cleaned_analysts += 1
+
+                if (
+                    title == current_title
+                    and company_name == current_company_name
+                    and broker == current_broker
+                    and symbol == current_symbol
+                    and analyst == current_analyst
+                ):
+                    if (
+                        identity_verified
+                        and clean_symbol_map.get(symbol) != company_name
+                    ):
+                        self._upsert_symbol_directory_with_conn(
+                            conn=conn,
+                            symbol=symbol,
+                            company_name=company_name,
+                            market="",
+                            source="metadata_repair",
+                            confidence=0.9,
+                            status="active",
+                            verified_at=now,
+                        )
+                        clean_symbol_map[symbol] = company_name
+                        clean_symbol_meta[symbol] = ("metadata_repair", 0.9)
+                    continue
+
+                conn.execute(
+                    """
+                    UPDATE reports
+                    SET title = ?, company_name = ?, broker = ?, analyst = ?, symbol = ?, updated_at = ?
+                    WHERE report_id = ?
+                    """,
+                    (title, company_name, broker, analyst, symbol, now, report_id),
+                )
+                updated_reports += 1
+
+                if identity_verified:
+                    self._upsert_symbol_directory_with_conn(
+                        conn=conn,
+                        symbol=symbol,
+                        company_name=company_name,
+                        market="",
+                        source="metadata_repair",
+                        confidence=0.9,
+                        status="active",
+                        verified_at=now,
+                    )
+                    clean_symbol_map[symbol] = company_name
+                    clean_symbol_meta[symbol] = ("metadata_repair", 0.9)
+
+        return {
+            "status": "ok",
+            "updated_at": now,
+            "scanned_reports": len(report_rows),
+            "updated_reports": updated_reports,
+            "cleaned_titles": cleaned_titles,
+            "cleaned_company_names": cleaned_company_names,
+            "cleaned_brokers": cleaned_brokers,
+            "cleaned_analysts": cleaned_analysts,
+            "cleared_symbols": cleared_symbols,
+            "backfilled_symbols": backfilled_symbols,
+            "backfilled_company_names": backfilled_company_names,
+            "backfilled_brokers": backfilled_brokers,
+            "backfilled_analysts": backfilled_analysts,
+            "corrected_symbols": corrected_symbols,
+            "corrected_company_names": corrected_company_names,
+            "corrected_brokers": corrected_brokers,
+            "cleaned_symbol_directory": cleaned_symbol_directory,
+            "deleted_symbol_directory": deleted_symbol_directory,
         }
 
     def upsert_report_facts(self, report_id: int, facts: dict[str, Any]) -> None:
@@ -1265,10 +2641,159 @@ class NaverReportRepository:
             symbol_row = conn.execute(
                 "SELECT COUNT(*) AS cnt, MAX(updated_at) AS last_updated_at FROM symbol_directory"
             ).fetchone()
+            facts_row = conn.execute(
+                """
+                SELECT
+                  COUNT(*) AS total_facts,
+                  SUM(CASE WHEN target_price_value > 0 THEN 1 ELSE 0 END) AS target_price_count,
+                  SUM(CASE WHEN rating <> 'UNKNOWN' THEN 1 ELSE 0 END) AS rating_count
+                FROM report_facts
+                """
+            ).fetchone()
+            quality_row = conn.execute(
+                """
+                SELECT
+                  SUM(
+                    CASE
+                      WHEN category = 'company_analysis' AND TRIM(company_name) = ''
+                      THEN 1
+                      ELSE 0
+                    END
+                  ) AS missing_company_name_count,
+                  SUM(
+                    CASE
+                      WHEN title LIKE '%<img%'
+                        OR title LIKE '%</%'
+                        OR title LIKE '%<a %'
+                        OR title LIKE '%<span%'
+                        OR title LIKE '%<div%'
+                        OR title LIKE '%<br%'
+                        OR title LIKE '%&lt;img%'
+                        OR title LIKE '%&lt;/%'
+                        OR title LIKE '%&lt;a %'
+                        OR title LIKE '%&lt;span%'
+                        OR title LIKE '%&lt;div%'
+                        OR title LIKE '%&lt;br%'
+                        OR title LIKE '%리포트 보기%'
+                        OR title LIKE '%btn_report.gif%'
+                      THEN 1
+                      ELSE 0
+                    END
+                  ) AS html_title_count,
+                  SUM(
+                    CASE
+                      WHEN company_name LIKE '%<img%'
+                        OR company_name LIKE '%</%'
+                        OR company_name LIKE '%<a %'
+                        OR company_name LIKE '%<span%'
+                        OR company_name LIKE '%<div%'
+                        OR company_name LIKE '%<br%'
+                        OR company_name LIKE '%&lt;img%'
+                        OR company_name LIKE '%&lt;/%'
+                        OR company_name LIKE '%&lt;a %'
+                        OR company_name LIKE '%&lt;span%'
+                        OR company_name LIKE '%&lt;div%'
+                        OR company_name LIKE '%&lt;br%'
+                        OR company_name LIKE '%리포트 보기%'
+                        OR company_name LIKE '%btn_report.gif%'
+                      THEN 1
+                      ELSE 0
+                    END
+                  ) AS html_company_name_count,
+                  SUM(
+                    CASE
+                      WHEN category = 'company_analysis' AND TRIM(symbol) = ''
+                      THEN 1
+                      ELSE 0
+                    END
+                  ) AS missing_symbol_count,
+                  SUM(CASE WHEN TRIM(broker) = '' THEN 1 ELSE 0 END) AS missing_broker_count,
+                  SUM(CASE WHEN TRIM(analyst) = '' THEN 1 ELSE 0 END) AS missing_analyst_count,
+                  SUM(
+                    CASE WHEN TRIM(category) = '' OR category = 'unknown' THEN 1 ELSE 0 END
+                  ) AS unknown_category_count
+                FROM reports
+                """
+            ).fetchone()
+            drift_row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM reports r
+                LEFT JOIN symbol_directory s ON s.symbol = r.symbol
+                WHERE TRIM(r.symbol) <> ''
+                  AND (
+                    s.symbol IS NULL
+                    OR (
+                      TRIM(COALESCE(s.company_name, '')) <> ''
+                      AND TRIM(COALESCE(r.company_name, '')) <> ''
+                      AND s.company_name <> r.company_name
+                    )
+                  )
+                """
+            ).fetchone()
+            identity_rows = conn.execute(
+                """
+                SELECT
+                  r.report_id,
+                  r.symbol,
+                  r.company_name,
+                  r.title,
+                  s.company_name AS directory_name
+                FROM reports r
+                LEFT JOIN symbol_directory s ON s.symbol = r.symbol
+                WHERE r.category = 'company_analysis'
+                  AND TRIM(COALESCE(r.symbol, '')) <> ''
+                ORDER BY r.published_at DESC, r.report_id DESC
+                """
+            ).fetchall()
+            directory_quality_rows = conn.execute(
+                "SELECT symbol, company_name FROM symbol_directory"
+            ).fetchall()
             category_counts = {
                 str(item["category"] or "unknown"): int(item["cnt"] or 0)
                 for item in cat_rows
             }
+            generic_symbol_directory_count = sum(
+                1
+                for item in directory_quality_rows
+                if not _clean_company_candidate(item["company_name"])
+            )
+            identity_suspect_count = 0
+            identity_drift_samples: list[dict[str, Any]] = []
+            for item in identity_rows:
+                code = str(item["symbol"] or "").strip()
+                raw_report_name = str(item["company_name"] or "")
+                report_name = _clean_company_candidate(item["company_name"])
+                directory_name = _clean_company_candidate(item["directory_name"])
+                suspect_reason = ""
+                if raw_report_name.strip() and raw_report_name.strip() != report_name:
+                    suspect_reason = "cleanable_report_name"
+                elif not report_name:
+                    suspect_reason = "missing_or_generic_report_name"
+                elif report_name == code:
+                    suspect_reason = "name_equals_symbol"
+                elif directory_name and not _company_names_overlap(
+                    report_name,
+                    directory_name,
+                ):
+                    suspect_reason = "report_directory_mismatch"
+                elif not directory_name:
+                    suspect_reason = "missing_symbol_directory_name"
+                if not suspect_reason:
+                    continue
+                identity_suspect_count += 1
+                if len(identity_drift_samples) >= 8:
+                    continue
+                identity_drift_samples.append(
+                    {
+                        "report_id": int(item["report_id"] or 0),
+                        "symbol": code,
+                        "company_name": str(item["company_name"] or ""),
+                        "directory_name": str(item["directory_name"] or ""),
+                        "title": str(item["title"] or "")[:140],
+                        "reason": suspect_reason,
+                    }
+                )
             return {
                 "total_reports": int(row["total_reports"] or 0),
                 "last_updated_at": str(row["last_updated_at"] or ""),
@@ -1276,15 +2801,57 @@ class NaverReportRepository:
                 "category_counts": category_counts,
                 "total_symbols": int(symbol_row["cnt"] or 0),
                 "symbol_last_updated_at": str(symbol_row["last_updated_at"] or ""),
+                "facts": {
+                    "total_facts": int(facts_row["total_facts"] or 0),
+                    "target_price_count": int(facts_row["target_price_count"] or 0),
+                    "rating_count": int(facts_row["rating_count"] or 0),
+                },
+                "quality": {
+                    "missing_company_name_count": int(
+                        quality_row["missing_company_name_count"] or 0
+                    ),
+                    "html_title_count": int(quality_row["html_title_count"] or 0),
+                    "html_company_name_count": int(
+                        quality_row["html_company_name_count"] or 0
+                    ),
+                    "missing_symbol_count": int(
+                        quality_row["missing_symbol_count"] or 0
+                    ),
+                    "missing_broker_count": int(
+                        quality_row["missing_broker_count"] or 0
+                    ),
+                    "missing_analyst_count": int(
+                        quality_row["missing_analyst_count"] or 0
+                    ),
+                    "unknown_category_count": int(
+                        quality_row["unknown_category_count"] or 0
+                    ),
+                    "symbol_directory_drift_count": int(drift_row["cnt"] or 0),
+                    "identity_suspect_count": identity_suspect_count,
+                    "generic_symbol_directory_count": generic_symbol_directory_count,
+                    "identity_drift_samples": identity_drift_samples,
+                },
                 "db_path": str(self.path),
             }
 
     def search(
-        self, query: str, symbol: str = "", category: str = "", limit: int = 10
+        self,
+        query: str,
+        symbol: str = "",
+        category: str = "",
+        limit: int = 10,
+        broker: str = "",
+        analyst: str = "",
+        date_from: str = "",
+        date_to: str = "",
     ) -> list[dict[str, Any]]:
         q = str(query or "").strip()
         sym = str(symbol or "").strip()
         cat = str(category or "").strip()
+        broker_text = str(broker or "").strip()
+        analyst_text = str(analyst or "").strip()
+        published_from = str(date_from or "").strip()
+        published_to = str(date_to or "").strip()
         max_rows = max(min(int(limit), 100), 1)
         where: list[str] = []
         params: list[Any] = []
@@ -1294,6 +2861,18 @@ class NaverReportRepository:
         if cat:
             where.append("r.category = ?")
             params.append(cat)
+        if broker_text:
+            where.append("r.broker LIKE ?")
+            params.append(f"%{broker_text}%")
+        if analyst_text:
+            where.append("r.analyst LIKE ?")
+            params.append(f"%{analyst_text}%")
+        if published_from:
+            where.append("r.published_at >= ?")
+            params.append(published_from)
+        if published_to:
+            where.append("r.published_at <= ?")
+            params.append(published_to)
         if q:
             like = f"%{q}%"
             where.append("(r.title LIKE ? OR r.content LIKE ? OR c.content LIKE ?)")
@@ -1355,6 +2934,104 @@ class NaverReportRepository:
                     }
                 )
             return out
+
+    def get_report(self, report_id: int) -> dict[str, Any] | None:
+        rid = int(report_id)
+        if rid <= 0:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  report_id,
+                  doc_id,
+                  category,
+                  source_url,
+                  detail_url,
+                  pdf_url,
+                  title,
+                  company_name,
+                  broker,
+                  analyst,
+                  symbol,
+                  published_at,
+                  crawled_at,
+                  pdf_sha256,
+                  pdf_archived_path,
+                  content_source,
+                  content,
+                  created_at,
+                  updated_at
+                FROM reports
+                WHERE report_id = ?
+                """,
+                (rid,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "report_id": int(row["report_id"]),
+                "doc_id": str(row["doc_id"] or ""),
+                "category": str(row["category"] or "unknown"),
+                "source_url": str(row["source_url"] or ""),
+                "detail_url": str(row["detail_url"] or ""),
+                "pdf_url": str(row["pdf_url"] or ""),
+                "title": str(row["title"] or ""),
+                "company_name": str(row["company_name"] or ""),
+                "broker": str(row["broker"] or ""),
+                "analyst": str(row["analyst"] or ""),
+                "symbol": str(row["symbol"] or ""),
+                "published_at": str(row["published_at"] or ""),
+                "crawled_at": str(row["crawled_at"] or ""),
+                "pdf_sha256": str(row["pdf_sha256"] or ""),
+                "pdf_archived_path": str(row["pdf_archived_path"] or ""),
+                "content_source": str(row["content_source"] or ""),
+                "content": str(row["content"] or ""),
+                "created_at": str(row["created_at"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+            }
+
+    def list_report_chunks(
+        self,
+        report_id: int,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        rid = int(report_id)
+        if rid <= 0:
+            return []
+        max_rows = max(min(int(limit), 5000), 1)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  chunk_id,
+                  report_id,
+                  chunk_index,
+                  page_start,
+                  page_end,
+                  section_title,
+                  content,
+                  created_at
+                FROM report_chunks
+                WHERE report_id = ?
+                ORDER BY chunk_index ASC
+                LIMIT ?
+                """,
+                (rid, max_rows),
+            ).fetchall()
+            return [
+                {
+                    "chunk_id": int(row["chunk_id"]),
+                    "report_id": int(row["report_id"]),
+                    "chunk_index": int(row["chunk_index"]),
+                    "page_start": int(row["page_start"] or 0),
+                    "page_end": int(row["page_end"] or 0),
+                    "section_title": str(row["section_title"] or "unknown"),
+                    "content": str(row["content"] or ""),
+                    "created_at": str(row["created_at"] or ""),
+                }
+                for row in rows
+            ]
 
     def list_recent_report_facts(
         self,
@@ -1674,17 +3351,28 @@ class NaverSecuritiesCrawler:
             timeout=timeout, follow_redirects=True, headers=headers
         ) as client:
             for item in targets:
+                detail_url = str(item.get("detail_url") or "")
+                detail_html = await self._fetch_text(client, detail_url) if detail_url else ""
+                detail_links = _extract_links(detail_html, detail_url) if detail_html else []
+                detail_title = self._extract_title(detail_html) if detail_html else ""
+                detail_date = _parse_date(detail_html) if detail_html else ""
+                detail_symbol = (
+                    self._symbol_from_query(detail_url)
+                    or self._symbol_from_links(detail_links)
+                    or _parse_symbol(detail_title)
+                )
+                detail_broker = self._extract_broker(detail_html) if detail_html else ""
                 ok = await self._ingest_pdf(
                     client=client,
                     category=str(item.get("category") or "unknown"),
                     source_url=str(item.get("source_url") or ""),
-                    detail_url=str(item.get("detail_url") or ""),
+                    detail_url=detail_url,
                     pdf_url=str(item.get("pdf_url") or ""),
-                    title=str(item.get("title") or ""),
-                    broker=str(item.get("broker") or ""),
-                    symbol=str(item.get("symbol") or ""),
-                    published_at=str(item.get("published_at") or ""),
-                    detail_html="",
+                    title=detail_title or str(item.get("title") or ""),
+                    broker=detail_broker or str(item.get("broker") or ""),
+                    symbol=detail_symbol or str(item.get("symbol") or ""),
+                    published_at=detail_date or str(item.get("published_at") or ""),
+                    detail_html=detail_html,
                     force=True,
                 )
                 if ok:
@@ -1751,6 +3439,21 @@ class NaverSecuritiesCrawler:
             return False
         if len(text) > self.config.max_pdf_chars:
             text = text[: self.config.max_pdf_chars]
+        text_tail = text[-12000:] if len(text) > 12000 else ""
+        metadata_probe = ""
+        needs_metadata_probe = _looks_like_garbled_pdf_text(text)
+        if not needs_metadata_probe:
+            quick_analyst_text = f"{detail_html}\n{text[:12000]}\n{text_tail}"
+            likely_mirae = (
+                _clean_broker_name(broker) == "미래에셋증권"
+                or "miraeasset.com" in detail_html.lower()
+                or "mirae asset" in text[:2000].lower()
+            )
+            needs_metadata_probe = (
+                likely_mirae and not _extract_analyst_from_text(quick_analyst_text)
+            )
+        if needs_metadata_probe:
+            metadata_probe = self._extract_pdf_metadata_ocr_text(binary)
 
         chunk_rows = _build_chunk_rows(
             page_rows,
@@ -1758,20 +3461,75 @@ class NaverSecuritiesCrawler:
             max_chunks=self.config.max_chunks_per_report,
         )
 
-        normalized_title = title.strip() or self._title_from_url(pdf_url)
-        normalized_symbol = symbol.strip()
-        if not normalized_symbol:
-            normalized_symbol = _parse_symbol(normalized_title)
-        normalized_company_name = self._extract_company_name(
-            detail_html, normalized_title
+        normalized_title = _clean_report_title(
+            title or self._title_from_url(pdf_url),
+            content=text,
+            category=category,
         )
-        normalized_broker = broker.strip()
-        normalized_analyst = self._extract_analyst(detail_html)
+        normalized_symbol = _clean_report_symbol(symbol, published_at=published_at)
+        if not normalized_symbol:
+            normalized_symbol = _clean_report_symbol(
+                _parse_symbol(normalized_title),
+                published_at=published_at,
+            )
         normalized_date = published_at.strip()
         if not normalized_date:
             normalized_date = _parse_date(detail_html)
         if not normalized_date:
             normalized_date = utc_now_iso()[:10]
+        known_symbol_names = (
+            self.repository.resolve_symbol_names([normalized_symbol])
+            if normalized_symbol
+            else {}
+        )
+        identity_text = (
+            f"{normalized_title}\n{_to_text(detail_html)}\n"
+            f"{metadata_probe}\n{text[:12000]}"
+        )
+        inferred_symbol, inferred_company = _extract_company_symbol_from_text(
+            identity_text,
+            symbol_names=known_symbol_names,
+            published_at=normalized_date,
+        )
+        if inferred_symbol and (
+            not normalized_symbol
+            or (normalized_symbol not in known_symbol_names and inferred_company)
+        ):
+            normalized_symbol = inferred_symbol
+            known_symbol_names = self.repository.resolve_symbol_names([normalized_symbol])
+        normalized_company_name = self._extract_company_name(
+            detail_html,
+            normalized_title,
+            content=text,
+            symbol_names=known_symbol_names,
+            published_at=normalized_date,
+        )
+        if not normalized_company_name and normalized_symbol:
+            normalized_company_name = self.repository.get_symbol_name(normalized_symbol)
+        if not normalized_company_name and inferred_company:
+            normalized_company_name = inferred_company
+        if category != "company_analysis":
+            normalized_symbol = ""
+            normalized_company_name = ""
+        broker_text = f"{detail_html}\n{metadata_probe}\n{text[:8000]}"
+        normalized_broker = (
+            _extract_strong_broker_from_text(broker_text)
+            or _clean_broker_name(broker)
+            or _extract_broker_from_text(broker_text)
+        )
+        analyst_text = f"{detail_html}\n{metadata_probe}\n{text[:12000]}\n{text_tail}"
+        normalized_analyst = self._extract_analyst(analyst_text)
+        if not normalized_analyst:
+            normalized_analyst = _extract_department_author_from_text(
+                analyst_text,
+                broker=normalized_broker,
+            )
+        if not normalized_analyst:
+            normalized_analyst = _infer_default_department_author_from_context(
+                broker=normalized_broker,
+                category=category,
+                text=analyst_text,
+            )
         normalized_crawled_at = utc_now_iso()
 
         structured_facts = _extract_basic_structured(
@@ -1844,6 +3602,59 @@ class NaverSecuritiesCrawler:
         except Exception:
             return b""
 
+    def _extract_pdf_metadata_ocr_text(self, payload: bytes) -> str:
+        magick = shutil.which("magick")
+        tesseract = shutil.which("tesseract")
+        if not magick or not tesseract or not payload:
+            return ""
+
+        temp_parent = self._archive_dir.parent / "ocr_tmp"
+        try:
+            temp_parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return ""
+
+        try:
+            with tempfile.TemporaryDirectory(dir=str(temp_parent)) as temp_dir:
+                temp_path = Path(temp_dir)
+                pdf_path = temp_path / "source.pdf"
+                image_path = temp_path / "page.png"
+                pdf_path.write_bytes(payload)
+                render = subprocess.run(
+                    [
+                        magick,
+                        "-density",
+                        "200",
+                        f"{pdf_path}[0]",
+                        "-alpha",
+                        "remove",
+                        "-background",
+                        "white",
+                        "-colorspace",
+                        "Gray",
+                        "-depth",
+                        "8",
+                        str(image_path),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    timeout=30,
+                )
+                if render.returncode != 0 or not image_path.exists():
+                    return ""
+                ocr = subprocess.run(
+                    [tesseract, str(image_path.resolve()), "stdout", "-l", "eng", "--psm", "6"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if ocr.returncode != 0:
+                    return ""
+                return _clean_metadata_text(ocr.stdout, limit=12000)
+        except Exception:
+            return ""
+
     def _extract_pdf_pages(self, payload: bytes) -> list[str]:
         try:
             from pypdf import PdfReader  # type: ignore
@@ -1876,6 +3687,8 @@ class NaverSecuritiesCrawler:
         facts: dict[str, Any],
         text: str,
     ) -> dict[str, Any]:
+        if not self.config.llm_facts_enabled:
+            return facts
         bridge = self._llm_bridge
         if not bridge.ready:
             return facts
@@ -1960,29 +3773,25 @@ class NaverSecuritiesCrawler:
         return merged
 
     @staticmethod
-    def _extract_company_name(detail_html: str, fallback_title: str) -> str:
-        text = _to_text(detail_html)
-        if text:
-            match = re.search(r"([가-힣A-Za-z0-9]+)\s*(?:\(\d{6}\))", text)
-            if match:
-                return str(match.group(1) or "").strip()[:80]
-        title = str(fallback_title or "").strip()
-        if not title:
-            return ""
-        return re.sub(r"\s+", " ", title).strip()[:80]
+    def _extract_company_name(
+        detail_html: str,
+        fallback_title: str,
+        *,
+        content: str = "",
+        symbol_names: dict[str, str] | None = None,
+        published_at: str = "",
+    ) -> str:
+        text = f"{_to_text(detail_html)}\n{fallback_title}\n{str(content or '')[:12000]}"
+        _, company = _extract_company_symbol_from_text(
+            text,
+            symbol_names=symbol_names,
+            published_at=published_at,
+        )
+        return company
 
     @staticmethod
     def _extract_analyst(detail_html: str) -> str:
-        text = _to_text(detail_html)
-        if not text:
-            return ""
-        match = re.search(r"애널리스트\s*[:：]?\s*([가-힣A-Za-z]{2,20})", text)
-        if match:
-            return str(match.group(1) or "").strip()[:40]
-        match = re.search(r"Analyst\s*[:：]?\s*([A-Za-z .]{3,40})", text)
-        if match:
-            return str(match.group(1) or "").strip()[:40]
-        return ""
+        return _extract_analyst_from_text(detail_html)
 
     def _page_url(self, seed_url: str, page: int) -> str:
         base = seed_url.strip()
@@ -2027,11 +3836,7 @@ class NaverSecuritiesCrawler:
 
     @staticmethod
     def _extract_broker(html: str) -> str:
-        text = _to_text(html)
-        match = re.search(r"([가-힣A-Za-z0-9]+증권)", text)
-        if not match:
-            return ""
-        return match.group(1)
+        return _extract_broker_from_text(html)
 
     @staticmethod
     def _symbol_from_query(url: str) -> str:

@@ -23,7 +23,9 @@ def test_runtime_engine_builds_snapshot_with_runtime_metadata() -> None:
     snapshot = engine.build_snapshot(cycle=15)
 
     assert snapshot["runtime"]["status"] == "running"
-    assert snapshot["runtime"]["engine"] == "skeleton"
+    assert snapshot["runtime"]["engine"] == "session_heartbeat"
+    assert snapshot["runtime"]["execution_mode"] == "skeleton_noop"
+    assert snapshot["runtime"]["executes_orders"] is False
     assert snapshot["runtime"]["base_interval_sec"] == 5
     assert snapshot["runtime"]["sessions"] == 2
     assert len(snapshot["sessions"]) == 2

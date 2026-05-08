@@ -93,6 +93,41 @@ def test_research_pipeline_persists_learning_total_count(tmp_path: Path) -> None
     assert persisted.get("learning_total_count") == 2
 
 
+def test_research_pipeline_embeds_market_intelligence_playbook(tmp_path: Path) -> None:
+    md_path = tmp_path / "strategy.md"
+    cfg = ResearchPipelineConfig(
+        state_path=str(tmp_path / "research.json"),
+        strategy_md_path=str(md_path),
+        market_scope="KRX",
+        codex_command="",
+        codex_query="국장",
+        codex_timeout_sec=10,
+        report_urls=[],
+        market_intelligence_sources=[
+            {
+                "source_id": "whale_insight",
+                "label": "Whale Insight",
+                "role": "고래 포지션 변동을 참고 신호로 추적",
+                "coverage": ["KOSPI", "NASDAQ"],
+                "signal_types": ["large_holder_change"],
+                "caution": "자동 수집 오류 가능성",
+            }
+        ],
+    )
+    pipeline = ResearchPipeline(cfg)
+
+    snapshot = asyncio.run(pipeline.run_once())
+    content = md_path.read_text(encoding="utf-8")
+
+    assert snapshot["market_intelligence_sources"][0]["source_id"] == "whale_insight"
+    assert any(
+        str(item.get("source") or "") == "market_intelligence_source"
+        for item in list(snapshot.get("items") or [])
+    )
+    assert "## Source Playbook" in content
+    assert "Whale Insight" in content
+
+
 def test_research_pipeline_dedupes_by_fingerprint(tmp_path: Path) -> None:
     cfg = ResearchPipelineConfig(
         state_path=str(tmp_path / "research.json"),

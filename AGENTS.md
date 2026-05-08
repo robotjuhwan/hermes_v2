@@ -3,8 +3,7 @@ Repository guide for coding agents in `/Users/juhwan/hermes_v2`.
 
 ## Scope
 - Primary scope: top-level TradeCraft app (`src/tradecraft`, `tests`, runtime entrypoints).
-- Vendored subproject: `third_party/freqtrade` (has its own `third_party/freqtrade/AGENTS.md`).
-- If touching vendored code, follow both this file and the subproject guide.
+- No vendored trading engine is currently part of the active app tree.
 
 ## Environment
 - Python: `>=3.10` (`pyproject.toml`).
@@ -139,7 +138,6 @@ If added later, merge their instructions into this file.
 
 ## Practical Agent Defaults
 - Prefer root app conventions when editing `src/tradecraft` and `tests`.
-- Treat `third_party/freqtrade` as external-style code unless task explicitly targets it.
 - Keep API responses backward-compatible unless requested otherwise.
 - Preserve existing env alias behavior in `AppSettings` fields.
 - For runtime jobs, avoid changing schedules/interval defaults unless requested.
