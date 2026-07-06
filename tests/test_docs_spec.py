@@ -264,6 +264,17 @@ def test_readme_documents_primary_jue_runtime_entrypoints() -> None:
         assert command in readme
 
 
+def test_refactor_roadmap_documents_next_decomposition_plans() -> None:
+    roadmap = _doc("16_refactor_roadmap.md")
+
+    assert "## Next Decomposition Plans" in roadmap
+    assert "Control/API decomposition" in roadmap
+    assert "Memory decomposition" in roadmap
+    assert "Binance block-trader decomposition" in roadmap
+    assert "KIS block-trader decomposition" in roadmap
+    assert "UI information architecture" in roadmap
+
+
 def test_readme_tradecraft_commands_are_installed_console_scripts() -> None:
     import re
 

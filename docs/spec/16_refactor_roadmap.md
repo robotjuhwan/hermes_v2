@@ -81,3 +81,13 @@ Acceptance criteria:
 - 쥬 memory/reflection provenance is not lost.
 
 Before any refactor branch is considered complete, run focused API/block tests, verify the static UI still loads, inspect readiness output, and confirm no application code accidentally changes trading behavior while docs or boundaries are being adjusted.
+
+## Next Decomposition Plans
+
+After the structure-stabilization pass, split future work into separate plans:
+
+1. Control/API decomposition: move service construction and ops readiness helpers out of `src/tradecraft/main.py` while preserving route auth behavior and API payload compatibility.
+2. Memory decomposition: split `src/tradecraft/services/investment_memory.py` into repository, context compaction, rituals/reflections, policy reviews, and public payload helpers.
+3. Binance block-trader decomposition: split ledger access, manager run orchestration, executor ticks, status payloads, and prompt/wiki context helpers without changing order behavior.
+4. KIS block-trader decomposition: split ledger access, KRX/session-aware manager orchestration, executor/reconciliation, status payloads, and prompt/wiki context helpers without changing order behavior.
+5. UI information architecture: keep the static frontend, but consolidate navigation into operator groups and prevent `app.js`/`style.css` from absorbing new tab-specific logic.
