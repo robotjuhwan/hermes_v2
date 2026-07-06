@@ -1,9 +1,29 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+def test_config_spec_captured_settings_count_matches_app_settings() -> None:
+    from scripts.check_project_contracts import (
+        docs_config_settings_count,
+        settings_model_field_count,
+    )
+
+    assert docs_config_settings_count(ROOT / "docs/spec/12_config_env.md") == (
+        settings_model_field_count()
+    )
+
+
+def test_repository_has_no_tracked_generated_package_metadata() -> None:
+    from scripts.check_project_contracts import tracked_generated_files
+
+    assert tracked_generated_files(ROOT) == []
 
 
 def _doc(name: str) -> str:
