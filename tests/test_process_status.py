@@ -463,3 +463,17 @@ def test_restart_runner_processes_rejects_unknown_keys() -> None:
         assert "unknown runner key" in str(exc)
     else:
         raise AssertionError("unknown runner key was not rejected")
+
+
+def test_process_status_maps_are_generated_from_runner_manifest() -> None:
+    from tradecraft.runtime.runner_manifest import (
+        DEFAULT_RESTART_RUNNER_KEYS,
+        RUNNER_SPECS,
+    )
+
+    manifest_keys = set(RUNNER_SPECS)
+    assert set(process_status.RUNNER_PID_FILES) == manifest_keys
+    assert set(process_status.RUNNER_PATTERNS) == manifest_keys
+    assert set(process_status.RUNNER_LABELS) == manifest_keys
+    assert set(process_status.RUNNER_RESTART_SPECS) == manifest_keys
+    assert process_status.DEFAULT_RESTART_RUNNER_KEYS == DEFAULT_RESTART_RUNNER_KEYS
