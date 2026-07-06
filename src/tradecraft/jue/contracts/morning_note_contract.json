@@ -1,0 +1,7 @@
+{
+  "contract_id": "morning_note_contract",
+  "version": 1,
+  "required": ["trading_day", "market_context", "account_focus", "block_implications", "risk_focus"],
+  "source_types": ["account", "blocks", "market_pulse", "reports", "memory", "quotes"],
+  "reject_when": ["missing_trading_day", "no_block_implication", "no_risk_focus", "stale_market_context"]
+}

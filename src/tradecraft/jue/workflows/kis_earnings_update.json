@@ -1,0 +1,23 @@
+{
+  "workflow_id": "kis_earnings_update",
+  "version": 1,
+  "scope": "kis",
+  "model_policy": {
+    "default_model": "settings.llm_model",
+    "default_reasoning_effort": "settings.llm_reasoning_effort",
+    "expected_runtime_model": "gpt-5.5",
+    "expected_reasoning_effort": "xhigh"
+  },
+  "cadence": {"kind": "event_driven", "trigger": "earnings_event"},
+  "required_skills": ["earnings_preview", "earnings_analysis", "model_update", "thesis_tracker"],
+  "required_context": ["symbol", "earnings_calendar", "company_report", "consensus", "quotes", "investment_memory", "blocks"],
+  "output_contracts": ["earnings_event_contract", "model_update_contract", "thesis_update_contract"],
+  "authority": {
+    "can_read_untrusted_research": false,
+    "can_write_memory": true,
+    "can_create_blocks": false,
+    "can_submit_orders": false
+  },
+  "safety_gates": ["event_timestamp_check", "evidence_freshness", "no_order_submission"],
+  "prompt_budget": {"max_skill_chars": 7600, "max_workflow_chars": 1600, "max_contract_chars": 5600}
+}

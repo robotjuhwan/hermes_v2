@@ -46,10 +46,32 @@ pytest -k portfolio_coach
 ```bash
 tradecraft-control
 tradecraft-runtime
-tradecraft-research
-tradecraft-kis-trader
+tradecraft-intelligence
+tradecraft-strategy-insights
+tradecraft-market-judge
+tradecraft-market-pulse
+tradecraft-jue-wiki
+tradecraft-investment-memory
+tradecraft-live-evaluator
+tradecraft-watchdog
+tradecraft-crypto-market-research
+tradecraft-crypto-pattern-lab
+tradecraft-crypto-alpha
+tradecraft-kis-block-trader
+tradecraft-binance-block-trader
 tradecraft-naver-reports
+tradecraft-reports-api
+tradecraft-reports-worker
+tradecraft-reports-stack
 ```
+
+Compatibility/legacy runner:
+```bash
+tradecraft-research
+```
+
+Retired direct KIS trader entrypoints are not part of the active app; KIS live
+trading goes through `tradecraft-kis-block-trader`.
 
 ## Codebase Map
 - `src/tradecraft/main.py`: FastAPI app setup + route wiring.

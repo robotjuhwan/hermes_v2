@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -14,9 +15,14 @@ from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo
 
 from tradecraft.runtime.state_store import utc_now_iso
-from tradecraft.services.llm_bridge import LLMBridge, LLMBridgeConfig
+from tradecraft.services.jue_language_policy import jue_language_policy
+from tradecraft.services.codex_native import CodexNativeConfig, CodexNativeRuntime
 
 KST = ZoneInfo("Asia/Seoul")
+logger = logging.getLogger(__name__)
+TRADING_GATE_NOTE = (
+    "TRADING — HERMES 안전 게이트와 블록 규칙을 통과한 실행만 허용됩니다."
+)
 
 
 def _safe_float(value: Any) -> float:
@@ -428,7 +434,7 @@ def render_portfolio_coach_md_v3(data: dict[str, Any]) -> str:
     if len(market_mood) < 3:
         fallback_lines = [
             f"데이터 기준시각(as_of): {date_kst} {time_kst} KST",
-            "시장 분위기: 데이터 제한으로 보수적 대응 권고",
+            "시장 분위기: 데이터 제한으로 검증 기반 대응 권고",
             "확정 수치 부족 시 신규 진입보다 리스크 점검 우선",
         ]
         for row in fallback_lines:
@@ -662,7 +668,7 @@ def render_portfolio_coach_md_v3(data: dict[str, Any]) -> str:
         if _clean_line(row, 120)
     ]
     lines.append("")
-    lines.append(notes[0] if notes else "TRADING — 실제 매매는 사용자 책임")
+    lines.append(notes[0] if notes else TRADING_GATE_NOTE)
     return "\n".join(lines).strip()
 
 
@@ -781,12 +787,19 @@ class PortfolioCoachConfig:
     hold_min_upside: float = 0.03
     sell_downside_threshold: float = -0.07
     review_queue_enabled: bool = True
-    llm_bridge_command: str = ""
-    llm_bridge_args: str = ""
-    llm_bridge_url: str = ""
-    llm_bridge_token: str = ""
-    llm_bridge_timeout_ms: int = 60000
+    codex_runtime_mode: str = "auto"
+    codex_runtime_sdk_codex_bin: str = ""
+    codex_runtime_timeout_ms: int = 60000
     llm_model: str = "gpt-5.5"
+    llm_reasoning_effort: str = "xhigh"
+    llm_usage_enabled: bool = True
+    llm_usage_db_path: str = ".runtime/llm_usage.db"
+    llm_usage_component: str = "portfolio_coach"
+    codex_native_thread_mode: str = "daily"
+    codex_native_thread_db_path: str = ".runtime/codex_native_threads.db"
+    codex_native_compact_after_turns: int = 8
+    codex_native_read_turns: bool = False
+    codex_native_developer_instructions_enabled: bool = True
 
 
 class KISHoldingsProvider:
@@ -1146,14 +1159,23 @@ class PortfolioCoachService:
         self.rag_store = rag_store
         self.kis = kis
         self.store = PortfolioCoachStore(config.state_db_path)
-        self.llm_bridge = LLMBridge(
-            LLMBridgeConfig(
-                command=config.llm_bridge_command,
-                args=config.llm_bridge_args,
-                url=config.llm_bridge_url,
-                token=config.llm_bridge_token,
-                timeout_ms=config.llm_bridge_timeout_ms,
+        self.codex_runtime = CodexNativeRuntime(
+            CodexNativeConfig(
+                mode=config.codex_runtime_mode,
+                sdk_codex_bin=config.codex_runtime_sdk_codex_bin,
+                timeout_ms=config.codex_runtime_timeout_ms,
                 model=config.llm_model,
+                reasoning_effort=config.llm_reasoning_effort,
+                usage_enabled=config.llm_usage_enabled,
+                usage_db_path=config.llm_usage_db_path,
+                usage_component=config.llm_usage_component,
+                thread_mode=config.codex_native_thread_mode,
+                thread_db_path=config.codex_native_thread_db_path,
+                compact_after_turns=config.codex_native_compact_after_turns,
+                read_turns=config.codex_native_read_turns,
+                developer_instructions_enabled=(
+                    config.codex_native_developer_instructions_enabled
+                ),
             )
         )
         self._name_cache: dict[str, str] = {}
@@ -1224,7 +1246,31 @@ class PortfolioCoachService:
                 "as_of": as_of,
             }
 
-        llm_json = await self._render_with_llm_json(snapshot=snapshot, pack=pack)
+        llm_json, llm_status = await self._render_with_llm_json(
+            snapshot=snapshot, pack=pack
+        )
+        pack["llm_status"] = llm_status
+        llm_state = str(llm_status.get("status") or "").strip().lower()
+        if llm_state != "ok":
+            reason = str(llm_status.get("reason") or llm_state or "codex_runtime_error")
+            error_message = str(llm_status.get("error_message") or "").strip()
+            message = (
+                "Codex native runtime 조언 생성 실패: "
+                f"{error_message or reason}. "
+                "하드코딩 보류안은 만들지 않고 원인 수정을 기다립니다."
+            )
+            return {
+                "status": "error",
+                "reason": reason,
+                "message": message,
+                "message_id": 0,
+                "used_candidates": list(pack.get("used_candidates") or []),
+                "pack": pack,
+                "llm_status": llm_status,
+                "holdings_hash": holdings_hash,
+                "candidate_hash": candidate_hash,
+                "as_of": as_of,
+            }
         action_payload = self._normalize_action_payload(
             llm_json if isinstance(llm_json, dict) else None,
             pack=pack,
@@ -1255,6 +1301,7 @@ class PortfolioCoachService:
             "message_id": message_id,
             "used_candidates": list(pack.get("used_candidates") or []),
             "pack": pack,
+            "llm_status": llm_status,
             "holdings_hash": holdings_hash,
             "candidate_hash": candidate_hash,
             "as_of": as_of,
@@ -1324,7 +1371,11 @@ class PortfolioCoachService:
                     if day_change_pct == 0.0:
                         day_change_pct = _safe_float(raw.get("stck_prdy_ctrt"))
                 except Exception:
-                    pass
+                    logger.warning(
+                        "portfolio coach quote lookup failed for ticker=%s",
+                        ticker,
+                        exc_info=True,
+                    )
 
             reports = self.report_repo.search(
                 query="", symbol=ticker, category="", limit=3
@@ -1941,7 +1992,7 @@ class PortfolioCoachService:
             f"시장 온도: {mood_label} (보유 가중 변동 {weighted_move:+.2f}%)",
             f"집중도 신호: 최대 비중 {concentration*100:.1f}%",
             f"리포트 커버리지: {reports_covered}건 / {tickers_covered}종목",
-            f"데이터 상태: {quality} (휴장/시세제한 시 보수적 해석)",
+            f"데이터 상태: {quality} (휴장/시세제한 시 검증 기반 해석)",
         ]
         weekday = (
             (_parse_date_value(as_of) or datetime.now(KST)).astimezone(KST).weekday()
@@ -2068,7 +2119,13 @@ class PortfolioCoachService:
                                 status="active",
                             )
                         except Exception:
-                            pass
+                            logger.warning(
+                                "portfolio coach failed to cache report symbol name "
+                                "symbol=%s name=%s",
+                                key,
+                                report_name,
+                                exc_info=True,
+                            )
                     self._name_cache[key] = report_name
                     return report_name
 
@@ -2088,11 +2145,21 @@ class PortfolioCoachService:
                                 status="active",
                             )
                         except Exception:
-                            pass
+                            logger.warning(
+                                "portfolio coach failed to cache pykrx symbol name "
+                                "symbol=%s name=%s",
+                                key,
+                                resolved,
+                                exc_info=True,
+                            )
                     self._name_cache[key] = resolved
                     return resolved
             except Exception:
-                pass
+                logger.warning(
+                    "portfolio coach pykrx symbol lookup failed for symbol=%s",
+                    key,
+                    exc_info=True,
+                )
 
         fallback = key or "UNKNOWN_NAME"
         self._name_cache[key] = fallback
@@ -2144,7 +2211,11 @@ class PortfolioCoachService:
                 )
                 return [row for row in rows if isinstance(row, dict)]
             except Exception:
-                pass
+                logger.warning(
+                    "portfolio coach recent report facts lookup failed; falling back "
+                    "to report search",
+                    exc_info=True,
+                )
 
         fallback: list[dict[str, Any]] = []
         rows = self.report_repo.search(query="", symbol="", category="", limit=100)
@@ -3015,7 +3086,7 @@ class PortfolioCoachService:
                 "next_actions": next_actions,
                 "name_mapping_failures": name_mapping_failures,
             },
-            "notes": ["TRADING — 실제 매매는 사용자 책임"],
+            "notes": [TRADING_GATE_NOTE],
         }
 
         used_candidates = [
@@ -3060,10 +3131,33 @@ class PortfolioCoachService:
 
     async def _render_with_llm_json(
         self, *, snapshot: dict[str, Any], pack: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        if not self.llm_bridge.ready:
-            return None
-        seed = self._render_json_fallback(pack)
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        status: dict[str, Any] = {
+            "component": self.config.llm_usage_component,
+            "model": self.codex_runtime.resolved_model,
+            "status": "pending",
+            "reason": "",
+            "error_message": "",
+        }
+        if not self.codex_runtime.ready:
+            status.update(
+                {
+                    "status": "skipped",
+                    "reason": "codex_runtime_not_ready",
+                }
+            )
+            return None, status
+        try:
+            seed = self._require_advice_seed_json(pack)
+        except ValueError as exc:
+            status.update(
+                {
+                    "status": "error",
+                    "reason": "advice_seed_missing",
+                    "error_message": str(exc),
+                }
+            )
+            return None, status
         coverage_obj = seed.get("evidence_coverage")
         recent_history_rows: list[Any] = []
         if isinstance(coverage_obj, dict):
@@ -3071,7 +3165,7 @@ class PortfolioCoachService:
             if isinstance(history_obj, list):
                 recent_history_rows = history_obj
         payload = {
-            "model": self.llm_bridge.resolved_model,
+            "model": self.codex_runtime.resolved_model,
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
             "messages": [
@@ -3080,6 +3174,7 @@ class PortfolioCoachService:
                     "content": (
                         "Return only one JSON object with keys: header, market_mood, portfolio, action_plan, model_portfolio, evidence_coverage, notes. "
                         "Do not add extra keys. Keep action_plan.trades length exactly 3 and model_portfolio.targets length 5-6 when possible. "
+                        "Analyze and draft wording changes in English, then translate operator-visible text into Korean. "
                         "Rewrite wording only; preserve numbers and evidence citations. "
                         "Rebalance target churn must stay low versus recent rebalance history: avoid abrupt target replacement/weight swings unless evidence_coverage clearly justifies it. "
                         "No markdown output."
@@ -3090,6 +3185,7 @@ class PortfolioCoachService:
                     "content": json.dumps(
                         {
                             "task": "Polish portfolio direct-brief JSON while preserving facts.",
+                            "language_policy": jue_language_policy(),
                             "as_of": snapshot.get("as_of"),
                             "seed": seed,
                             "rebalance_guidance": {
@@ -3173,7 +3269,7 @@ class PortfolioCoachService:
                                     "gaps": ["..."],
                                     "next_actions": ["..."],
                                 },
-                                "notes": ["TRADING — 실제 매매는 사용자 책임"],
+                                "notes": [TRADING_GATE_NOTE],
                             },
                         },
                         ensure_ascii=False,
@@ -3181,104 +3277,110 @@ class PortfolioCoachService:
                 },
             ],
         }
-        result = await self.llm_bridge.complete(payload)
+        try:
+            result = await self.codex_runtime.complete(payload)
+        except Exception as exc:
+            status.update(
+                {
+                    "status": "error",
+                    "reason": "codex_runtime_exception",
+                    "error_message": str(exc),
+                }
+            )
+            return None, status
         if not bool(result.get("ok")):
-            return None
+            status.update(
+                {
+                    "status": "error",
+                    "reason": "codex_runtime_error",
+                    "error_message": _clean_line(
+                        result.get("error_message") or result.get("error"), 240
+                    ),
+                }
+            )
+            return None, status
         text = str(result.get("content") or "").strip()
         if not text:
-            return None
+            status.update(
+                {
+                    "status": "error",
+                    "reason": "codex_runtime_empty_content",
+                    "error_message": "empty Codex native response content",
+                }
+            )
+            return None, status
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
-            return None
+        except json.JSONDecodeError as exc:
+            status.update(
+                {
+                    "status": "error",
+                    "reason": "codex_runtime_json_decode_error",
+                    "error_message": str(exc),
+                }
+            )
+            return None, status
         if not isinstance(parsed, dict):
-            return None
+            status.update(
+                {
+                    "status": "error",
+                    "reason": "codex_runtime_invalid_schema",
+                    "error_message": "response root is not a JSON object",
+                }
+            )
+            return None, status
         action_plan_obj = parsed.get("action_plan")
         if not isinstance(action_plan_obj, dict):
-            return None
+            status.update(
+                {
+                    "status": "error",
+                    "reason": "codex_runtime_invalid_schema",
+                    "error_message": "action_plan is missing or invalid",
+                }
+            )
+            return None, status
         if not isinstance(action_plan_obj.get("trades"), list):
-            return None
+            status.update(
+                {
+                    "status": "error",
+                    "reason": "codex_runtime_invalid_schema",
+                    "error_message": "action_plan.trades is missing or invalid",
+                }
+            )
+            return None, status
         model_obj = parsed.get("model_portfolio")
         if not isinstance(model_obj, dict):
-            return None
+            status.update(
+                {
+                    "status": "error",
+                    "reason": "codex_runtime_invalid_schema",
+                    "error_message": "model_portfolio is missing or invalid",
+                }
+            )
+            return None, status
         if not isinstance(model_obj.get("targets"), list):
-            return None
-        return parsed
+            status.update(
+                {
+                    "status": "error",
+                    "reason": "codex_runtime_invalid_schema",
+                    "error_message": "model_portfolio.targets is missing or invalid",
+                }
+            )
+            return None, status
+        status.update(
+            {
+                "status": "ok",
+                "reason": "codex_runtime_json_ok",
+                "content_chars": len(text),
+            }
+        )
+        return parsed, status
 
-    def _render_json_fallback(self, pack: dict[str, Any]) -> dict[str, Any]:
+    def _require_advice_seed_json(self, pack: dict[str, Any]) -> dict[str, Any]:
         payload = pack.get("advice_seed_json")
         if isinstance(payload, dict):
             return payload
-        now = datetime.now(KST)
-        now_as_of = now.strftime("%Y-%m-%d %H:%M KST")
-        fallback_actions = [
-            self._build_hold_action(
-                action="REDUCE",
-                as_of=utc_now_iso(),
-                reason="제안 보류(근거 부족: 조언 입력 생성 실패)",
-                next_action="브릿지 응답/입력 데이터 점검",
-            ),
-            self._build_hold_action(
-                action="BUY",
-                as_of=utc_now_iso(),
-                reason="제안 보류(근거 부족: 조언 입력 생성 실패)",
-                next_action="브릿지 응답/입력 데이터 점검",
-            ),
-            self._build_hold_action(
-                action="REBALANCE",
-                as_of=utc_now_iso(),
-                reason="제안 보류(근거 부족: 조언 입력 생성 실패)",
-                next_action="브릿지 응답/입력 데이터 점검",
-            ),
-        ]
-        return {
-            "header": {
-                "mode": "PAPER_DIRECT",
-                "date_kst": now.strftime("%Y-%m-%d"),
-                "time_kst": now.strftime("%H:%M"),
-                "as_of": now_as_of,
-            },
-            "market_mood": [
-                f"데이터 기준시각(as_of): {now_as_of}",
-                "시장 분위기: 데이터 제한으로 보수적 대응",
-                "확정 수치 부족 시 비중 축소/분산 점검 우선",
-            ],
-            "action_plan": {
-                "trades": fallback_actions,
-                "rebalance_table_rows": [],
-            },
-            "actions": fallback_actions,
-            "model_portfolio": {"targets": []},
-            "ideas": [],
-            "portfolio": {
-                "total": "-",
-                "cash": "-",
-                "holdings_summary": "데이터 없음",
-                "concentration": "데이터 없음",
-            },
-            "evidence_coverage": {
-                "reports_used_count": 0,
-                "tickers_covered": 0,
-                "filter_rejects": [],
-                "gaps": ["조언 seed 생성 실패"],
-                "next_actions": ["브릿지/입력 데이터 점검"],
-            },
-            "data_status": {
-                "reports_used_count": 0,
-                "tickers_covered": 0,
-                "filter_rejects": [],
-                "gaps": ["조언 seed 생성 실패"],
-                "next_actions": ["브릿지/입력 데이터 점검"],
-            },
-            "coverage": {
-                "reports_covered": 0,
-                "tickers_covered": 0,
-                "filter_rejects": [],
-                "gaps": ["조언 seed 생성 실패"],
-                "next_actions": ["브릿지/입력 데이터 점검"],
-            },
-            "notes": ["TRADING — 실제 매매는 사용자 책임"],
-        }
+        raise ValueError("advice_seed_json is missing or invalid")
 
     def _normalize_action_payload(
         self,
@@ -3286,7 +3388,7 @@ class PortfolioCoachService:
         *,
         pack: dict[str, Any],
     ) -> dict[str, Any]:
-        seed = self._render_json_fallback(pack)
+        seed = self._require_advice_seed_json(pack)
         base = payload if isinstance(payload, dict) else seed
 
         header_obj_raw = base.get("header")
@@ -3678,7 +3780,7 @@ class PortfolioCoachService:
             mood_lines.extend(
                 [
                     f"데이터 기준시각(as_of): {mood_as_of}",
-                    "시장 분위기: 데이터 제한 시 보수적 대응",
+                    "시장 분위기: 데이터 제한 시 검증 기반 대응",
                     "변동성 확대 구간에서는 비중/손절 규칙 우선",
                 ]
             )
@@ -3787,7 +3889,7 @@ class PortfolioCoachService:
                 if _clean_line(row, 120)
             ]
         if not notes:
-            notes = ["TRADING — 실제 매매는 사용자 책임"]
+            notes = [TRADING_GATE_NOTE]
 
         return {
             "header": header,

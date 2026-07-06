@@ -1,0 +1,7 @@
+{
+  "contract_id": "model_update_contract",
+  "version": 1,
+  "required": ["symbol", "updated_at", "driver_changes", "estimate_delta", "valuation_delta", "confidence_delta"],
+  "source_types": ["company_report", "consensus", "research", "valuation", "memory", "macro"],
+  "reject_when": ["missing_symbol", "missing_updated_at", "driver_change_without_source", "valuation_delta_missing", "confidence_delta_missing"]
+}

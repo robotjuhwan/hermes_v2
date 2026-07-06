@@ -1,0 +1,7 @@
+{
+  "contract_id": "decision_lifecycle_contract",
+  "version": 1,
+  "required": ["symbol_or_theme", "lifecycle_stage", "evidence_state", "decision_state", "next_review_trigger"],
+  "source_types": ["memory", "research", "valuation", "blocks", "reports", "quotes", "user_directive"],
+  "reject_when": ["missing_subject", "missing_lifecycle_stage", "evidence_state_empty", "decision_state_empty", "next_review_trigger_missing"]
+}

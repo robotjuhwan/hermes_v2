@@ -58,6 +58,14 @@ def _write_worker_state(
 _is_symbol_directory_stale = is_symbol_directory_stale
 
 
+def _rag_sync_error_detail(rag_result: dict[str, Any]) -> str:
+    for key in ("error_message", "error", "reason", "detail"):
+        detail = str(rag_result.get(key) or "").strip()
+        if detail:
+            return detail[:500]
+    return ""
+
+
 def build_crawler(settings: AppSettings) -> NaverSecuritiesCrawler:
     return build_report_crawler(settings)
 
@@ -152,11 +160,22 @@ def run() -> None:
                         str(symbol_refresh.get("detail") or "")[:200],
                     )
             if rag_sync:
-                logger.info(
-                    "rag sync status=%s synced=%s",
-                    str(rag_sync.get("status") or "unknown"),
-                    int(rag_sync.get("synced") or 0),
-                )
+                rag_status = str(rag_sync.get("status") or "unknown")
+                rag_synced = int(rag_sync.get("synced") or 0)
+                rag_error = _rag_sync_error_detail(rag_sync)
+                if rag_status == "error" or rag_error:
+                    logger.warning(
+                        "rag sync status=%s synced=%s error=%s",
+                        rag_status,
+                        rag_synced,
+                        rag_error or "unknown",
+                    )
+                else:
+                    logger.info(
+                        "rag sync status=%s synced=%s",
+                        rag_status,
+                        rag_synced,
+                    )
             logger.info(
                 "reports worker cycle=%s inserted=%s total=%s",
                 cycle,

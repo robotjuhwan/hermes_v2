@@ -1,0 +1,37 @@
+{
+  "contract_id": "block_action_contract",
+  "version": 1,
+  "required": [
+    "symbol",
+    "market_or_account_scope",
+    "horizon",
+    "quantity_or_quote_budget",
+    "entry_style",
+    "target_price",
+    "stop_price",
+    "thesis",
+    "risk_note",
+    "confidence",
+    "evidence_refs"
+  ],
+  "action_keys": ["adopt_existing_blocks", "create_blocks", "update_blocks", "close_blocks", "pause_blocks"],
+  "price_fields": ["entry_price", "entry_trigger_price", "target_price", "stop_price"],
+  "evidence_fields": ["evidence_refs", "reasons", "risks", "data_gaps"],
+  "reject_when": [
+    "missing_symbol",
+    "missing_market_or_account_scope",
+    "missing_horizon",
+    "missing_quantity_or_quote_budget",
+    "missing_entry_style",
+    "missing_waiting_entry_trigger",
+    "missing_target_price",
+    "missing_stop_price",
+    "non_positive_price",
+    "invalid_long_price_order",
+    "invalid_short_price_order",
+    "missing_executable_price_structure",
+    "missing_evidence_refs",
+    "missing_thesis",
+    "missing_risk_note"
+  ]
+}

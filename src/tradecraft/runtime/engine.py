@@ -98,10 +98,12 @@ class RuntimeEngine:
         sessions: list[RuntimeSession],
         base_interval_sec: int,
         service_name: str = "tradecraft-runtime",
+        session_source: str = "",
     ) -> None:
         self.sessions = sessions
         self.base_interval_sec = max(int(base_interval_sec), 1)
         self.service_name = service_name
+        self.session_source = str(session_source or "")
 
     @property
     def session_count(self) -> int:
@@ -113,6 +115,7 @@ class RuntimeEngine:
         rows: list[dict[str, Any]],
         base_interval_sec: int = 5,
         service_name: str = "tradecraft-runtime",
+        session_source: str = "",
     ) -> "RuntimeEngine":
         interval = max(int(base_interval_sec), 1)
         sessions: list[RuntimeSession] = []
@@ -131,7 +134,12 @@ class RuntimeEngine:
                 )
             )
 
-        return cls(sessions=sessions, base_interval_sec=interval, service_name=service_name)
+        return cls(
+            sessions=sessions,
+            base_interval_sec=interval,
+            service_name=service_name,
+            session_source=session_source,
+        )
 
     def build_snapshot(self, cycle: int) -> dict[str, Any]:
         session_rows = [session.tick(cycle=cycle) for session in self.sessions]
@@ -145,22 +153,23 @@ class RuntimeEngine:
                 "role": "session_state_monitor",
                 "role_label": "세션 상태/heartbeat",
                 "description": (
-                    "거래소별 전략 세션의 heartbeat, risk, skeleton execution "
-                    "상태를 기록한다."
+                    "거래소별 전략 세션의 heartbeat와 risk 상태를 기록한다. "
+                    "주문 실행은 KIS/Binance 블록 러너가 담당한다."
                 ),
-                "execution_mode": "skeleton_noop",
+                "execution_mode": "state_writer_no_orders",
                 "executes_orders": False,
+                "session_source": self.session_source,
                 "base_interval_sec": self.base_interval_sec,
                 "sessions": self.session_count,
                 "managed_capabilities": [
                     "session_heartbeat",
-                    "strategy_skeleton",
+                    "session_state_snapshot",
                     "risk_state_snapshot",
                 ],
                 "externalized_capabilities": [
                     "research_and_reports:intelligence",
                     "market_signals:strategy_insights",
-                    "kis_trading:kis_trader",
+                    "kis_trading:kis_block_trader",
                 ],
             },
             "sessions": session_rows,

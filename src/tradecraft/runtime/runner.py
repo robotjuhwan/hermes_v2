@@ -5,7 +5,10 @@ import time
 
 from tradecraft.config import AppSettings
 from tradecraft.runtime.engine import RuntimeEngine
-from tradecraft.runtime.process_status import write_current_runner_pid
+from tradecraft.runtime.process_status import (
+    clear_current_runner_pid,
+    write_current_runner_pid,
+)
 from tradecraft.runtime.session_loader import load_runtime_sessions
 from tradecraft.runtime.state_store import RuntimeStateStore
 
@@ -18,6 +21,7 @@ def _build_runtime_engine(settings: AppSettings, interval: int) -> tuple[Runtime
         session_rows,
         base_interval_sec=interval,
         service_name="tradecraft-runtime",
+        session_source=source,
     )
     return engine, source
 
@@ -44,12 +48,21 @@ def run() -> None:
     logger.info("runtime session source: %s", session_source)
 
     cycle = 0
-    while True:
-        cycle += 1
-        snapshot = engine.build_snapshot(cycle=cycle)
-        store.write_snapshot(snapshot)
-        logger.info("runtime heartbeat written: cycle=%s sessions=%s", cycle, engine.session_count)
-        time.sleep(interval)
+    try:
+        while True:
+            cycle += 1
+            snapshot = engine.build_snapshot(cycle=cycle)
+            store.write_snapshot(snapshot)
+            logger.info(
+                "runtime heartbeat written: cycle=%s sessions=%s",
+                cycle,
+                engine.session_count,
+            )
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        logger.info("runtime state writer interrupted; stopping")
+    finally:
+        clear_current_runner_pid("runtime")
 
 
 if __name__ == "__main__":

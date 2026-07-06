@@ -1,0 +1,13 @@
+{
+  "contract_id": "thesis_update_contract",
+  "version": 1,
+  "required": ["symbol", "thesis_statement", "impact", "conviction_delta", "invalidation", "evidence_refs"],
+  "impact_values": ["strengthen", "neutral", "weaken", "broken"],
+  "reject_when": [
+    "missing_symbol",
+    "missing_thesis_statement",
+    "missing_invalidation",
+    "impact_not_allowed",
+    "conviction_delta_missing"
+  ]
+}

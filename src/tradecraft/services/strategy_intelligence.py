@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import logging
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urljoin
 
 import httpx
 
-from tradecraft.services.llm_bridge import LLMBridge
+from tradecraft.services.jue_language_policy import jue_language_policy
+from tradecraft.services.codex_native import CodexNativeRuntime
+
+logger = logging.getLogger(__name__)
 
 
 class ReportRepository(Protocol):
@@ -34,9 +40,26 @@ class ReportRepository(Protocol):
 
     def resolve_symbol_names(self, symbols: list[str]) -> dict[str, str]: ...
 
+    def latest_symbol_linked_reports(
+        self,
+        symbol: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]: ...
+
 
 class FundamentalsRepository(Protocol):
     def latest(self, symbol: str) -> dict[str, Any] | None: ...
+
+
+class ETFResearchProvider(Protocol):
+    def list_universe(self) -> list[dict[str, Any]]: ...
+
+    def latest_snapshot(self, symbol: str) -> dict[str, Any]: ...
+
+    def latest_score(self, symbol: str) -> dict[str, Any]: ...
+
+    def status(self) -> dict[str, Any]: ...
 
 
 class RAGQueryStore(Protocol):
@@ -72,6 +95,9 @@ class StrategyIntelligenceConfig:
     model_timeout_ms: int = 120000
     max_report_scan: int = 90
     max_candidates: int = 8
+    brief_cache_ttl_sec: int = 60
+    migrate_legacy_jsonl: bool = False
+    legacy_jsonl_sidecar_max_lines: int = 500
 
 
 _CANDIDATE_WORDS = {
@@ -92,6 +118,12 @@ _MARKET_WORDS = {"시장", "거시", "분위기", "regime", "리스크온", "리
 _REVIEW_WORDS = {"복기", "결과", "맞았", "틀렸", "성과"}
 _STOCK_WORDS = {"종목", "목표가", "목표주가", "실적", "밸류", "리스크"}
 _REPORT_WORDS = {"리포트", "보고서", "근거", "요약", "원문"}
+_ETF_INTENT_WORDS = {
+    "etf",
+    "상장지수",
+    "kodex",
+    "tiger",
+}
 _POSITIVE_WORDS = {
     "상향",
     "개선",
@@ -213,6 +245,18 @@ _GENERIC_NAME_TOKENS = {
     "국내시세정보",
     "코스콤국내시세정보",
 }
+_GENERIC_ETF_NAME_PREFIXES = {
+    "ACE",
+    "ARIRANG",
+    "HANARO",
+    "KBSTAR",
+    "KODEX",
+    "KOSEF",
+    "RISE",
+    "SOL",
+    "TIGER",
+    "TIMEFOLIO",
+}
 
 
 def _now_iso() -> str:
@@ -225,9 +269,258 @@ def _clean_text(value: Any, *, limit: int = 700) -> str:
     return text[: max(int(limit), 1)]
 
 
+def _parse_signal_date(value: Any) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(text).astimezone(timezone.utc).date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _external_source_stale_after_days(source_id: str) -> int:
+    normalized = str(source_id or "").strip().lower()
+    if normalized == "after_close_330":
+        return 2
+    if normalized == "whale_insight":
+        return 5
+    return 7
+
+
+def _latest_signal_date(rows: list[dict[str, Any]]) -> str:
+    dated: list[tuple[date, str]] = []
+    for row in rows:
+        raw = str(row.get("as_of") or row.get("published_at") or "").strip()
+        parsed = _parse_signal_date(raw)
+        if parsed is not None:
+            dated.append((parsed, raw))
+    if not dated:
+        return ""
+    dated.sort(key=lambda item: item[0])
+    return dated[-1][1]
+
+
+def _apply_external_source_freshness(payload: dict[str, Any]) -> None:
+    if not payload.get("signals") and int(payload.get("count") or 0) <= 0:
+        return
+    source_id = str(payload.get("source_id") or "")
+    latest_as_of = str(payload.get("latest_as_of") or "").strip()
+    if not latest_as_of:
+        latest_as_of = _latest_signal_date(list(payload.get("signals") or []))
+        if latest_as_of:
+            payload["latest_as_of"] = latest_as_of
+    parsed = _parse_signal_date(latest_as_of)
+    warnings = list(payload.get("warnings") or [])
+    if parsed is None:
+        payload["status"] = "stale"
+        payload["stale"] = True
+        payload["stale_reason"] = "missing_latest_as_of"
+        warnings.append("latest_as_of 없음: 외부 수급/고래 신호 최신성 확인 필요")
+        payload["warnings"] = warnings
+        return
+    today = datetime.now(timezone.utc).date()
+    stale_days = max((today - parsed).days, 0)
+    stale_after_days = _external_source_stale_after_days(source_id)
+    payload["stale_days"] = stale_days
+    payload["stale_after_days"] = stale_after_days
+    if stale_days > stale_after_days:
+        payload["status"] = "stale"
+        payload["stale"] = True
+        payload["stale_reason"] = "latest_as_of_too_old"
+        warnings.append(
+            f"latest_as_of {latest_as_of} is {stale_days} days old "
+            f"(limit {stale_after_days}d)"
+        )
+    else:
+        payload["stale"] = False
+    if warnings:
+        payload["warnings"] = warnings
+
+
+def _is_external_signal_stale(source_id: str, signal: dict[str, Any]) -> bool:
+    return bool(_external_signal_freshness(source_id, signal)["stale"])
+
+
+def _external_signal_freshness(source_id: str, signal: dict[str, Any]) -> dict[str, Any]:
+    raw = str(signal.get("as_of") or signal.get("published_at") or "").strip()
+    stale_after_days = _external_source_stale_after_days(
+        str(signal.get("source_id") or source_id or "")
+    )
+    parsed = _parse_signal_date(raw)
+    if parsed is None:
+        return {
+            "stale": True,
+            "stale_days": None,
+            "stale_after_days": stale_after_days,
+            "stale_reason": "missing_as_of",
+        }
+    stale_days = max((datetime.now(timezone.utc).date() - parsed).days, 0)
+    stale = stale_days > stale_after_days
+    return {
+        "stale": stale,
+        "stale_days": stale_days,
+        "stale_after_days": stale_after_days,
+        "stale_reason": "as_of_too_old" if stale else "",
+    }
+
+
+def _decorate_external_signal_freshness(
+    source_id: str, signal: dict[str, Any]
+) -> dict[str, Any]:
+    row = dict(signal)
+    row.update(_external_signal_freshness(source_id, row))
+    return row
+
+
 def _keyword_hits(text: str, words: set[str]) -> list[str]:
     lower = text.lower()
     return [word for word in words if word in lower]
+
+
+def _has_etf_intent(query: str) -> bool:
+    text = str(query or "").lower()
+    return any(word in text for word in _ETF_INTENT_WORDS)
+
+
+def _is_etf_payload(row: dict[str, Any]) -> bool:
+    return str(row.get("asset_class") or "").lower() == "etf"
+
+
+def _clean_etf_display_name(value: Any, *, symbol: str = "") -> str:
+    text = _clean_text(value, limit=50)
+    if not text or _has_subject_boilerplate(text):
+        return ""
+    if symbol:
+        text = re.sub(rf"\(?\b{re.escape(symbol)}\b\)?", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -:/|,.;")
+    return text if re.search(r"[A-Za-z가-힣]", text) else ""
+
+
+def _is_generic_etf_display_name(value: Any) -> bool:
+    text = _clean_etf_display_name(value)
+    if not text:
+        return True
+    compact = _compact(text).upper()
+    return compact in _GENERIC_ETF_NAME_PREFIXES
+
+
+def _prefer_etf_display_name(current: Any, candidate: Any, *, symbol: str = "") -> str:
+    current_name = _clean_etf_display_name(current, symbol=symbol)
+    candidate_name = _clean_etf_display_name(candidate, symbol=symbol)
+    if not candidate_name:
+        return current_name
+    if not current_name or current_name == symbol:
+        return candidate_name
+    if _is_generic_etf_display_name(current_name) and not _is_generic_etf_display_name(
+        candidate_name,
+    ):
+        return candidate_name
+    if _compact(candidate_name).upper().startswith(_compact(current_name).upper()) and len(
+        candidate_name
+    ) > len(current_name):
+        return candidate_name
+    if len(candidate_name) > len(current_name) and not _is_generic_etf_display_name(candidate_name):
+        return candidate_name
+    return current_name
+
+
+def _include_etf_intent_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    max_items: int,
+    etf_intent: bool,
+) -> list[dict[str, Any]]:
+    top_candidates = list(candidates[:max_items])
+    if max_items <= 0:
+        return top_candidates
+    if not etf_intent:
+        non_etf_pool = [row for row in candidates if not _is_etf_payload(row)]
+        target_non_etf = min(len(non_etf_pool), max(1, max_items // 2))
+        if target_non_etf <= 0:
+            return top_candidates
+
+        selected_symbols = {str(row.get("symbol") or "") for row in top_candidates}
+        selected_non_etf = sum(1 for row in top_candidates if not _is_etf_payload(row))
+        for equity_row in non_etf_pool:
+            if selected_non_etf >= target_non_etf:
+                break
+            symbol = str(equity_row.get("symbol") or "")
+            if symbol in selected_symbols:
+                continue
+            replace_index = next(
+                (
+                    index
+                    for index in range(len(top_candidates) - 1, -1, -1)
+                    if _is_etf_payload(top_candidates[index])
+                ),
+                None,
+            )
+            if replace_index is None:
+                break
+            removed_symbol = str(top_candidates[replace_index].get("symbol") or "")
+            selected_symbols.discard(removed_symbol)
+            top_candidates[replace_index] = equity_row
+            selected_symbols.add(symbol)
+            selected_non_etf += 1
+        top_candidates.sort(key=lambda row: (int(row["score"]), int(row["confidence"])), reverse=True)
+        if len(top_candidates) >= 3 and not any(
+            not _is_etf_payload(row) for row in top_candidates[:3]
+        ):
+            non_etf_index = next(
+                (
+                    index
+                    for index, row in enumerate(top_candidates[3:], start=3)
+                    if not _is_etf_payload(row)
+                ),
+                None,
+            )
+            if non_etf_index is not None:
+                non_etf_row = top_candidates.pop(non_etf_index)
+                top_candidates.insert(2, non_etf_row)
+        return top_candidates[:max_items]
+
+    selected_symbols = {str(row.get("symbol") or "") for row in top_candidates}
+    desired_etfs = [row for row in candidates if _is_etf_payload(row)][
+        : min(max(3, max_items // 3), max_items)
+    ]
+    for etf_row in desired_etfs:
+        symbol = str(etf_row.get("symbol") or "")
+        if symbol in selected_symbols:
+            continue
+        if len(top_candidates) < max_items:
+            top_candidates.append(etf_row)
+            selected_symbols.add(symbol)
+            continue
+
+        replace_index = next(
+            (
+                index
+                for index in range(len(top_candidates) - 1, -1, -1)
+                if not _is_etf_payload(top_candidates[index])
+            ),
+            None,
+        )
+        if replace_index is None:
+            break
+        removed_symbol = str(top_candidates[replace_index].get("symbol") or "")
+        selected_symbols.discard(removed_symbol)
+        top_candidates[replace_index] = etf_row
+        selected_symbols.add(symbol)
+
+    top_candidates.sort(key=lambda row: (int(row["score"]), int(row["confidence"])), reverse=True)
+    return top_candidates[:max_items]
 
 
 def _is_low_quality_evidence_text(value: Any, *, min_chars: int = 18) -> bool:
@@ -252,6 +545,64 @@ def _is_low_quality_evidence_text(value: Any, *, min_chars: int = 18) -> bool:
     if digit_ratio > 0.45 and len(useful_hits) < 2:
         return True
     return False
+
+
+def _is_market_table_evidence_text(value: Any) -> bool:
+    text = _clean_text(value, limit=500)
+    if not text:
+        return True
+    lower = text.lower()
+    table_tokens = (
+        "1d(%)",
+        "5d(%)",
+        "mtd(%)",
+        "ytd(%)",
+        "1d(bp)",
+        "5d(bp)",
+        "close",
+        "dow",
+        "nasdaq",
+        "d-20",
+        "global indices",
+        "korea market",
+        "ficc",
+        "주요지수",
+        "지수등락률",
+    )
+    token_hits = sum(1 for token in table_tokens if token in lower)
+    evidence_hits = _keyword_hits(lower, _EVIDENCE_WORDS | _POSITIVE_WORDS | _NEGATIVE_WORDS)
+    return token_hits >= 3 and len(evidence_hits) <= 1
+
+
+def _is_etf_specific_evidence_text(value: Any, *, symbol: str, name: str) -> bool:
+    text = _clean_text(value, limit=500)
+    if not text or _is_market_table_evidence_text(text):
+        return False
+    lower = text.lower()
+    if symbol and symbol in text:
+        return True
+    clean_name = _clean_etf_display_name(name, symbol=symbol)
+    if clean_name and len(clean_name) >= 4 and clean_name.lower() in lower:
+        return True
+    compact_text = _compact(text).lower()
+    compact_name = _compact(clean_name).lower()
+    if compact_name and len(compact_name) >= 4 and compact_name in compact_text:
+        return True
+    return any(
+        keyword in lower
+        for keyword in (
+            "etf",
+            "상장지수",
+            "코스닥150",
+            "kosdaq150",
+            "코스피200",
+            "kospi200",
+            "s&p500",
+            "sp500",
+            "나스닥100",
+            "nasdaq100",
+        )
+    )
 
 
 def _query_terms(query: str) -> list[str]:
@@ -568,7 +919,7 @@ def _candidate_data_coverage(
         "source_count": len(source_set),
         "coverage_score": coverage_score,
         "has_report": "naver_reports" in source_set,
-        "has_research": "research_feed" in source_set,
+        "has_research": bool(source_set.intersection({"research_feed", "daily_discovery"})),
         "has_whale": "whale_insight" in source_set,
         "has_after_close": "after_close_330" in source_set,
         "has_valuation": has_valuation,
@@ -618,7 +969,11 @@ def _candidate_data_warnings(
     if int(coverage.get("source_count") or 0) <= 1:
         warnings.append("소스 1개")
     missing = set(str(item) for item in list(coverage.get("missing") or []))
-    if "밸류" in missing or str(valuation.get("status") or "").lower() != "ok":
+    valuation_status = str(valuation.get("status") or "").lower()
+    if (
+        valuation_status != "not_applicable"
+        and ("밸류" in missing or valuation_status != "ok")
+    ):
         warnings.append("밸류 미수집")
     if "고래" in missing:
         warnings.append("고래 없음")
@@ -627,6 +982,135 @@ def _candidate_data_warnings(
     if "리포트" in missing:
         warnings.append("리포트 없음")
     return list(dict.fromkeys(warnings))[:6]
+
+
+def _etf_candidate_suitability(
+    *,
+    components: dict[str, int],
+    reasons: list[str],
+    risks: list[str],
+    has_etf_research: bool,
+    has_report: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    report = int(components.get("report") or 0)
+    liquidity = int(components.get("liquidity") or 0)
+    momentum = int(components.get("momentum") or 0)
+    core_fit = int(components.get("core_fit") or 0)
+    risk = int(components.get("risk_penalty") or 0)
+    recency = int(components.get("recency") or 0)
+    evidence = int(components.get("evidence") or 0)
+    source_count = int(has_etf_research) + int(has_report)
+    coverage_score = min(
+        100,
+        24
+        + (28 if has_etf_research else 0)
+        + (18 if has_report else 0)
+        + (16 if liquidity >= 50 else 0)
+        + (12 if evidence >= 45 else 0),
+    )
+    coverage = {
+        "source_count": source_count,
+        "coverage_score": coverage_score,
+        "has_report": has_report,
+        "has_research": False,
+        "has_whale": False,
+        "has_after_close": False,
+        "has_valuation": False,
+        "has_quality_data": False,
+        "has_growth_data": False,
+        "has_etf_research": has_etf_research,
+        "missing": [] if has_etf_research else ["ETF리서치"],
+    }
+    base_risks = list(risks[:2])
+    if risk >= 65:
+        base_risks.insert(0, f"리스크 점수 {risk}")
+    labels = {
+        "report": "ETF 리포트",
+        "liquidity": "ETF 유동성",
+        "momentum": "ETF 모멘텀",
+        "core_fit": "코어 적합도",
+        "recency": "최신성",
+        "evidence": "근거품질",
+    }
+    short_raw = (
+        18.0
+        + report * 0.16
+        + liquidity * 0.24
+        + momentum * 0.30
+        + core_fit * 0.18
+        + recency * 0.06
+        + evidence * 0.06
+        - risk * 0.20
+    )
+    mid_raw = (
+        18.0
+        + report * 0.18
+        + liquidity * 0.26
+        + momentum * 0.18
+        + core_fit * 0.28
+        + recency * 0.04
+        + evidence * 0.06
+        - risk * 0.20
+    )
+    long_raw = (
+        18.0
+        + report * 0.14
+        + liquidity * 0.24
+        + momentum * 0.10
+        + core_fit * 0.40
+        + recency * 0.04
+        + evidence * 0.08
+        - risk * 0.18
+    )
+    short_term = _horizon_bucket(
+        score=short_raw,
+        components=components,
+        coverage=coverage,
+        labels=labels,
+        base_drivers=list(reasons[:2]),
+        base_risks=base_risks,
+    )
+    mid_term = _horizon_bucket(
+        score=mid_raw,
+        components=components,
+        coverage=coverage,
+        labels=labels,
+        base_drivers=list(reasons[:2]),
+        base_risks=base_risks,
+    )
+    long_term = _horizon_bucket(
+        score=long_raw,
+        components=components,
+        coverage=coverage,
+        labels=labels,
+        base_drivers=list(reasons[:2]),
+        base_risks=base_risks,
+    )
+    balanced_score = _clamp_score(
+        short_term["score"] * 0.30 + mid_term["score"] * 0.30 + long_term["score"] * 0.40
+    )
+    balanced = {
+        "score": balanced_score,
+        "grade": _grade_for_score(
+            balanced_score,
+            evidence=evidence,
+            coverage_score=coverage_score,
+        ),
+        "drivers": list(
+            dict.fromkeys(
+                short_term["drivers"][:1]
+                + mid_term["drivers"][:1]
+                + long_term["drivers"][:1]
+            )
+        )[:4],
+        "risks": list(dict.fromkeys(base_risks))[:4],
+    }
+    return {
+        "short_term": short_term,
+        "mid_term": mid_term,
+        "long_term": long_term,
+        "balanced": balanced,
+    }, coverage
 
 
 def _horizon_bucket(
@@ -655,6 +1139,27 @@ def _horizon_bucket(
     }
 
 
+def _raise_horizon_floor(
+    bucket: dict[str, Any],
+    *,
+    floor: int,
+    evidence: int,
+    coverage_score: int,
+    driver: str,
+) -> None:
+    current = int(bucket.get("score") or 0)
+    if current >= floor:
+        return
+    bucket["score"] = floor
+    bucket["grade"] = _grade_for_score(
+        floor,
+        evidence=evidence,
+        coverage_score=coverage_score,
+    )
+    drivers = list(bucket.get("drivers") or [])
+    bucket["drivers"] = list(dict.fromkeys([driver] + drivers))[:4]
+
+
 def _candidate_suitability(
     *,
     item: dict[str, Any],
@@ -671,6 +1176,7 @@ def _candidate_suitability(
     )
     risk = int(components.get("risk_penalty") or 0)
     report = int(components.get("report") or 0)
+    research = int(components.get("research") or 0)
     after_close = int(components.get("after_close") or 0)
     whale = int(components.get("whale") or 0)
     valuation_score = int(components.get("valuation") or 0)
@@ -693,6 +1199,7 @@ def _candidate_suitability(
         17.0
         + after_close * 0.30
         + report * 0.25
+        + research * 0.25
         + recency * 0.15
         + evidence * 0.10
         + whale * 0.10
@@ -703,6 +1210,7 @@ def _candidate_suitability(
     mid_raw = (
         17.0
         + report * 0.25
+        + research * 0.18
         + growth * 0.20
         + valuation_score * 0.15
         + after_close * 0.15
@@ -718,6 +1226,7 @@ def _candidate_suitability(
         + valuation_score * 0.20
         + whale * 0.15
         + report * 0.10
+        + research * 0.08
         + evidence * 0.05
         + after_close * 0.05
         - risk * 0.22
@@ -732,6 +1241,7 @@ def _candidate_suitability(
         labels={
             "after_close": "단기 수급",
             "report": "리포트 모멘텀",
+            "research": "디스커버리/리서치",
             "recency": "최신성",
             "evidence": "근거품질",
             "whale": "고래",
@@ -745,6 +1255,7 @@ def _candidate_suitability(
         coverage=coverage,
         labels={
             "report": "리포트 모멘텀",
+            "research": "디스커버리/리서치",
             "growth": "성장",
             "valuation": "밸류",
             "after_close": "수급",
@@ -763,10 +1274,41 @@ def _candidate_suitability(
             "valuation": "밸류",
             "whale": "고래",
             "report": "리포트",
+            "research": "디스커버리/리서치",
         },
         base_drivers=list(reasons[:2]),
         base_risks=common_risks,
     )
+    if after_close >= 70:
+        _raise_horizon_floor(
+            short_term,
+            floor=min(72, 48 + int(after_close * 0.20)),
+            evidence=evidence,
+            coverage_score=int(coverage.get("coverage_score") or 0),
+            driver=f"세시반 독립 수급 {after_close}",
+        )
+        _raise_horizon_floor(
+            mid_term,
+            floor=min(54, 32 + int(after_close * 0.12)),
+            evidence=evidence,
+            coverage_score=int(coverage.get("coverage_score") or 0),
+            driver=f"세시반 다음 거래일 확인 {after_close}",
+        )
+    if whale >= 70:
+        _raise_horizon_floor(
+            mid_term,
+            floor=min(56, 34 + int(whale * 0.12)),
+            evidence=evidence,
+            coverage_score=int(coverage.get("coverage_score") or 0),
+            driver=f"고래 포지션 변화 {whale}",
+        )
+        _raise_horizon_floor(
+            long_term,
+            floor=min(58, 36 + int(whale * 0.13)),
+            evidence=evidence,
+            coverage_score=int(coverage.get("coverage_score") or 0),
+            driver=f"고래 중장기 검토 {whale}",
+        )
     balanced_score = _clamp_score(
         (short_term["score"] + mid_term["score"] + long_term["score"]) / 3
     )
@@ -868,6 +1410,18 @@ def _is_candidate_symbol(value: Any) -> bool:
 
 def _compact(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or ""))
+
+
+def _corporate_name_key(value: Any) -> str:
+    key = _compact(value)
+    if not key:
+        return ""
+    key = key.replace("㈜", "").replace("(주)", "").replace("주식회사", "")
+    for suffix in ("공사", "공단", "유한회사"):
+        if key.endswith(suffix) and len(key) > len(suffix) + 1:
+            key = key[: -len(suffix)]
+            break
+    return key
 
 
 def _sanitize_subject_name(value: Any, *, symbol: str = "") -> str:
@@ -1145,6 +1699,7 @@ class JSONLInsightSource:
                     }
                 )
             total_count = len(signals)
+            latest_as_of = _latest_signal_date(signals)
 
         payload = {
             "source_id": self.config.source_id,
@@ -1158,7 +1713,10 @@ class JSONLInsightSource:
             "status": "ok" if signals else "waiting",
             "count": total_count,
             "returned_count": len(signals),
-            "signals": signals,
+            "signals": [
+                _decorate_external_signal_freshness(self.config.source_id, row)
+                for row in signals
+            ],
         }
         if self.repository is not None:
             payload["db_path"] = self.repository.db_path
@@ -1168,6 +1726,9 @@ class JSONLInsightSource:
             payload["latest_collected_at"] = latest_collected_at
         else:
             payload["storage"] = "jsonl"
+            if latest_as_of:
+                payload["latest_as_of"] = latest_as_of
+        _apply_external_source_freshness(payload)
         return payload
 
 
@@ -1321,7 +1882,11 @@ class StrategyInsightRepository:
             raise RuntimeError("strategy insight db path is not configured")
         path = Path(self.db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(path))
+        conn = sqlite3.connect(str(path), timeout=30.0)
+        conn.execute("PRAGMA busy_timeout = 30000")
+        if str(path) != ":memory:":
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -1518,6 +2083,95 @@ class StrategyInsightRepository:
             else "",
             "signals": signals,
         }
+
+    def prune_history(
+        self,
+        *,
+        retention_days: int = 45,
+        signal_row_cap_per_symbol: int = 96,
+        now_iso: str | None = None,
+        vacuum: bool = True,
+    ) -> dict[str, Any]:
+        days = int(retention_days)
+        if days <= 0:
+            return {
+                "status": "skipped",
+                "reason": "retention_disabled",
+                "retention_days": days,
+                "deleted": {},
+                "vacuumed": False,
+            }
+        try:
+            base_now = (
+                datetime.fromisoformat(str(now_iso).replace("Z", "+00:00"))
+                if now_iso
+                else datetime.now(timezone.utc)
+            )
+        except ValueError:
+            base_now = datetime.now(timezone.utc)
+        if base_now.tzinfo is None:
+            base_now = base_now.replace(tzinfo=timezone.utc)
+        cutoff = (base_now - timedelta(days=days)).isoformat()
+        with self._connect() as conn:
+            deleted = int(
+                conn.execute(
+                    "DELETE FROM strategy_signals WHERE as_of < ?",
+                    (cutoff,),
+                ).rowcount
+                or 0
+            )
+            capped_deleted = self._delete_repeated_signal_rows(
+                conn,
+                row_cap_per_symbol=signal_row_cap_per_symbol,
+            )
+        vacuumed = False
+        if vacuum and (deleted or capped_deleted):
+            with sqlite3.connect(self.db_path, isolation_level=None) as conn:
+                conn.execute("VACUUM")
+            vacuumed = True
+        return {
+            "status": "ok",
+            "retention_days": days,
+            "cutoff": cutoff,
+            "signal_row_cap_per_symbol": int(signal_row_cap_per_symbol),
+            "deleted": {
+                "strategy_signals": deleted,
+                "strategy_signals_capped": capped_deleted,
+            },
+            "vacuumed": vacuumed,
+        }
+
+    @staticmethod
+    def _delete_repeated_signal_rows(
+        conn: sqlite3.Connection,
+        *,
+        row_cap_per_symbol: int,
+    ) -> int:
+        cap = int(row_cap_per_symbol)
+        if cap <= 0:
+            return 0
+        return int(
+            conn.execute(
+                """
+                DELETE FROM strategy_signals
+                WHERE signal_id IN (
+                    SELECT signal_id
+                    FROM (
+                        SELECT
+                            signal_id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY source_id, signal_type, symbol
+                                ORDER BY as_of DESC, signal_id DESC
+                            ) AS row_rank
+                        FROM strategy_signals
+                    )
+                    WHERE row_rank > ?
+                )
+                """,
+                (cap,),
+            ).rowcount
+            or 0
+        )
 
     def migrate_jsonl(
         self,
@@ -1949,6 +2603,16 @@ class StrategyInsightCollector:
 
     def _resolve_symbol_from_repository(self, name: str) -> str:
         repository = getattr(self.engine, "repository", None)
+        resolve_from_text = getattr(repository, "resolve_symbol_from_text", None)
+        if callable(resolve_from_text):
+            try:
+                resolved = resolve_from_text(name)
+            except Exception:
+                resolved = None
+            if isinstance(resolved, dict):
+                symbol = str(resolved.get("symbol") or "").strip()
+                if _is_candidate_symbol(symbol):
+                    return symbol
         search = getattr(repository, "search", None)
         if not callable(search):
             return ""
@@ -1957,6 +2621,7 @@ class StrategyInsightCollector:
         except Exception:
             return ""
         name_key = _compact(name)
+        canonical_name_key = _corporate_name_key(name)
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -1964,7 +2629,10 @@ class StrategyInsightCollector:
             if not _is_candidate_symbol(symbol):
                 continue
             row_name = row.get("company_name") or row.get("name") or row.get("title")
-            if _compact(row_name) == name_key:
+            row_key = _compact(row_name)
+            if row_key == name_key:
+                return symbol
+            if canonical_name_key and _corporate_name_key(row_name) == canonical_name_key:
                 return symbol
         return ""
 
@@ -2079,15 +2747,18 @@ class StrategyIntelligenceEngine:
         *,
         repository: ReportRepository,
         rag_store: RAGQueryStore | None,
-        llm_bridge: LLMBridge,
+        codex_runtime: CodexNativeRuntime,
         fundamentals_repository: FundamentalsRepository | None = None,
+        etf_research_repository: ETFResearchProvider | None = None,
         config: StrategyIntelligenceConfig | None = None,
     ) -> None:
         self.repository = repository
         self.rag_store = rag_store
-        self.llm_bridge = llm_bridge
+        self.codex_runtime = codex_runtime
         self.fundamentals_repository = fundamentals_repository
+        self.etf_research_repository = etf_research_repository
         self.config = config or StrategyIntelligenceConfig()
+        self._brief_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self.insight_repository = (
             StrategyInsightRepository(self.config.insight_db_path)
             if self.config.insight_db_path
@@ -2122,7 +2793,7 @@ class StrategyIntelligenceEngine:
                         "closing_candidate",
                     ],
                     coverage=["KOSPI", "KOSDAQ"],
-                    caution="매매 추천이 아니라 당일 시장 분위기와 후보군 보조 신호",
+                    caution="다음 거래일 블록 매매 후보를 좁히는 당일 수급/섹터 운영 신호",
                 ),
                 repository=self.insight_repository,
             ),
@@ -2132,14 +2803,78 @@ class StrategyIntelligenceEngine:
     def _migrate_existing_jsonl_signals(self) -> None:
         if self.insight_repository is None:
             return
+        if not bool(self.config.migrate_legacy_jsonl):
+            return
         for source in self.sources:
             try:
+                summary = self.insight_repository.source_summary(
+                    source_id=source.config.source_id,
+                    limit=1,
+                )
+                if int(summary.get("total_count") or 0) > 0:
+                    continue
                 self.insight_repository.migrate_jsonl(
                     source_id=source.config.source_id,
                     path=source.config.path,
                 )
-            except Exception:
-                continue
+            except Exception as exc:
+                logger.warning(
+                    "strategy insight legacy JSONL migration skipped for %s: %s",
+                    source.config.source_id,
+                    exc,
+                )
+
+    def compact_legacy_jsonl_sidecars(
+        self,
+        *,
+        max_lines_per_source: int | None = None,
+    ) -> dict[str, Any]:
+        if self.insight_repository is None:
+            return {
+                "status": "skipped",
+                "reason": "sqlite_storage_disabled",
+                "sources": [],
+            }
+        limit = int(
+            max_lines_per_source
+            if max_lines_per_source is not None
+            else self.config.legacy_jsonl_sidecar_max_lines
+        )
+        if limit <= 0:
+            return {
+                "status": "skipped",
+                "reason": "sidecar_compaction_disabled",
+                "sources": [],
+            }
+
+        sources: list[dict[str, Any]] = []
+        for source in self.sources:
+            path = Path(source.config.path)
+            rows = self.insight_repository.list_signals(
+                source_id=source.config.source_id,
+                limit=limit,
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            old_bytes = path.stat().st_size if path.exists() else 0
+            with path.open("w", encoding="utf-8") as handle:
+                for row in reversed(rows):
+                    handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            new_bytes = path.stat().st_size if path.exists() else 0
+            sources.append(
+                {
+                    "source_id": source.config.source_id,
+                    "path": str(path),
+                    "rows": len(rows),
+                    "old_bytes": old_bytes,
+                    "new_bytes": new_bytes,
+                    "bytes_saved": max(old_bytes - new_bytes, 0),
+                }
+            )
+        return {
+            "status": "ok",
+            "max_lines_per_source": limit,
+            "sources": sources,
+        }
 
     def source_status(self) -> list[dict[str, Any]]:
         return [source.read(limit=200) for source in self.sources]
@@ -2164,12 +2899,18 @@ class StrategyIntelligenceEngine:
                 date_to=date_to,
                 limit=limit,
             )
+            items = [
+                _decorate_external_signal_freshness(
+                    str(row.get("source_id") or normalized_source), row
+                )
+                for row in rows
+            ]
             return {
                 "status": "ok",
                 "storage": "sqlite",
                 "db_path": self.insight_repository.db_path,
-                "count": len(rows),
-                "items": rows,
+                "count": len(items),
+                "items": items,
             }
 
         items: list[dict[str, Any]] = []
@@ -2184,7 +2925,9 @@ class StrategyIntelligenceEngine:
                     continue
                 if date_to and as_of > date_to:
                     continue
-                items.append(row)
+                items.append(
+                    _decorate_external_signal_freshness(source.config.source_id, row)
+                )
         items.sort(key=lambda row: str(row.get("as_of") or ""), reverse=True)
         max_rows = max(1, min(int(limit or 200), 5000))
         return {
@@ -2230,7 +2973,7 @@ class StrategyIntelligenceEngine:
             db_result = self.insight_repository.upsert_signals(rows)
 
         path = Path(source.config.path)
-        if self.insight_repository is None or int((db_result or {}).get("inserted") or 0) > 0:
+        if self.insight_repository is None:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
                 for row in rows:
@@ -2332,6 +3075,23 @@ class StrategyIntelligenceEngine:
         out: dict[str, dict[str, Any]] = {}
         if not isinstance(research_feed, dict):
             return out
+
+        def ensure_item(code: str) -> dict[str, Any]:
+            return out.setdefault(
+                code,
+                {
+                    "symbol": code,
+                    "name": "",
+                    "score": 0.0,
+                    "confidence": 0,
+                    "reasons": [],
+                    "risks": [],
+                    "facts": [],
+                    "published_dates": [],
+                    "sources": set(),
+                },
+            )
+
         for row in list(research_feed.get("items") or [])[:30]:
             if not isinstance(row, dict):
                 continue
@@ -2340,27 +3100,88 @@ class StrategyIntelligenceEngine:
                 code = str(symbol or "").strip()
                 if not _is_candidate_symbol(code):
                     continue
-                item = out.setdefault(
-                    code,
-                    {
-                        "symbol": code,
-                        "score": 0.0,
-                        "reasons": [],
-                        "sources": set(),
-                    },
-                )
+                item = ensure_item(code)
                 item["score"] += 8.0
-                item["sources"].add(str(row.get("source") or "research"))
+                item["sources"].add(str(row.get("source") or "research_feed"))
                 title = _clean_text(row.get("title"), limit=70)
                 if title:
                     item["reasons"].append(f"리서치 후보군에 포함: {title}")
+                published = str(row.get("published_at") or row.get("as_of") or "")
+                if published:
+                    item["published_dates"].append(published)
+
+        discovery = research_feed.get("daily_discovery")
+        if isinstance(discovery, dict):
+            trading_day = str(
+                discovery.get("trading_day")
+                or discovery.get("date")
+                or discovery.get("generated_at")
+                or "",
+            )
+            for row in list(discovery.get("items") or [])[:40]:
+                if not isinstance(row, dict):
+                    continue
+                code = str(row.get("symbol") or row.get("code") or "").strip()
+                if not _is_candidate_symbol(code):
+                    continue
+                analysis = row.get("analysis") if isinstance(row.get("analysis"), dict) else {}
+                item = ensure_item(code)
+                name = _sanitize_subject_name(
+                    row.get("name") or analysis.get("name"),
+                    symbol=code,
+                )
+                if name:
+                    item["name"] = name
+
+                raw_score = _safe_float(row.get("score") or analysis.get("score"))
+                stance = str(analysis.get("stance") or row.get("stance") or "").lower()
+                if raw_score <= 0:
+                    raw_score = 60.0
+                if stance in {"block_candidate", "create", "buy", "enter"}:
+                    score_delta = 14.0
+                elif stance in {"confirm", "watch", "watchlist"}:
+                    score_delta = 8.0 + max(0.0, min(6.0, (raw_score - 55.0) / 6.0))
+                elif stance in {"risk_check", "caution"}:
+                    score_delta = 5.0 + max(0.0, min(3.0, (raw_score - 55.0) / 10.0))
+                else:
+                    score_delta = 6.0 + max(0.0, min(5.0, (raw_score - 55.0) / 8.0))
+                item["score"] += score_delta
+                confidence_raw = _safe_float(analysis.get("confidence") or row.get("confidence"))
+                if 0 < confidence_raw <= 1:
+                    confidence_raw *= 100
+                item["confidence"] = max(int(item.get("confidence") or 0), _clamp_score(confidence_raw))
+                item["sources"].add("daily_discovery")
+                if trading_day:
+                    item["published_dates"].append(trading_day)
+
+                summary = _clean_text(analysis.get("summary") or row.get("summary"), limit=130)
+                if summary:
+                    item["reasons"].append(f"데일리 디스커버리: {summary}")
+                    item["facts"].append(summary)
+                for reason in list(analysis.get("reasons") or row.get("reasons") or [])[:3]:
+                    clean = _clean_text(reason, limit=120)
+                    if clean:
+                        item["reasons"].append(clean)
+                        item["facts"].append(clean)
+                for risk in list(analysis.get("risks") or row.get("risks") or [])[:3]:
+                    clean = _clean_text(risk, limit=120)
+                    if clean:
+                        item["risks"].append(clean)
         return out
 
     def _external_signals(self) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
         statuses = self.source_status()
         by_symbol: dict[str, list[dict[str, Any]]] = {}
         for status in statuses:
+            if bool(status.get("stale")) or str(status.get("status") or "") == "stale":
+                continue
+            source_id = str(status.get("source_id") or "")
             for signal in list(status.get("signals") or []):
+                signal_source_id = str(
+                    signal.get("source_id") or signal.get("source") or source_id
+                )
+                if _is_external_signal_stale(signal_source_id, signal):
+                    continue
                 symbol = str(signal.get("symbol") or "").strip()
                 if not _is_candidate_symbol(symbol):
                     continue
@@ -2494,6 +3315,336 @@ class StrategyIntelligenceEngine:
         self._canonicalize_candidate_names(by_symbol)
         return by_symbol
 
+    def _etf_universe(self) -> list[dict[str, Any]]:
+        if self.etf_research_repository is None:
+            return []
+        try:
+            universe = self.etf_research_repository.list_universe()
+        except Exception:
+            return []
+        return [row for row in universe if isinstance(row, dict)]
+
+    def _linked_etf_reports(self, symbol: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        linked_reports = getattr(self.repository, "latest_symbol_linked_reports", None)
+        if callable(linked_reports):
+            try:
+                rows = linked_reports(symbol, limit=limit)
+            except Exception:
+                rows = []
+            if isinstance(rows, list) and rows:
+                return [row for row in rows if isinstance(row, dict)]
+        try:
+            rows = self.repository.search(query="", symbol=symbol, limit=limit)
+        except Exception:
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def _collect_etf_report_candidates(
+        self,
+        universe: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        by_symbol: dict[str, dict[str, Any]] = {}
+        seen_pairs: set[tuple[str, int]] = set()
+        universe_symbols = [
+            str(row.get("symbol") or "").strip()
+            for row in universe[: max(self.config.max_candidates * 3, 12)]
+            if isinstance(row, dict) and _is_candidate_symbol(str(row.get("symbol") or "").strip())
+        ]
+        resolved_names: dict[str, str] = {}
+        resolver = getattr(self.repository, "resolve_symbol_names", None)
+        if callable(resolver) and universe_symbols:
+            try:
+                raw_names = resolver(universe_symbols)
+            except Exception:
+                raw_names = {}
+            if isinstance(raw_names, dict):
+                resolved_names = {
+                    str(symbol): str(name)
+                    for symbol, name in raw_names.items()
+                    if name
+                }
+        for row in universe[: max(self.config.max_candidates * 3, 12)]:
+            symbol = str(row.get("symbol") or "").strip()
+            if not _is_candidate_symbol(symbol):
+                continue
+            universe_name = _clean_text(row.get("name") or symbol, limit=50)
+            directory_name = _prefer_etf_display_name(
+                universe_name,
+                resolved_names.get(symbol),
+                symbol=symbol,
+            )
+            reports = self._linked_etf_reports(symbol, limit=20)
+            for report_row in reports:
+                report_id = int(report_row.get("report_id") or 0)
+                if report_id <= 0 or (symbol, report_id) in seen_pairs:
+                    continue
+                seen_pairs.add((symbol, report_id))
+                asset_class = str(report_row.get("asset_class") or "").lower()
+                linked_asset_classes = str(report_row.get("linked_asset_classes") or "").lower()
+                if asset_class and asset_class != "etf" and "etf" not in linked_asset_classes:
+                    continue
+                report = self.repository.get_report(report_id) or {}
+                content = _clean_text(
+                    report.get("content")
+                    or report_row.get("snippet")
+                    or report_row.get("link_evidence")
+                    or report_row.get("title"),
+                    limit=1200,
+                )
+                facts = self.repository.get_report_facts(report_id) or {}
+                report_name = _clean_text(
+                    report_row.get("linked_name")
+                    or report_row.get("company_name")
+                    or "",
+                    limit=50,
+                )
+                name = _prefer_etf_display_name(
+                    report_name or symbol,
+                    directory_name or universe_name or symbol,
+                    symbol=symbol,
+                )
+                item = by_symbol.setdefault(
+                    symbol,
+                    _candidate_item(symbol, name or symbol, 58),
+                )
+                item["name"] = (
+                    _prefer_etf_display_name(item.get("name"), name, symbol=symbol)
+                    or symbol
+                )
+                item.update(
+                    {
+                        "asset_class": "etf",
+                        "horizon_bias": "core_etf",
+                        "valuation": {"status": "not_applicable", "label": "etf"},
+                        "has_etf_research": False,
+                    }
+                )
+                item["sources"].add("naver_reports")
+                item["report_ids"].append(report_id)
+                _add_score(item, "report", 8.0)
+                item["confidence"] = max(int(item["confidence"]), 62)
+
+                broker = str(report_row.get("broker") or "")
+                published = str(report_row.get("published_at") or "")
+                if published:
+                    item.setdefault("published_dates", []).append(published)
+                item["citations"].append(f"[{broker or '-'}, {published or '-'}, p.?]")
+
+                title = _clean_text(report_row.get("title"), limit=90)
+                if title and _is_etf_specific_evidence_text(title, symbol=symbol, name=name):
+                    item["reasons"].append(f"ETF 연결 리포트: {title}")
+                evidence = _clean_text(
+                    report_row.get("link_evidence") or content,
+                    limit=140,
+                )
+                if (
+                    evidence
+                    and not _is_low_quality_evidence_text(evidence, min_chars=10)
+                    and _is_etf_specific_evidence_text(evidence, symbol=symbol, name=name)
+                ):
+                    item["facts"].append(evidence)
+                for bullet in list(facts.get("summary_bullets") or [])[:2]:
+                    clean = _clean_text(bullet, limit=120)
+                    if (
+                        clean
+                        and not _is_low_quality_evidence_text(clean, min_chars=14)
+                        and _is_etf_specific_evidence_text(clean, symbol=symbol, name=name)
+                    ):
+                        item["facts"].append(clean)
+
+        for item in by_symbol.values():
+            components = _candidate_component_scores(item, risks=list(item.get("risks") or []))
+            item["score_components_override"] = {
+                "report": min(45, components.get("report", 0)),
+                "research": 0,
+                "whale": 0,
+                "after_close": 0,
+                "valuation": 0,
+                "quality": 0,
+                "growth": 0,
+                "risk_penalty": components.get("risk_penalty", 0),
+                "risk_score": components.get("risk_score", 0),
+                "recency": components.get("recency", 35),
+                "evidence": min(45, components.get("evidence", 0)),
+                "liquidity": 0,
+                "momentum": 0,
+                "core_fit": 0,
+            }
+        self._canonicalize_candidate_names(by_symbol)
+        return by_symbol
+
+    def _merge_candidate_item(
+        self,
+        existing: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> dict[str, Any]:
+        if existing.get("name") == existing.get("symbol") and incoming.get("name"):
+            existing["name"] = incoming["name"]
+        if (
+            str(existing.get("asset_class") or incoming.get("asset_class") or "").lower() == "etf"
+            and incoming.get("name")
+        ):
+            symbol = str(existing.get("symbol") or incoming.get("symbol") or "")
+            existing["name"] = _prefer_etf_display_name(
+                existing.get("name"),
+                incoming.get("name"),
+                symbol=symbol,
+            ) or str(existing.get("name") or incoming.get("name") or symbol)
+        existing["confidence"] = max(
+            int(existing.get("confidence") or 0),
+            int(incoming.get("confidence") or 0),
+        )
+        for key in ("reasons", "risks", "checks", "report_ids", "citations", "facts", "published_dates"):
+            existing.setdefault(key, [])
+            existing[key].extend(list(incoming.get(key) or []))
+        existing.setdefault("sources", set()).update(set(incoming.get("sources") or []))
+        for key in ("asset_class", "horizon_bias", "valuation", "etf_snapshot", "etf_score"):
+            if incoming.get(key):
+                existing[key] = incoming[key]
+        existing["has_etf_research"] = bool(existing.get("has_etf_research")) or bool(
+            incoming.get("has_etf_research")
+        )
+
+        existing_components = dict(existing.get("components") or {})
+        for key, value in dict(incoming.get("components") or {}).items():
+            existing_components[key] = float(existing_components.get(key) or 0.0) + float(value or 0.0)
+        existing["components"] = existing_components
+
+        if isinstance(existing.get("score_components_override"), dict) or isinstance(
+            incoming.get("score_components_override"), dict
+        ):
+            merged = dict(existing.get("score_components_override") or {})
+            for key, value in dict(incoming.get("score_components_override") or {}).items():
+                if key in {"report", "research", "whale", "after_close", "evidence"}:
+                    merged[key] = min(100, int(merged.get(key) or 0) + int(value or 0))
+                elif key == "recency":
+                    merged[key] = max(int(merged.get(key) or 0), int(value or 0))
+                elif key in {"risk_penalty", "risk_score"}:
+                    merged[key] = max(int(merged.get(key) or 0), int(value or 0))
+                else:
+                    merged[key] = max(int(merged.get(key) or 0), int(value or 0))
+            existing["score_components_override"] = merged
+        return existing
+
+    def _merge_candidate_maps(
+        self,
+        target: dict[str, dict[str, Any]],
+        incoming: dict[str, dict[str, Any]],
+    ) -> None:
+        for symbol, item in incoming.items():
+            if symbol in target:
+                target[symbol] = self._merge_candidate_item(target[symbol], item)
+            else:
+                target[symbol] = item
+
+    def _collect_etf_candidates(
+        self,
+        universe: list[dict[str, Any]] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        if self.etf_research_repository is None:
+            return {}
+        if universe is None:
+            universe = self._etf_universe()
+        by_symbol: dict[str, dict[str, Any]] = {}
+        for row in universe[: max(self.config.max_candidates * 3, 12)]:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or "").strip()
+            if not _is_candidate_symbol(symbol):
+                continue
+            name = _clean_text(row.get("name") or symbol, limit=50)
+            snapshot: dict[str, Any] = {}
+            score: dict[str, Any] = {}
+            try:
+                snapshot = self.etf_research_repository.latest_snapshot(symbol)
+            except Exception:
+                snapshot = {"status": "error", "symbol": symbol}
+            try:
+                score = self.etf_research_repository.latest_score(symbol)
+            except Exception:
+                score = {"label": "unknown", "symbol": symbol}
+            if not isinstance(snapshot, dict):
+                snapshot = {"status": "missing", "symbol": symbol}
+            if not isinstance(score, dict):
+                score = {"label": "unknown", "symbol": symbol}
+
+            has_snapshot = str(snapshot.get("status") or "").lower() == "ok"
+            score_label = str(score.get("label") or "unknown")
+            has_score = score_label != "unknown" or any(
+                _safe_float(score.get(key)) > 0
+                for key in (
+                    "liquidity_score",
+                    "momentum_score",
+                    "core_fit_score",
+                )
+            )
+            if not has_snapshot and not has_score:
+                continue
+
+            liquidity = _clamp_score(score.get("liquidity_score"))
+            momentum = _clamp_score(score.get("momentum_score"))
+            core_fit = _clamp_score(score.get("core_fit_score"))
+            risk = _clamp_score(score.get("risk_score"))
+            evidence = 55 if has_score else 35
+            if has_snapshot:
+                evidence += 10
+            components = {
+                "report": 0,
+                "research": 0,
+                "whale": 0,
+                "after_close": 0,
+                "valuation": 0,
+                "quality": 0,
+                "growth": 0,
+                "risk_penalty": risk,
+                "risk_score": risk,
+                "recency": 45,
+                "evidence": min(evidence, 80),
+                "liquidity": liquidity,
+                "momentum": momentum,
+                "core_fit": core_fit,
+            }
+            item = _candidate_item(symbol, name or symbol, 58)
+            item.update(
+                {
+                    "asset_class": "etf",
+                    "horizon_bias": "core_etf",
+                    "valuation": {"status": "not_applicable", "label": "etf"},
+                    "score_components_override": components,
+                    "etf_snapshot": snapshot,
+                    "etf_score": score,
+                    "has_etf_research": has_snapshot or has_score,
+                }
+            )
+            item["sources"].add("etf_research")
+            item["facts"].extend(
+                [
+                    f"ETF liquidity score {liquidity}",
+                    f"ETF momentum score {momentum}",
+                    f"ETF core fit score {core_fit}",
+                ]
+            )
+            for reason in list(score.get("reasons") or [])[:3]:
+                clean = _clean_text(reason, limit=120)
+                if clean:
+                    item["reasons"].append(clean)
+            for risk_text in list(score.get("risks") or [])[:3]:
+                clean = _clean_text(risk_text, limit=120)
+                if clean:
+                    item["risks"].append(clean)
+            if has_snapshot:
+                change_pct = _safe_float(snapshot.get("change_pct"))
+                turnover = _safe_float(snapshot.get("turnover_krw"))
+                item["reasons"].append(f"ETF 최신 스냅샷 등락률 {change_pct:.2f}%")
+                item["facts"].append(f"ETF turnover {turnover:,.0f} KRW")
+                captured_at = str(snapshot.get("captured_at") or "")
+                if captured_at:
+                    item["published_dates"].append(captured_at[:10])
+            if score_label in {"core_fit", "theme_momentum"}:
+                item["reasons"].insert(0, f"ETF 리서치 라벨: {score_label}")
+            by_symbol[symbol] = item
+        return by_symbol
+
     def _canonicalize_candidate_names(self, by_symbol: dict[str, dict[str, Any]]) -> None:
         resolver = getattr(self.repository, "resolve_symbol_names", None)
         if not callable(resolver) or not by_symbol:
@@ -2507,6 +3658,15 @@ class StrategyIntelligenceEngine:
         for symbol, item in by_symbol.items():
             raw_resolved = names.get(symbol)
             if _has_subject_boilerplate(raw_resolved):
+                continue
+            if str(item.get("asset_class") or "").lower() == "etf":
+                resolved = _clean_etf_display_name(raw_resolved, symbol=symbol)
+                if resolved:
+                    item["name"] = _prefer_etf_display_name(
+                        item.get("name"),
+                        resolved,
+                        symbol=symbol,
+                    ) or str(item.get("name") or resolved)
                 continue
             resolved = _sanitize_subject_name(raw_resolved, symbol=symbol)
             if resolved:
@@ -2554,6 +3714,9 @@ class StrategyIntelligenceEngine:
 
     def _attach_valuation_context(self, by_symbol: dict[str, dict[str, Any]]) -> None:
         for symbol, item in by_symbol.items():
+            if str(item.get("asset_class") or "").lower() == "etf":
+                item["valuation"] = {"status": "not_applicable", "label": "etf"}
+                continue
             valuation = self._candidate_valuation_payload(symbol)
             item["valuation"] = valuation
             if valuation.get("status") != "ok":
@@ -2639,9 +3802,20 @@ class StrategyIntelligenceEngine:
         limit: int | None = None,
     ) -> dict[str, Any]:
         raw_limit = int(limit or self.config.max_candidates)
-        max_items = max(3, min(raw_limit, 12))
+        max_items = max(3, min(raw_limit, 30))
         intent = classify_strategy_intent(query)
+        etf_intent = _has_etf_intent(query)
         report_candidates = self._collect_report_candidates(query=query)
+        etf_universe = self._etf_universe()
+        self._merge_candidate_maps(
+            report_candidates,
+            self._collect_etf_report_candidates(etf_universe),
+        )
+        etf_candidates = self._collect_etf_candidates(etf_universe)
+        self._merge_candidate_maps(
+            report_candidates,
+            etf_candidates,
+        )
         source_statuses, external_by_symbol = self._external_signals()
         research_by_symbol = self._research_pick_signals(research_feed)
         rag_context = self._collect_rag_context(query)
@@ -2651,9 +3825,20 @@ class StrategyIntelligenceEngine:
                 symbol,
                 _candidate_item(symbol, symbol, 42),
             )
+            signal_name = _sanitize_subject_name(signal.get("name"), symbol=symbol)
+            if signal_name and str(item.get("name") or "") == symbol:
+                item["name"] = signal_name
             _add_score(item, "research", float(signal.get("score") or 0))
+            item["confidence"] = max(
+                int(item.get("confidence") or 0),
+                int(signal.get("confidence") or 0),
+            )
             item["sources"].add("research_feed")
-            item["reasons"].extend(list(signal.get("reasons") or [])[:2])
+            item["sources"].update(set(signal.get("sources") or []))
+            item["reasons"].extend(list(signal.get("reasons") or [])[:4])
+            item["risks"].extend(list(signal.get("risks") or [])[:3])
+            item["facts"].extend(list(signal.get("facts") or [])[:4])
+            item["published_dates"].extend(list(signal.get("published_dates") or [])[:4])
 
         for symbol, signals in external_by_symbol.items():
             item = report_candidates.setdefault(
@@ -2680,6 +3865,9 @@ class StrategyIntelligenceEngine:
                     _add_score(item, component, delta)
                 item["confidence"] = max(int(item["confidence"]), min(82, 45 + strength // 3))
                 item["sources"].add(source_id)
+                as_of = str(signal.get("as_of") or signal.get("published_at") or "").strip()
+                if as_of:
+                    item.setdefault("published_dates", []).append(as_of)
 
         self._canonicalize_candidate_names(report_candidates)
         self._attach_valuation_context(report_candidates)
@@ -2687,21 +3875,41 @@ class StrategyIntelligenceEngine:
         candidates: list[dict[str, Any]] = []
         exclusions: list[dict[str, Any]] = []
         for symbol, item in report_candidates.items():
+            is_etf = str(item.get("asset_class") or "").lower() == "etf"
             reasons = [row for row in dict.fromkeys(item.get("reasons") or []) if row]
             risks = [row for row in dict.fromkeys(item.get("risks") or []) if row]
             checks = [row for row in dict.fromkeys(item.get("checks") or []) if row]
             sources = sorted(str(row) for row in set(item.get("sources") or []))
-            component_scores = _candidate_component_scores(
-                item,
-                risks=risks,
-            )
-            suitability, data_coverage = _candidate_suitability(
-                item=item,
-                components=component_scores,
-                sources=sources,
-                reasons=reasons,
-                risks=risks,
-            )
+            if is_etf and isinstance(item.get("score_components_override"), dict):
+                component_scores = dict(item["score_components_override"])
+                if etf_intent:
+                    component_scores["report"] = min(
+                        100,
+                        int(component_scores.get("report") or 0) + 20,
+                    )
+                    component_scores["evidence"] = min(
+                        100,
+                        int(component_scores.get("evidence") or 0) + 20,
+                    )
+                suitability, data_coverage = _etf_candidate_suitability(
+                    components=component_scores,
+                    reasons=reasons,
+                    risks=risks,
+                    has_etf_research=bool(item.get("has_etf_research")),
+                    has_report="naver_reports" in sources,
+                )
+            else:
+                component_scores = _candidate_component_scores(
+                    item,
+                    risks=risks,
+                )
+                suitability, data_coverage = _candidate_suitability(
+                    item=item,
+                    components=component_scores,
+                    sources=sources,
+                    reasons=reasons,
+                    risks=risks,
+                )
             identity_status = _candidate_identity_status(
                 symbol,
                 item.get("name") or symbol,
@@ -2722,16 +3930,18 @@ class StrategyIntelligenceEngine:
                 + float(data_coverage.get("coverage_score") or 0) * 0.04
                 - float(component_scores.get("risk_penalty") or 0) * 0.05
             )
-            if not bool(data_coverage.get("has_valuation")):
+            if not is_etf and not bool(data_coverage.get("has_valuation")):
                 confidence_raw -= 5.0
             confidence_score = max(0, min(100, int(round(confidence_raw))))
-            if len(sources) <= 1:
+            if len(sources) <= 1 and not is_etf:
                 confidence_score = min(confidence_score, 62)
             if int(component_scores.get("evidence") or 0) < 45:
                 confidence_score = min(confidence_score, 70)
             payload = {
                 "symbol": symbol,
                 "name": str(item.get("name") or symbol),
+                "asset_class": str(item.get("asset_class") or "equity"),
+                "horizon_bias": str(item.get("horizon_bias") or ""),
                 "score": score,
                 "score_method_version": "v2",
                 "score_components": component_scores,
@@ -2771,6 +3981,8 @@ class StrategyIntelligenceEngine:
                     {
                         "symbol": payload["symbol"],
                         "name": payload["name"],
+                        "asset_class": payload["asset_class"],
+                        "horizon_bias": payload["horizon_bias"],
                         "reason": "점수/근거가 후보 기준에 미달",
                         "score": payload["score"],
                         "score_method_version": payload["score_method_version"],
@@ -2780,9 +3992,14 @@ class StrategyIntelligenceEngine:
                         "data_coverage": payload["data_coverage"],
                         "identity_status": payload["identity_status"],
                         "data_warnings": payload["data_warnings"],
+                        "valuation": payload["valuation"],
                         "reasons": payload["reasons"],
                         "risks": payload["risks"],
                         "checks": payload["checks"],
+                        "sources": payload["sources"],
+                        "report_ids": payload["report_ids"],
+                        "citations": payload["citations"],
+                        "facts": payload["facts"],
                     }
                 )
             else:
@@ -2790,7 +4007,11 @@ class StrategyIntelligenceEngine:
 
         candidates.sort(key=lambda row: (int(row["score"]), int(row["confidence"])), reverse=True)
         exclusions.sort(key=lambda row: int(row["score"]), reverse=True)
-        top_candidates = candidates[:max_items]
+        top_candidates = _include_etf_intent_candidates(
+            candidates,
+            max_items=max_items,
+            etf_intent=etf_intent,
+        )
         regime = self._infer_market_regime(
             research_feed=research_feed,
             rag_context=rag_context,
@@ -2800,25 +4021,30 @@ class StrategyIntelligenceEngine:
             "updated_at": _now_iso(),
             "query": query,
             "intent": intent,
-            "model": self.llm_bridge.resolved_model,
+            "model": self.codex_runtime.resolved_model,
             "score_method_version": "v2",
             "regime": regime,
             "next_session": {
                 "label": "다음 거래일",
                 "mode": "watchlist",
-                "disclaimer": "정보 제공용 관심 후보이며 매매 추천이 아닙니다.",
+                "disclaimer": "실거래 판단용 관심 후보입니다. 실제 주문은 블록 규칙과 안전 게이트 검증 후 실행됩니다.",
             },
             "candidates": top_candidates,
             "candidate_count": len(top_candidates),
             "exclusions": exclusions[:6],
-            "sources": self._summarize_sources(source_statuses, research_feed, rag_context),
+            "sources": self._summarize_sources(
+                source_statuses,
+                research_feed,
+                rag_context,
+                etf_usable_count=len(etf_candidates),
+            ),
             "rag_context": rag_context[:6],
             "methodology": [
                 "단기·중기·장기 투자 검토 적합도를 분리하고 balanced 평균으로 기본 정렬",
                 "리포트/수급/고래/밸류/퀄리티/성장/근거품질을 기간별 가중치로 다르게 반영",
                 "RAG 문단은 그림 캡션/공시 문구/이미지 노이즈를 제외하고 품질 점수 상위만 사용",
-                "소스가 부족하거나 밸류 데이터가 없으면 confidence와 장기 적합도를 보수적으로 제한",
-                "후보는 투자 검토 watchlist이며 실제 진입은 가격·거래대금·수급 확인 후 판단",
+                "소스가 부족하거나 밸류 데이터가 없으면 confidence와 장기 적합도를 검증 기반으로 제한",
+                "후보는 블록 매매 후보군이며 실제 진입은 가격·거래대금·수급 확인과 안전 게이트를 통과한 뒤 판단",
             ],
         }
 
@@ -2827,7 +4053,19 @@ class StrategyIntelligenceEngine:
         source_statuses: list[dict[str, Any]],
         research_feed: dict[str, Any] | None,
         rag_context: list[dict[str, Any]],
+        etf_usable_count: int | None = None,
     ) -> list[dict[str, Any]]:
+        research_runner_count = (
+            int((research_feed or {}).get("count") or 0)
+            if isinstance(research_feed, dict)
+            else 0
+        )
+        research_runner_items = (
+            list((research_feed or {}).get("items") or [])
+            if isinstance(research_feed, dict)
+            else []
+        )
+        research_runner_active = bool(research_runner_count or research_runner_items)
         rows = [
             {
                 "source_id": "naver_reports",
@@ -2839,11 +4077,57 @@ class StrategyIntelligenceEngine:
             {
                 "source_id": "research_runner",
                 "label": "Research Runner",
-                "status": "active" if isinstance(research_feed, dict) else "missing",
-                "count": int((research_feed or {}).get("count") or 0) if isinstance(research_feed, dict) else 0,
-                "role": "시장 브리프와 기존 후보군",
+                "status": "active"
+                if research_runner_active
+                else "optional_disabled",
+                "count": research_runner_count,
+                "role": (
+                    "legacy market brief feed; optional when Naver Reports/RAG, "
+                    "ETF research, Whale, and 세시반 are primary"
+                ),
             },
         ]
+        if isinstance(research_feed, dict):
+            discovery = research_feed.get("daily_discovery")
+            if isinstance(discovery, dict):
+                discovery_items = [
+                    row for row in list(discovery.get("items") or []) if isinstance(row, dict)
+                ]
+                rows.append(
+                    {
+                        "source_id": "daily_discovery",
+                        "label": "Daily Discovery",
+                        "status": str(discovery.get("status") or "active"),
+                        "count": len(discovery_items),
+                        "role": "일반 종목 랜덤/심층 디스커버리 후보",
+                    }
+                )
+        if self.etf_research_repository is not None:
+            try:
+                etf_status = self.etf_research_repository.status()
+            except Exception:
+                etf_status = {}
+            if etf_usable_count is not None:
+                usable_count = max(int(etf_usable_count or 0), 0)
+            elif "usable_research_count" in etf_status:
+                usable_count = int(etf_status.get("usable_research_count") or 0)
+            else:
+                usable_count = int(etf_status.get("candidate_count") or 0)
+                if usable_count <= 0:
+                    usable_count = max(
+                        int(etf_status.get("score_count") or 0),
+                        int(etf_status.get("snapshot_count") or 0),
+                    )
+            rows.append(
+                {
+                    "source_id": "etf_research",
+                    "label": "ETF Research",
+                    "status": "active" if usable_count > 0 else "waiting",
+                    "count": usable_count,
+                    "role": "ETF 코어/테마 후보 스냅샷과 점수",
+                    "db_path": etf_status.get("db_path"),
+                }
+            )
         for status in source_statuses:
             rows.append(
                 {
@@ -2866,20 +4150,86 @@ class StrategyIntelligenceEngine:
         use_llm: bool = False,
         limit: int | None = None,
     ) -> dict[str, Any]:
+        cache_key = self._brief_cache_key(
+            query=query,
+            research_feed=research_feed,
+            limit=limit,
+        )
+        cache_ttl_sec = max(0, int(self.config.brief_cache_ttl_sec))
+        if not use_llm and cache_ttl_sec > 0:
+            cached = self._brief_cache.get(cache_key)
+            if cached:
+                cached_at, cached_payload = cached
+                if time.monotonic() - cached_at <= cache_ttl_sec:
+                    payload = copy.deepcopy(cached_payload)
+                    payload["cache_status"] = "hit"
+                    return payload
+                self._brief_cache.pop(cache_key, None)
+
         payload = self.build_candidates(
             query=query,
             research_feed=research_feed,
             limit=limit,
         )
-        payload["brief_mode"] = "deterministic"
-        payload["brief_md"] = self._deterministic_brief(payload)
-        if use_llm and self.llm_bridge.ready and payload.get("candidates"):
-            llm_brief = await self._llm_brief(payload)
-            if llm_brief:
-                payload["brief_mode"] = "llm"
-                payload["brief_md"] = llm_brief
+        if use_llm:
+            payload["brief_mode"] = "llm_error"
+            payload["brief_md"] = ""
+            if not getattr(self.codex_runtime, "ready", False):
+                payload["status"] = "error"
+                payload["error_message"] = "codex_runtime_unavailable"
+            elif not payload.get("candidates"):
+                payload["status"] = "error"
+                payload["error_message"] = "no_strategy_candidates"
+            else:
+                llm_brief, llm_error = await self._llm_brief(payload)
+                if llm_brief:
+                    payload["brief_mode"] = "llm"
+                    payload["brief_md"] = llm_brief
+                else:
+                    payload["status"] = "error"
+                    payload["error_message"] = llm_error or "codex_runtime_error"
+        else:
+            payload["brief_mode"] = "deterministic"
+            payload["brief_md"] = self._deterministic_brief(payload)
+        payload["cache_status"] = "miss"
+        if not use_llm and cache_ttl_sec > 0:
+            self._brief_cache[cache_key] = (time.monotonic(), copy.deepcopy(payload))
+            if len(self._brief_cache) > 32:
+                oldest_key = min(
+                    self._brief_cache,
+                    key=lambda key: self._brief_cache[key][0],
+                )
+                self._brief_cache.pop(oldest_key, None)
         self._append_decision_log(payload)
         return payload
+
+    def _brief_cache_key(
+        self,
+        *,
+        query: str,
+        research_feed: dict[str, Any] | None,
+        limit: int | None,
+    ) -> str:
+        try:
+            research_fingerprint = json.dumps(
+                research_feed or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except TypeError:
+            research_fingerprint = str(research_feed)
+        raw = json.dumps(
+            {
+                "query": query,
+                "limit": int(limit or self.config.max_candidates),
+                "research": research_fingerprint,
+                "score_method_version": "v2",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _deterministic_brief(self, payload: dict[str, Any]) -> str:
         regime = payload.get("regime") or {}
@@ -2911,18 +4261,19 @@ class StrategyIntelligenceEngine:
             [
                 "",
                 "운영 원칙",
-                "- 관심 후보는 매수 지시가 아니라 다음 거래일 체크리스트입니다.",
-                "- 시초 갭, 거래대금, 섹터 수급, 리스크 이벤트 확인 전 진입 판단을 보류합니다.",
+                "- 관심 후보는 다음 거래일 블록 생성/수정 판단을 위한 우선순위입니다.",
+                "- 시초 갭, 거래대금, 섹터 수급, 리스크 이벤트를 확인해 진입/보류/회피를 결정합니다.",
             ]
         )
         return "\n".join(lines)
 
-    async def _llm_brief(self, payload: dict[str, Any]) -> str:
+    async def _llm_brief(self, payload: dict[str, Any]) -> tuple[str, str]:
         prompt = {
             "task": "Build a Korean strategy-intelligence brief from structured evidence.",
+            "language_policy": jue_language_policy(),
             "rules": [
-                "Do not give direct order instructions.",
-                "Treat candidates as watchlist ideas, not recommendations.",
+                "Frame candidates as HERMES block-trading priorities, not generic research notes.",
+                "Do not fabricate quantities or order prices; block execution gates decide them.",
                 "Explain why each candidate is interesting, what must be confirmed, and why it could be wrong.",
                 "Use Whale Insight/Sesiban only if source signals are actually present; otherwise say they are waiting adapters.",
             ],
@@ -2935,16 +4286,21 @@ class StrategyIntelligenceEngine:
             },
             "output_schema": {"brief_md": "string"},
         }
-        result = await self.llm_bridge.complete(
+        result = await self.codex_runtime.complete(
             {
-                "model": self.llm_bridge.resolved_model,
+                "model": self.codex_runtime.resolved_model,
                 "response_format": {"type": "json_object"},
+                "telemetry": {
+                    "component": "strategy_intelligence",
+                    "operation": "build_brief",
+                },
                 "messages": [
                     {
                         "role": "system",
                         "content": (
                             "Return only one JSON object. You are a cautious, evidence-bound "
-                            "investment strategy intelligence layer. Korean only."
+                            "investment strategy intelligence layer. Analyze and draft in "
+                            "English, then translate the final brief_md into Korean."
                         ),
                     },
                     {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
@@ -2953,15 +4309,18 @@ class StrategyIntelligenceEngine:
             timeout_ms=max(int(self.config.model_timeout_ms), 1000),
         )
         if not bool(result.get("ok")):
-            return ""
+            return "", str(result.get("error_message") or result.get("error") or "codex_runtime_error")
         text = str(result.get("content") or "").strip()
+        if not text:
+            return "", "codex_runtime_empty_content"
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
-            return text
+            return text, ""
         if isinstance(parsed, dict):
-            return str(parsed.get("brief_md") or parsed.get("answer") or "").strip()
-        return ""
+            brief = str(parsed.get("brief_md") or parsed.get("answer") or "").strip()
+            return brief, "" if brief else "codex_runtime_invalid_schema"
+        return "", "codex_runtime_invalid_schema"
 
     def _append_decision_log(self, payload: dict[str, Any]) -> None:
         path = Path(self.config.decision_log_path)

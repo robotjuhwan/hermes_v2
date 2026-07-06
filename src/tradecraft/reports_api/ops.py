@@ -220,12 +220,12 @@ def build_deployment_checks(
             }
         )
 
-    if settings.naver_reports_llm_facts_enabled and not settings.llm_bridge_ready:
+    if settings.naver_reports_llm_facts_enabled and not settings.codex_runtime_ready:
         issues.append(
             {
                 "level": "warn",
                 "code": "llm_facts_bridge_missing",
-                "detail": "TRADECRAFT_NAVER_REPORTS_LLM_FACTS_ENABLED=true requires TRADECRAFT_LLM_BRIDGE_COMMAND or TRADECRAFT_LLM_BRIDGE_URL",
+                "detail": "TRADECRAFT_NAVER_REPORTS_LLM_FACTS_ENABLED=true requires Codex native SDK bridge to be enabled",
             }
         )
 

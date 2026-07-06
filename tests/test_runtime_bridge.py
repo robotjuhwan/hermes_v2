@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 from tradecraft.runtime.state_store import RuntimeStateStore
@@ -7,6 +8,18 @@ from tradecraft.services.runtime_bridge import (
     ResearchSnapshotReader,
     RuntimeSnapshotReader,
 )
+
+
+def test_runtime_state_store_logs_invalid_json_snapshot(tmp_path, caplog) -> None:
+    path = tmp_path / "state.json"
+    path.write_text("{broken json", encoding="utf-8")
+
+    caplog.set_level(logging.WARNING, logger="tradecraft.runtime.state_store")
+    snapshot = RuntimeStateStore(path).read_snapshot()
+
+    assert snapshot is None
+    assert "failed to read runtime state snapshot" in caplog.text
+    assert str(path) in caplog.text
 
 
 def test_runtime_reader_missing_snapshot(tmp_path) -> None:
@@ -60,7 +73,7 @@ def test_runtime_reader_exposes_full_snapshot_metadata(tmp_path) -> None:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "runtime": {
                 "role": "session_state_monitor",
-                "execution_mode": "skeleton_noop",
+                "execution_mode": "state_writer_no_orders",
                 "executes_orders": False,
             },
             "sessions": [{"session_id": "s1", "mode": "short_term"}],

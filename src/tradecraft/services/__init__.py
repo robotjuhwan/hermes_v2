@@ -1,5 +1,5 @@
 from tradecraft.services.market import (
-    mock_dashboard,
+    empty_dashboard_template,
     recalculate_dashboard_totals,
     recalculate_venue_totals,
     replace_venue_assets,
@@ -9,7 +9,7 @@ from tradecraft.services.telegram import TelegramBridge, TelegramConfig
 from tradecraft.services.upbit import UpbitAdapter, UpbitConfig
 
 __all__ = [
-    "mock_dashboard",
+    "empty_dashboard_template",
     "recalculate_dashboard_totals",
     "recalculate_venue_totals",
     "replace_venue_assets",

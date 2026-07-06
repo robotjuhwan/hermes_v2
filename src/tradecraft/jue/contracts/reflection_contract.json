@@ -1,0 +1,13 @@
+{
+  "contract_id": "reflection_contract",
+  "version": 1,
+  "required": ["block_id", "symbol", "thesis_quality", "entry_quality", "execution_quality", "exit_reason", "lesson_md"],
+  "quality_values": ["strong", "acceptable", "weak", "unknown"],
+  "reject_when": [
+    "missing_block_id",
+    "missing_symbol",
+    "missing_exit_reason",
+    "missing_lesson",
+    "pnl_only_reflection"
+  ]
+}

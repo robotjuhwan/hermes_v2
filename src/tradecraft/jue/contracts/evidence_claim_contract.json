@@ -1,0 +1,13 @@
+{
+  "contract_id": "evidence_claim_contract",
+  "version": 1,
+  "required": ["claim", "source_type", "source_id", "captured_at", "freshness", "confidence"],
+  "source_types": ["quote", "order_book", "account", "report", "rag", "valuation", "whale", "closing_flow", "quant", "catalyst", "memory", "user_directive"],
+  "reject_when": [
+    "missing_source_id",
+    "missing_captured_at",
+    "claim_without_source",
+    "stale_source_used_as_fresh",
+    "confidence_outside_0_1"
+  ]
+}

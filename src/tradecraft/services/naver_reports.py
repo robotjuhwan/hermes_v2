@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import html
 import io
 import json
+import logging
 import re
 import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -19,7 +22,23 @@ from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 import httpx
 
 from tradecraft.runtime.state_store import utc_now_iso
-from tradecraft.services.llm_bridge import LLMBridge, LLMBridgeConfig
+from tradecraft.services.codex_native import CodexNativeConfig, CodexNativeRuntime
+
+logger = logging.getLogger(__name__)
+
+_OPS_STATUS_DISK_CACHE_MTIME_TOLERANCE_NS = 5_000_000_000
+
+_KRX_SYMBOL_DIRECTORY_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+_KRX_SYMBOL_DIRECTORY_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd",
+    "X-Requested-With": "XMLHttpRequest",
+}
+_KRX_STOCK_MARKET_LABELS = {
+    "STK": "KOSPI",
+    "KSQ": "KOSDAQ",
+    "KNX": "KONEX",
+}
 
 
 def _is_six_digit_symbol(value: Any) -> bool:
@@ -42,6 +61,70 @@ def _clean_company_name(value: Any) -> str:
     ):
         return ""
     return text[:80]
+
+
+def _fetch_krx_symbol_directory_direct(
+    *, timeout_sec: float = 15.0
+) -> tuple[list[tuple[str, str, str]], list[str]]:
+    rows: list[tuple[str, str, str]] = []
+    errors: list[str] = []
+
+    def _post(
+        client: httpx.Client, payload: dict[str, str], label: str
+    ) -> list[dict[str, Any]]:
+        try:
+            response = client.post(
+                _KRX_SYMBOL_DIRECTORY_URL,
+                headers=_KRX_SYMBOL_DIRECTORY_HEADERS,
+                data=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+            return []
+        block = data.get("block1") if isinstance(data, dict) else None
+        if not isinstance(block, list):
+            errors.append(f"{label}: missing block1")
+            return []
+        return [item for item in block if isinstance(item, dict)]
+
+    timeout = httpx.Timeout(timeout_sec)
+    with httpx.Client(timeout=timeout) as client:
+        stock_rows = _post(
+            client,
+            {
+                "bld": "dbms/comm/finder/finder_stkisu",
+                "mktsel": "ALL",
+                "searchText": "",
+            },
+            "STOCK",
+        )
+        for item in stock_rows:
+            code = str(item.get("short_code") or "").strip()
+            name = _clean_company_name(item.get("codeName"))
+            market_code = str(item.get("marketCode") or "").strip().upper()
+            market = _KRX_STOCK_MARKET_LABELS.get(market_code, market_code or "KRX")
+            if _is_six_digit_symbol(code) and name:
+                rows.append((code, name, market))
+
+        for market in ("ETF", "ETN"):
+            etx_rows = _post(
+                client,
+                {
+                    "bld": "dbms/comm/finder/finder_secuprodisu",
+                    "mktsel": market,
+                    "searchText": "",
+                },
+                market,
+            )
+            for item in etx_rows:
+                code = str(item.get("short_code") or "").strip()
+                name = _clean_company_name(item.get("codeName"))
+                if _is_six_digit_symbol(code) and name:
+                    rows.append((code, name, market))
+
+    return rows, errors
 
 
 def _to_text(raw: str) -> str:
@@ -92,9 +175,15 @@ def _is_generic_company_name(value: Any) -> bool:
         "market",
         "daily",
         "review",
+        "리뷰",
+        "실적 리뷰",
+        "실적리뷰",
         "preview",
+        "프리뷰",
         "comment",
+        "코멘트",
         "update",
+        "업데이트",
         "earnings",
         "company",
         "company brief",
@@ -117,6 +206,8 @@ def _is_generic_company_name(value: Any) -> bool:
         "네이버에",
         "콘텐츠",
         "제공",
+        "것들",
+        "이제",
         "코스콤",
         "국내",
         "시세",
@@ -162,6 +253,14 @@ def _is_authoritative_symbol_source(source: Any, confidence: Any) -> bool:
     except (TypeError, ValueError):
         score = 0.0
     return name in _AUTHORITATIVE_SYMBOL_DIRECTORY_SOURCES and score >= 0.99
+
+
+def _is_trusted_symbol_link_directory(source: Any, confidence: Any) -> bool:
+    try:
+        score = float(confidence)
+    except (TypeError, ValueError):
+        score = 0.0
+    return _is_authoritative_symbol_source(source, score) or score >= 0.99
 
 
 def _choose_identity_company(
@@ -213,6 +312,257 @@ def _clean_report_symbol(value: Any, *, published_at: Any = "") -> str:
     return text
 
 
+_GENERIC_SYMBOL_LINK_NAMES = {
+    "etf",
+    "etn",
+    "펀드",
+    "상장지수펀드",
+    "투자유망",
+    "정보",
+    "국내 etf",
+    "해외 etf",
+}
+
+
+def _symbol_asset_class_from_market(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text == "etf":
+        return "etf"
+    if text == "etn":
+        return "etn"
+    return "stock"
+
+
+def _clean_symbol_link_name(value: Any) -> str:
+    name = _clean_metadata_text(value, limit=120)
+    if not name:
+        return ""
+    if name.lower() in _GENERIC_SYMBOL_LINK_NAMES:
+        return ""
+    return name
+
+
+def _compact_symbol_alias(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "")).lower()
+
+
+def _symbol_name_pattern(name: str) -> re.Pattern[str]:
+    tokens = [re.escape(token) for token in re.split(r"\s+", name.strip()) if token]
+    if not tokens:
+        return re.compile(r"a^")
+    pattern = r"\s*".join(tokens)
+    boundary_chars = r"가-힣A-Za-z0-9"
+    korean_particles = "은는이가을를과와도에의로"
+    return re.compile(
+        rf"(?<![{boundary_chars}]){pattern}(?=$|[^{boundary_chars}]|[{korean_particles}])",
+        flags=re.IGNORECASE,
+    )
+
+
+def _symbol_link_evidence(text: str, start: int, end: int) -> str:
+    left = max(start - 32, 0)
+    right = min(end + 32, len(text))
+    return re.sub(r"\s+", " ", text[left:right]).strip()[:160]
+
+
+def _candidate_name_before_symbol(text: str, position: int) -> str:
+    names = _candidate_names_before_symbol(text, position)
+    return names[0] if names else ""
+
+
+def _candidate_names_before_symbol(text: str, position: int) -> list[str]:
+    left = str(text or "")[max(int(position) - 72, 0) : max(int(position), 0)]
+    left = re.sub(r"[\s([{（]+$", "", left).strip()
+    match = re.search(r"([가-힣A-Za-z][가-힣A-Za-z0-9&.\- ]{1,42})$", left)
+    if not match:
+        return []
+    raw = match.group(1).strip()
+    candidates = [raw]
+    tokens = raw.split()
+    if tokens:
+        candidates.extend([tokens[-1], " ".join(tokens[-2:])])
+    names: list[str] = []
+    for candidate in reversed(candidates):
+        cleaned = _clean_company_candidate(candidate)
+        if cleaned and cleaned not in names:
+            names.append(cleaned)
+    return names
+
+
+def _has_conflicting_name_near_symbol(
+    text: str,
+    *,
+    position: int,
+    expected_name: str,
+    asset_class: str,
+) -> bool:
+    if str(asset_class or "stock").strip().lower() in {"etf", "etn"}:
+        return False
+    expected = _clean_company_candidate(expected_name)
+    if not expected:
+        return False
+    nearby_names = _candidate_names_before_symbol(text, position)
+    if not nearby_names:
+        return False
+    return not any(_company_names_overlap(name, expected) for name in nearby_names)
+
+
+def _allow_name_only_symbol_link(name: str, asset_class: str = "stock") -> bool:
+    if str(asset_class or "").strip().lower() in {"etf", "etn"}:
+        return True
+    compact = _compact_symbol_alias(name)
+    if len(compact) <= 2:
+        return False
+    if re.fullmatch(r"[a-z]{1,3}", compact):
+        return False
+    return True
+
+
+def _extract_report_symbol_links(
+    text: str,
+    *,
+    symbol_names: dict[str, str],
+    asset_class_by_symbol: dict[str, str] | None = None,
+    published_at: str = "",
+) -> list[dict[str, Any]]:
+    raw_text = str(text or "")
+    if not raw_text.strip():
+        return []
+    asset_classes = asset_class_by_symbol or {}
+    candidates: dict[str, dict[str, Any]] = {}
+
+    def remember(
+        *,
+        symbol: str,
+        name: str,
+        confidence: float,
+        evidence: str,
+        position: int,
+    ) -> None:
+        current = candidates.get(symbol)
+        if current and float(current["confidence"]) > confidence:
+            return
+        if current and float(current["confidence"]) == confidence:
+            position = min(int(current["_position"]), position)
+        candidates[symbol] = {
+            "symbol": symbol,
+            "name": name,
+            "asset_class": str(asset_classes.get(symbol) or "stock").strip()
+            or "stock",
+            "link_type": "mention",
+            "source": "text_extract",
+            "confidence": confidence,
+            "evidence": evidence[:160],
+            "_position": position,
+        }
+
+    compact_text = _compact_symbol_alias(raw_text)
+    head_length = min(len(raw_text), 1500)
+    occupied_name_spans: list[tuple[int, int]] = []
+    sorted_symbols = sorted(
+        symbol_names.items(),
+        key=lambda item: len(_compact_symbol_alias(item[1])),
+        reverse=True,
+    )
+    for symbol, raw_name in sorted_symbols:
+        code = _clean_report_symbol(symbol, published_at=published_at)
+        name = _clean_symbol_link_name(raw_name)
+        if not code or not name:
+            continue
+        pattern = _symbol_name_pattern(name)
+        first_name_match = pattern.search(raw_text)
+        code_match = re.search(rf"(?<!\d){re.escape(code)}(?!\d)", raw_text)
+        if code_match:
+            start = max(code_match.start() - 80, 0)
+            end = min(code_match.end() + 80, len(raw_text))
+            near_text = raw_text[start:end]
+            confidence = 0.85
+            evidence_start = code_match.start()
+            evidence_end = code_match.end()
+            near_name_match = pattern.search(near_text)
+            has_canonical_name = bool(
+                near_name_match
+                or _compact_symbol_alias(name) in _compact_symbol_alias(near_text)
+            )
+            if has_canonical_name:
+                confidence = 0.95
+                if near_name_match:
+                    evidence_start = start + near_name_match.start()
+                    occupied_name_spans.append(
+                        (
+                            start + near_name_match.start(),
+                            start + near_name_match.end(),
+                        )
+                    )
+                    evidence_end = code_match.end()
+            elif _has_conflicting_name_near_symbol(
+                raw_text,
+                position=code_match.start(),
+                expected_name=name,
+                asset_class=asset_classes.get(symbol, "stock"),
+            ):
+                continue
+            remember(
+                symbol=code,
+                name=name,
+                confidence=confidence,
+                evidence=_symbol_link_evidence(raw_text, evidence_start, evidence_end),
+                position=code_match.start(),
+            )
+            continue
+        compact_name = _compact_symbol_alias(name)
+        if compact_name and compact_name in compact_text and first_name_match is None:
+            if not _allow_name_only_symbol_link(name, asset_classes.get(symbol, "")):
+                continue
+            position = compact_text.find(compact_name)
+            compact_end = position + len(compact_name)
+            if any(
+                position < end and compact_end > start
+                for start, end in occupied_name_spans
+            ):
+                continue
+            confidence = 0.75 if position < head_length else 0.55
+            remember(
+                symbol=code,
+                name=name,
+                confidence=confidence,
+                evidence=name,
+                position=position,
+            )
+            occupied_name_spans.append((position, compact_end))
+            continue
+        if first_name_match is None:
+            continue
+        if not _allow_name_only_symbol_link(name, asset_classes.get(symbol, "")):
+            continue
+        if any(
+            first_name_match.start() < end and first_name_match.end() > start
+            for start, end in occupied_name_spans
+        ):
+            continue
+        confidence = 0.75 if first_name_match.start() < head_length else 0.55
+        remember(
+            symbol=code,
+            name=name,
+            confidence=confidence,
+            evidence=_symbol_link_evidence(
+                raw_text,
+                first_name_match.start(),
+                first_name_match.end(),
+            ),
+            position=first_name_match.start(),
+        )
+        occupied_name_spans.append((first_name_match.start(), first_name_match.end()))
+
+    ordered = sorted(
+        candidates.values(),
+        key=lambda item: (int(item["_position"]), -float(item["confidence"])),
+    )[:20]
+    for item in ordered:
+        item.pop("_position", None)
+    return ordered
+
+
 def _derive_title_from_content(content: Any, *, category: str = "") -> str:
     text = _clean_metadata_text(content, limit=320)
     if not text:
@@ -241,11 +591,341 @@ def _clean_report_title(value: Any, *, content: Any = "", category: str = "") ->
     return title[:140]
 
 
+def _trim_report_title_tail(value: str) -> str:
+    text = _clean_metadata_text(value, limit=160)
+    if not text:
+        return ""
+    text = re.split(
+        r"\s+(?:What[’']?s New|Analysis|So What|투자의견|목표주가|현재주가|시가총액|Stock Data|Analyst|RA\b|www\.|Forecasts and valuations)",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    text = re.split(
+        r"\s+[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+",
+        text,
+        maxsplit=1,
+    )[0]
+    text = re.split(
+        r"\s+[가-힣]{2,4}\s+[a-z][a-z0-9._%+-]*",
+        text,
+        maxsplit=1,
+    )[0]
+    text = re.split(
+        r"\s+\|\s*\d{4}[./]\s*\d{1,2}[./]\s*\d{1,2}",
+        text,
+        maxsplit=1,
+    )[0]
+    text = re.split(r"\s+[■●▶▪]\s+", text, maxsplit=1)[0]
+    for marker in (
+        " 최근 ",
+        " 동사의 ",
+        " 이번 ",
+        " 약 ",
+        " ETF 까지 ",
+        " 목표주가",
+        " Check Point",
+    ):
+        marker_index = text.find(marker)
+        if marker_index >= 16:
+            text = text[:marker_index]
+            break
+    return text.strip(" ,:;-/|")[:96].strip()
+
+
+def _derive_company_report_title(
+    *,
+    title: Any,
+    content: Any,
+    company_name: str,
+    symbol: str,
+) -> str:
+    company = _clean_company_candidate(company_name)
+    code = _clean_report_symbol(symbol)
+    if not company or not code:
+        return ""
+    probe = "\n".join(
+        [
+            _clean_metadata_text(title, limit=260),
+            _clean_metadata_text(content, limit=5000),
+        ]
+    )
+    if not probe.strip():
+        return ""
+    pattern = re.compile(
+        rf"{re.escape(company)}[ \t]*[\(（][ \t]*{re.escape(code)}(?:/[A-Z]{{1,6}})?[ \t]*[\)）][ \t]*(?P<tail>[^\n\r]{{0,120}})",
+        flags=re.IGNORECASE,
+    )
+    matches = list(pattern.finditer(probe))
+    match = next(
+        (
+            item
+            for item in matches
+            if _trim_report_title_tail(item.group("tail") or "")
+        ),
+        matches[0] if matches else None,
+    )
+    if not match:
+        return ""
+    tail = _trim_report_title_tail(match.group("tail") or "")
+    candidate = f"{company} ({code})"
+    if tail:
+        candidate = f"{candidate} {tail}"
+    return _clean_metadata_text(candidate, limit=140)
+
+
+def _derive_company_bracket_report_title(
+    *,
+    title: Any,
+    content: Any,
+    company_name: str,
+    symbol: str,
+) -> str:
+    company = _clean_company_candidate(company_name)
+    code = _clean_report_symbol(symbol)
+    if not company or not code:
+        return ""
+    probe = "\n".join(
+        [
+            _clean_metadata_text(title, limit=260),
+            _clean_metadata_text(content, limit=5000),
+        ]
+    )
+    if not probe.strip():
+        return ""
+    pattern = re.compile(
+        rf"[\[［]\s*{re.escape(company)}\s*[\]］][ \t]*(?P<tail>[^\n\r]{{0,120}})",
+        flags=re.IGNORECASE,
+    )
+    matches = list(pattern.finditer(probe))
+    match = next(
+        (
+            item
+            for item in matches
+            if _trim_report_title_tail(item.group("tail") or "")
+        ),
+        matches[0] if matches else None,
+    )
+    if not match:
+        return ""
+    tail = _trim_report_title_tail(match.group("tail") or "")
+    repeat_match = re.search(
+        rf"\s+{re.escape(company)}(?:은|는|이|가|의|,|\s)",
+        tail,
+    )
+    if repeat_match and repeat_match.start() >= 8:
+        tail = tail[: repeat_match.start()].strip()
+    candidate = f"{company} ({code})"
+    if tail:
+        candidate = f"{candidate} {tail}"
+    return _clean_metadata_text(candidate, limit=140)
+
+
+def _strip_leading_report_disclaimer(value: Any) -> str:
+    text = _clean_metadata_text(value, limit=1200)
+    if not text:
+        return ""
+    leading_noise = (
+        text.lower().startswith("www.")
+        or "본 조사분석자료" in text[:260]
+        or "고객께서는 자신의 판단과 책임" in text[:320]
+        or "금융투자분석사의 확인" in text[:260]
+        or "compliance notice" in text[:260].lower()
+    )
+    if not leading_noise:
+        return text
+    useful_markers = (
+        r"\bIBKS\s+Spot\s+Comment\b",
+        r"\bETF\s+Catch[-\s]?up\b",
+        r"\bQuant\s+Monthly\b",
+        r"\bKIWOOM\s+FICC\s+DAILY\b",
+        r"\bWeekly\s*\|",
+        r"\bIssue\s+Comment\b",
+        r"\bCompany\s+Report\b",
+        r"\bEarnings\s+Preview\b",
+        r"\bNOT\s+RATED\b",
+        r"\bBUY\b",
+        r"\bStrategy\s+Comment\b",
+        r"\bSector\s+Comment\b",
+    )
+    for pattern in useful_markers:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match and match.start() > 0:
+            return text[match.start() :].strip()
+    return text
+
+
+def _normalize_search_snippet(
+    value: Any,
+    *,
+    company_name: Any = "",
+    symbol: Any = "",
+) -> str:
+    text = _strip_leading_report_disclaimer(value)
+    company = _clean_company_candidate(company_name)
+    code = _clean_report_symbol(symbol)
+    if not text or not company or not code:
+        return text
+    pattern = re.compile(
+        rf"^(?:\d{{1,3}}\s+)?{re.escape(company)}[ \t]*[\(（][ \t]*{re.escape(code)}(?:/[A-Z]{{1,6}})?[ \t]*[\)）][ \t]*",
+        flags=re.IGNORECASE,
+    )
+    return pattern.sub(f"{company} ({code}) ", text, count=1).strip()
+
+
+def _improve_company_report_title(
+    title: Any,
+    *,
+    content: Any,
+    company_name: str,
+    symbol: str,
+) -> str:
+    current = _clean_metadata_text(title, limit=140)
+    derived = _derive_company_report_title(
+        title=current,
+        content=content,
+        company_name=company_name,
+        symbol=symbol,
+    )
+    if not derived:
+        derived = _derive_company_bracket_report_title(
+            title=current,
+            content=content,
+            company_name=company_name,
+            symbol=symbol,
+        )
+    if not derived:
+        return current
+    company = _clean_company_candidate(company_name)
+    code = _clean_report_symbol(symbol)
+    canonical_prefix = f"{company} ({code})"
+    if current.startswith(canonical_prefix):
+        return current
+    prefix_index = current.find(canonical_prefix)
+    if prefix_index > 0:
+        return derived
+    noisy_prefix_markers = (
+        "주가 및 주요이벤트",
+        "기업가치 제고",
+        "기업분석 ",
+        "www.",
+        "Stock Data",
+        "시가총액",
+        "재무지표",
+        "밸류에이션 지표",
+    )
+    if (
+        len(current) > 90
+        or any(marker in current for marker in noisy_prefix_markers)
+        or re.match(r"^\d{1,3}\s+", current)
+        or re.match(r"^\d{4}[./-]\s*\d{1,2}[./-]\s*\d{1,2}\s+", current)
+    ):
+        return derived
+    return current
+
+
+def _is_noisy_non_company_report_title(value: Any) -> bool:
+    title = _clean_metadata_text(value, limit=180)
+    if not title:
+        return True
+    lowered = title.lower()
+    if lowered.startswith("www.") or "본 조사분석자료" in title:
+        return True
+    noisy_starts = (
+        "1 제목입니다",
+        "시가총액 △eps",
+        "지수 선물",
+        "종가 1d",
+        "글로벌 배출권 가격",
+    )
+    if lowered.startswith(noisy_starts):
+        return True
+    number_tokens = len(re.findall(r"[-+]?\d+(?:[.,]\d+)?%?", title))
+    word_tokens = len(re.findall(r"[가-힣A-Za-z]+", title))
+    return number_tokens >= 8 and number_tokens > word_tokens
+
+
+def _trim_non_company_title(value: str) -> str:
+    text = _clean_metadata_text(value, limit=180)
+    if not text:
+        return ""
+    text = re.split(
+        r"\s+(?:What[’']?s New|자료:|Research Center|Table|Chart)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    text = re.split(r"\s+[■●▶▪]\s+", text, maxsplit=1)[0]
+    for marker in (" 이번 ", " 최근 ", " 해당 ", " 다만 "):
+        marker_index = text.find(marker)
+        if marker_index >= 16:
+            text = text[:marker_index]
+            break
+    return text.strip(" ,:;-/|")[:96].strip()
+
+
+def _derive_non_company_report_title(content: Any) -> str:
+    text = _clean_metadata_text(content, limit=5000)
+    if not text:
+        return ""
+    weekly = re.search(
+        r"(?:주간|월간|Weekly|Monthly)?\s*Comment\s*\([^)）]{3,40}[)）]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if weekly:
+        return _trim_non_company_title(weekly.group(0))
+
+    spot = re.search(r"\bIBKS\s+Spot\s+Comment\b(?P<body>.{0,520})", text)
+    if spot:
+        body = spot.group("body") or ""
+        bracket = re.search(r"(\[[^\]]{2,30}\]\s*.{4,140})", body)
+        if bracket:
+            headline = _trim_non_company_title(bracket.group(1))
+            if headline:
+                return _clean_metadata_text(
+                    f"IBKS Spot Comment {headline}",
+                    limit=140,
+                )
+        return "IBKS Spot Comment"
+
+    return ""
+
+
+def _improve_non_company_report_title(
+    title: Any,
+    *,
+    content: Any,
+) -> str:
+    current = _clean_metadata_text(title, limit=140)
+    if current and not _is_noisy_non_company_report_title(current):
+        return current
+    derived = _derive_non_company_report_title(content)
+    return derived or current
+
+
 def _parse_date(text: str) -> str:
     match = re.search(r"(\d{4})[./-](\d{2})[./-](\d{2})", text)
     if not match:
         return ""
-    return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+    return _normalize_report_date(
+        f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+    )
+
+
+def _normalize_report_date(value: Any) -> str:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if not match:
+        return ""
+    try:
+        return date(
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+        ).isoformat()
+    except ValueError:
+        return ""
 
 
 def _parse_symbol(text: str) -> str:
@@ -583,44 +1263,68 @@ def _extract_company_symbol_from_text(
             return code, mapped_company
         return code, ""
 
-    patterns: tuple[re.Pattern[str], ...] = (
-        re.compile(
-            r"기술분석보고서\s*([가-힣A-Za-z][가-힣A-Za-z0-9&.\- ]{1,30})"
-            r"\s*\(\s*(\d{6})\s*(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?\s*\)",
-            flags=re.IGNORECASE,
+    patterns: tuple[tuple[re.Pattern[str], str, int], ...] = (
+        (
+            re.compile(
+                r"기술분석보고서\s*([가-힣A-Za-z][가-힣A-Za-z0-9&.\- ]{1,30})"
+                r"\s*\(\s*(\d{6})\s*(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?\s*\)",
+                flags=re.IGNORECASE,
+            ),
+            "company_symbol",
+            0,
         ),
-        re.compile(
-            r"([가-힣A-Za-z][가-힣A-Za-z0-9&.\- ]{1,30})\s*"
-            r"\(\s*(\d{6})\s*(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?\s*\)",
-            flags=re.IGNORECASE,
+        (
+            re.compile(
+                r"\(\s*(\d{6})\s*(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?\s*\)\s*"
+                r"([가-힣A-Za-z][가-힣A-Za-z0-9&.\- ]{1,30})",
+                flags=re.IGNORECASE,
+            ),
+            "symbol_company",
+            1,
         ),
-        re.compile(
-            r"\(\s*(\d{6})\s*(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?\s*\)\s*"
-            r"([가-힣A-Za-z][가-힣A-Za-z0-9&.\- ]{1,30})",
-            flags=re.IGNORECASE,
+        (
+            re.compile(
+                r"([가-힣A-Za-z][가-힣A-Za-z0-9&.\-]{1,30})\s*"
+                r"\(\s*(\d{6})\s*(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?\s*\)",
+                flags=re.IGNORECASE,
+            ),
+            "company_symbol",
+            1,
         ),
-        re.compile(
-            r"(?<!\d)(\d{6})(?!\d)\s*[·|/]\s*"
-            r"(?:[가-힣A-Za-z&/\-]{1,24}\s+)?"
-            r"([가-힣A-Za-z][가-힣A-Za-z0-9&.\-]{1,30})",
-            flags=re.IGNORECASE,
+        (
+            re.compile(
+                r"(?<!\d)(\d{6})(?!\d)\s*[·|/]\s*"
+                r"(?:[가-힣A-Za-z&/\-]{1,24}\s+)?"
+                r"([가-힣A-Za-z][가-힣A-Za-z0-9&.\-]{1,30})",
+                flags=re.IGNORECASE,
+            ),
+            "symbol_company",
+            2,
         ),
-        re.compile(
-            r"([가-힣][가-힣A-Za-z0-9&.\-]{1,24})\s+"
-            r"(?<!\d)(\d{6})(?!\d)"
-            r"(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?",
-            flags=re.IGNORECASE,
+        (
+            re.compile(
+                r"([가-힣][가-힣A-Za-z0-9&.\-]{1,24})\s+"
+                r"(?<!\d)(\d{6})(?!\d)"
+                r"(?:\s*[/,.)]\s*(?:KS|KQ|KOSPI|KOSDAQ))?",
+                flags=re.IGNORECASE,
+            ),
+            "company_symbol",
+            2,
         ),
     )
 
-    for pattern in patterns:
+    candidates: list[tuple[int, int, tuple[str, str]]] = []
+    for pattern, orientation, priority in patterns:
         for match in pattern.finditer(raw[:12000]):
-            if pattern.pattern.startswith(("([가-힣", "기술분석보고서")):
+            if orientation == "company_symbol":
                 result = _pick(match.group(2), match.group(1))
             else:
                 result = _pick(match.group(1), match.group(2))
             if result and (result[1] or result[0] in known):
-                return result
+                candidates.append((match.start(), priority, result))
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[0][2]
 
     for match in re.finditer(r"(?<!\d)(\d{6})(?!\d)", raw[:12000]):
         code = _valid_symbol(match.group(1))
@@ -1102,6 +1806,31 @@ def _infer_report_category(source_url: str, detail_url: str) -> str:
     return "unknown"
 
 
+_RESEARCH_SEED_CATEGORY_PRIORITY: dict[str, int] = {
+    "company_analysis": 0,
+    "industry_analysis": 1,
+    "invest_info": 2,
+    "market_info": 3,
+    "economy_analysis": 4,
+    "bond_analysis": 5,
+    "unknown": 9,
+}
+
+
+def _prioritize_research_seed_urls(values: list[str]) -> list[str]:
+    indexed: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(values):
+        url = str(raw or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        category = _infer_report_category(url, url)
+        priority = _RESEARCH_SEED_CATEGORY_PRIORITY.get(category, 9)
+        indexed.append((priority, index, url))
+    return [url for _, _, url in sorted(indexed)]
+
+
 def _is_research_detail_url(url: str) -> bool:
     lower = str(url or "").lower()
     if "/research/" not in lower:
@@ -1439,21 +2168,35 @@ class NaverReportCrawlerConfig:
     max_chunks_per_report: int = 24
     max_pdf_chars: int = 120000
     min_pdf_text_chars: int = 240
-    max_detail_pages: int = 150
+    max_detail_pages: int = 40
+    max_pdfs_per_cycle: int = 80
     request_delay_sec: float = 1.8
-    llm_bridge_command: str = ""
-    llm_bridge_args: str = ""
-    llm_bridge_url: str = ""
-    llm_bridge_token: str = ""
-    llm_bridge_timeout_ms: int = 60000
+    codex_runtime_mode: str = "auto"
+    codex_runtime_sdk_codex_bin: str = ""
+    codex_runtime_timeout_ms: int = 60000
     llm_model: str = "gpt-5.5"
+    llm_reasoning_effort: str = "xhigh"
+    llm_usage_enabled: bool = True
+    llm_usage_db_path: str = ".runtime/llm_usage.db"
+    llm_usage_component: str = "research_reports"
+    codex_native_thread_mode: str = "daily"
+    codex_native_thread_db_path: str = ".runtime/codex_native_threads.db"
+    codex_native_compact_after_turns: int = 8
+    codex_native_read_turns: bool = False
+    codex_native_developer_instructions_enabled: bool = True
     llm_facts_enabled: bool = False
 
 
 class NaverReportRepository:
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, status_cache_ttl_sec: float = 30.0) -> None:
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ops_status_disk_cache_path = self.path.with_name(
+            f"{self.path.name}.ops_status_cache.json"
+        )
+        self.status_cache_ttl_sec = max(float(status_cache_ttl_sec), 0.0)
+        self._status_cache: tuple[float, int, dict[str, Any]] | None = None
+        self._ops_status_cache: tuple[float, int, dict[str, Any]] | None = None
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -1462,6 +2205,114 @@ class NaverReportRepository:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA busy_timeout = 30000")
         return conn
+
+    def _connect_readonly(self) -> sqlite3.Connection:
+        db_uri = f"{self.path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(db_uri, timeout=30.0, uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000")
+        return conn
+
+    def _db_mtime_ns(self) -> int:
+        candidates = [
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        ]
+        latest = 0
+        for candidate in candidates:
+            try:
+                latest = max(latest, candidate.stat().st_mtime_ns)
+            except FileNotFoundError:
+                continue
+        return latest
+
+    def _db_file_footprint(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for label, candidate in (
+            ("db", self.path),
+            ("wal", Path(f"{self.path}-wal")),
+            ("shm", Path(f"{self.path}-shm")),
+        ):
+            try:
+                out[label] = int(candidate.stat().st_size)
+            except FileNotFoundError:
+                out[label] = 0
+        return out
+
+    def _invalidate_status_cache(self) -> None:
+        self._status_cache = None
+        self._ops_status_cache = None
+        try:
+            self._ops_status_disk_cache_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    def _read_ops_status_disk_cache(
+        self,
+        *,
+        mtime_ns: int,
+    ) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(self._ops_status_disk_cache_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if int(payload.get("version") or 0) != 1:
+            return None
+        cached_mtime_ns = int(payload.get("db_mtime_ns") or 0)
+        if cached_mtime_ns != int(mtime_ns):
+            cached_footprint = payload.get("db_footprint")
+            if not isinstance(cached_footprint, dict):
+                return None
+            current_footprint = self._db_file_footprint()
+            normalized_cached_footprint = {
+                str(key): int(value or 0)
+                for key, value in cached_footprint.items()
+            }
+            mtime_delta = abs(int(mtime_ns) - cached_mtime_ns)
+            if (
+                normalized_cached_footprint != current_footprint
+                or mtime_delta > _OPS_STATUS_DISK_CACHE_MTIME_TOLERANCE_NS
+            ):
+                return None
+        if str(payload.get("db_path") or "") != str(self.path):
+            return None
+        status = payload.get("status")
+        if not isinstance(status, dict):
+            return None
+        return copy.deepcopy(status)
+
+    def _write_ops_status_disk_cache(
+        self,
+        *,
+        mtime_ns: int,
+        status: dict[str, Any],
+    ) -> None:
+        try:
+            tmp_path = self._ops_status_disk_cache_path.with_suffix(
+                self._ops_status_disk_cache_path.suffix + ".tmp"
+            )
+            tmp_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "db_path": str(self.path),
+                        "db_mtime_ns": int(mtime_ns),
+                        "db_footprint": self._db_file_footprint(),
+                        "cached_at": utc_now_iso(),
+                        "status": status,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            tmp_path.replace(self._ops_status_disk_cache_path)
+        except (OSError, TypeError, ValueError):
+            return
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -1527,6 +2378,36 @@ class NaverReportRepository:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(report_id) REFERENCES reports(report_id)
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS report_symbol_links (
+                    report_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    asset_class TEXT NOT NULL DEFAULT 'stock',
+                    link_type TEXT NOT NULL DEFAULT 'mention',
+                    source TEXT NOT NULL DEFAULT 'unknown',
+                    confidence REAL NOT NULL DEFAULT 0.0,
+                    evidence TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (report_id, symbol, link_type),
+                    FOREIGN KEY (report_id) REFERENCES reports(report_id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_report_symbol_links_symbol
+                ON report_symbol_links(symbol, asset_class, confidence DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_report_symbol_links_report
+                ON report_symbol_links(report_id)
                 """
             )
             conn.execute(
@@ -1726,6 +2607,40 @@ class NaverReportRepository:
                 (raw, int(row["report_id"])),
             )
 
+    def has_pdf_url(self, pdf_url: str) -> bool:
+        raw = str(pdf_url or "").strip()
+        if not raw:
+            return False
+        canonical = _canonical_url(raw)
+        with self._connect_readonly() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM reports
+                WHERE pdf_url IN (?, ?)
+                LIMIT 1
+                """,
+                (raw, canonical),
+            ).fetchone()
+        return row is not None
+
+    def has_detail_url(self, detail_url: str) -> bool:
+        raw = str(detail_url or "").strip()
+        if not raw:
+            return False
+        canonical = _canonical_url(raw)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM reports
+                WHERE detail_url IN (?, ?)
+                LIMIT 1
+                """,
+                (raw, canonical),
+            ).fetchone()
+        return row is not None
+
     def upsert_report(
         self,
         category: str,
@@ -1750,13 +2665,19 @@ class NaverReportRepository:
     ) -> int:
         now = utc_now_iso()
         text = content.strip()
+        normalized_published_at = _normalize_report_date(published_at)
         normalized_title = _clean_report_title(
             title,
             content=text,
             category=category,
         )
         normalized_company_name = _clean_company_name(company_name)
-        normalized_symbol = _clean_report_symbol(symbol, published_at=published_at)
+        normalized_symbol = _clean_report_symbol(
+            symbol,
+            published_at=normalized_published_at,
+        )
+        directory_source = "naver_reports"
+        directory_confidence = 0.8
         chunk_rows = list(chunks or [])
         if not chunk_rows:
             plain_chunks = _split_chunks(
@@ -1776,28 +2697,32 @@ class NaverReportRepository:
             or hashlib.sha256(str(pdf_url or "").encode("utf-8")).hexdigest()
         )
         with self._connect() as conn:
+            symbol_rows = conn.execute(
+                "SELECT symbol, company_name, market, source, confidence FROM symbol_directory"
+            ).fetchall()
+            symbol_names: dict[str, str] = {}
+            symbol_meta: dict[str, tuple[str, float]] = {}
+            asset_class_by_symbol: dict[str, str] = {}
+            for symbol_row in symbol_rows:
+                code = str(symbol_row["symbol"] or "").strip()
+                name = _clean_symbol_link_name(symbol_row["company_name"])
+                if not _is_six_digit_symbol(code) or not name:
+                    continue
+                symbol_names[code] = name
+                symbol_meta[code] = (
+                    str(symbol_row["source"] or ""),
+                    float(symbol_row["confidence"] or 0.0),
+                )
+                asset_class_by_symbol[code] = _symbol_asset_class_from_market(
+                    symbol_row["market"]
+                )
             if category == "company_analysis":
-                symbol_rows = conn.execute(
-                    "SELECT symbol, company_name, source, confidence FROM symbol_directory"
-                ).fetchall()
-                symbol_names: dict[str, str] = {}
-                symbol_meta: dict[str, tuple[str, float]] = {}
-                for symbol_row in symbol_rows:
-                    code = str(symbol_row["symbol"] or "").strip()
-                    name = _clean_company_candidate(symbol_row["company_name"])
-                    if not _is_six_digit_symbol(code) or not name:
-                        continue
-                    symbol_names[code] = name
-                    symbol_meta[code] = (
-                        str(symbol_row["source"] or ""),
-                        float(symbol_row["confidence"] or 0.0),
-                    )
                 inferred_symbol, inferred_company = _extract_company_symbol_from_text(
                     f"{normalized_title}\n{text[:12000]}\n{text[-12000:] if len(text) > 12000 else ''}",
                     symbol_names=symbol_names,
-                    published_at=published_at,
+                    published_at=normalized_published_at,
                 )
-                if inferred_symbol and inferred_symbol == normalized_symbol:
+                if inferred_symbol:
                     mapped_source, mapped_confidence = symbol_meta.get(
                         inferred_symbol,
                         ("", 0.0),
@@ -1809,11 +2734,25 @@ class NaverReportRepository:
                         mapped_source=mapped_source,
                         mapped_confidence=mapped_confidence,
                     )
+                    normalized_symbol = inferred_symbol
+                    directory_source = "text_extract"
+                    directory_confidence = 0.9
                     if selected_company:
                         normalized_company_name = selected_company
             elif category != "company_analysis":
                 normalized_symbol = ""
                 normalized_company_name = ""
+                normalized_title = _improve_non_company_report_title(
+                    normalized_title,
+                    content=text,
+                )
+            if category == "company_analysis":
+                normalized_title = _improve_company_report_title(
+                    normalized_title,
+                    content=text,
+                    company_name=normalized_company_name,
+                    symbol=normalized_symbol,
+                )
 
             row = conn.execute(
                 "SELECT report_id, created_at FROM reports WHERE doc_id = ? OR pdf_url = ?",
@@ -1840,7 +2779,7 @@ class NaverReportRepository:
                         broker,
                         analyst,
                         normalized_symbol,
-                        published_at,
+                        normalized_published_at,
                         crawled_at,
                         pdf_sha256,
                         pdf_archived_path,
@@ -1875,7 +2814,7 @@ class NaverReportRepository:
                         broker,
                         analyst,
                         normalized_symbol,
-                        published_at,
+                        normalized_published_at,
                         crawled_at,
                         pdf_sha256,
                         pdf_archived_path,
@@ -1895,10 +2834,53 @@ class NaverReportRepository:
                 symbol=normalized_symbol,
                 company_name=normalized_company_name,
                 market="",
-                source="naver_reports",
-                confidence=0.8,
+                source=directory_source,
+                confidence=directory_confidence,
                 status="active",
                 verified_at=now,
+            )
+            if normalized_symbol and normalized_company_name:
+                symbol_names[normalized_symbol] = normalized_company_name
+                asset_class_by_symbol.setdefault(normalized_symbol, "stock")
+            link_text = (
+                f"{normalized_title}\n{text[:12000]}"
+                f"\n{text[-12000:] if len(text) > 12000 else ''}"
+            )
+            symbol_links = _extract_report_symbol_links(
+                link_text,
+                symbol_names=symbol_names,
+                asset_class_by_symbol=asset_class_by_symbol,
+                published_at=normalized_published_at,
+            )
+            if category == "company_analysis" and normalized_symbol:
+                primary_name = (
+                    normalized_company_name
+                    or symbol_names.get(normalized_symbol)
+                    or normalized_symbol
+                )
+                symbol_links.insert(
+                    0,
+                    {
+                        "symbol": normalized_symbol,
+                        "name": primary_name,
+                        "asset_class": asset_class_by_symbol.get(
+                            normalized_symbol,
+                            "stock",
+                        ),
+                        "link_type": "primary",
+                        "source": "reports.symbol",
+                        "confidence": 1.0,
+                        "evidence": normalized_title,
+                    },
+                )
+            self._delete_generated_report_symbol_links_with_conn(
+                conn=conn,
+                report_id=report_id,
+            )
+            self._upsert_report_symbol_links_with_conn(
+                conn=conn,
+                report_id=report_id,
+                links=symbol_links,
             )
 
             for idx, row_payload in enumerate(chunk_rows):
@@ -1927,6 +2909,7 @@ class NaverReportRepository:
                     report_id=report_id,
                     facts=structured_facts,
                 )
+            self._invalidate_status_cache()
             return report_id
 
     def _upsert_symbol_directory_with_conn(
@@ -1964,11 +2947,21 @@ class NaverReportRepository:
                     WHEN excluded.company_name <> ''
                       AND (
                         TRIM(COALESCE(symbol_directory.company_name, '')) = ''
-                        OR excluded.confidence >= symbol_directory.confidence
+                        OR excluded.confidence > symbol_directory.confidence
                         OR (
                           symbol_directory.source NOT IN ('pykrx', 'krx', 'krx_lookup')
-                          AND excluded.source IN ('metadata_repair', 'pykrx', 'krx', 'krx_lookup')
+                          AND excluded.source IN ('pykrx', 'krx', 'krx_lookup')
+                          AND excluded.confidence >= 0.99
+                        )
+                        OR (
+                          symbol_directory.source NOT IN ('pykrx', 'krx', 'krx_lookup', 'metadata_repair', 'text_extract')
+                          AND excluded.source IN ('metadata_repair', 'text_extract')
                           AND excluded.confidence >= 0.85
+                        )
+                        OR (
+                          symbol_directory.source = 'naver_reports'
+                          AND excluded.source IN ('metadata_repair', 'text_extract')
+                          AND excluded.confidence >= symbol_directory.confidence
                         )
                       )
                     THEN excluded.company_name
@@ -2031,6 +3024,399 @@ class NaverReportRepository:
                 status=status,
                 verified_at=verified_at or utc_now_iso(),
             )
+        self._invalidate_status_cache()
+
+    def seed_symbol_directory(self, items: list[dict[str, Any]]) -> int:
+        updated = 0
+        now = utc_now_iso()
+        with self._connect() as conn:
+            for item in items:
+                symbol = _clean_report_symbol(item.get("symbol"))
+                name = _clean_symbol_link_name(
+                    item.get("name") or item.get("company_name")
+                )
+                if not symbol or not name:
+                    continue
+                market = str(item.get("market") or "").strip()
+                source = str(item.get("source") or "configured_etf").strip()
+                self._upsert_symbol_directory_with_conn(
+                    conn=conn,
+                    symbol=symbol,
+                    company_name=name,
+                    market=market,
+                    source=source or "configured_etf",
+                    confidence=1.0,
+                    status=str(item.get("status") or "active"),
+                    verified_at=now,
+                )
+                updated += 1
+        if updated:
+            self._invalidate_status_cache()
+        return updated
+
+    def upsert_report_symbol_links(
+        self,
+        report_id: int,
+        links: list[dict[str, Any]],
+    ) -> int:
+        with self._connect() as conn:
+            written = self._upsert_report_symbol_links_with_conn(
+                conn=conn,
+                report_id=report_id,
+                links=links,
+            )
+        if written:
+            self._invalidate_status_cache()
+        return written
+
+    def _upsert_report_symbol_links_with_conn(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        report_id: int,
+        links: list[dict[str, Any]],
+        directory_by_symbol: dict[str, dict[str, Any]] | None = None,
+    ) -> int:
+        rid = int(report_id)
+        if rid <= 0:
+            return 0
+        now = utc_now_iso()
+        seen: set[tuple[str, str]] = set()
+        updated = 0
+        directory_by_symbol = directory_by_symbol or self._symbol_directory_map_with_conn(conn)
+        for link in links[:20]:
+            symbol = _clean_report_symbol(link.get("symbol"))
+            if not symbol:
+                continue
+            link_type = str(link.get("link_type") or "mention").strip()[:24]
+            key = (symbol, link_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            name = _clean_symbol_link_name(link.get("name"))
+            asset_class = str(link.get("asset_class") or "stock").strip().lower()[:24]
+            source = str(link.get("source") or "unknown").strip()[:40]
+            evidence = _clean_metadata_text(link.get("evidence"), limit=180)
+            try:
+                confidence = float(link.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            directory = directory_by_symbol.get(symbol) or {}
+            directory_name = _clean_symbol_link_name(directory.get("name"))
+            directory_asset_class = str(directory.get("asset_class") or "").strip()
+            if directory_asset_class and asset_class == "stock":
+                asset_class = directory_asset_class
+            if (
+                asset_class == "stock"
+                and directory_name
+                and name
+                and not _company_names_overlap(name, directory_name)
+                and _is_trusted_symbol_link_directory(
+                    directory.get("source"),
+                    directory.get("confidence"),
+                )
+            ):
+                if source in {"text_extract", "reports.symbol"}:
+                    continue
+                name = directory_name
+            elif not name and directory_name:
+                name = directory_name
+            conn.execute(
+                """
+                INSERT INTO report_symbol_links(
+                    report_id, symbol, name, asset_class, link_type, source,
+                    confidence, evidence, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id, symbol, link_type) DO UPDATE SET
+                    name=excluded.name,
+                    asset_class=excluded.asset_class,
+                    source=excluded.source,
+                    confidence=excluded.confidence,
+                    evidence=excluded.evidence,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    rid,
+                    symbol,
+                    name,
+                    asset_class or "stock",
+                    link_type or "mention",
+                    source or "unknown",
+                    max(min(confidence, 1.0), 0.0),
+                    evidence,
+                    now,
+                    now,
+                ),
+            )
+            updated += 1
+        return updated
+
+    def _symbol_directory_map_with_conn(
+        self,
+        conn: sqlite3.Connection,
+    ) -> dict[str, dict[str, Any]]:
+        directory_rows = conn.execute(
+            "SELECT symbol, company_name, market, source, confidence FROM symbol_directory"
+        ).fetchall()
+        return {
+            str(row["symbol"] or "").strip(): {
+                "name": _clean_symbol_link_name(row["company_name"]),
+                "asset_class": _symbol_asset_class_from_market(row["market"]),
+                "source": str(row["source"] or ""),
+                "confidence": float(row["confidence"] or 0.0),
+            }
+            for row in directory_rows
+            if _is_six_digit_symbol(row["symbol"])
+        }
+
+    @staticmethod
+    def _delete_generated_report_symbol_links_with_conn(
+        *,
+        conn: sqlite3.Connection,
+        report_id: int,
+    ) -> None:
+        rid = int(report_id)
+        if rid <= 0:
+            return
+        conn.execute(
+            """
+            DELETE FROM report_symbol_links
+            WHERE report_id = ?
+              AND source IN ('text_extract', 'reports.symbol')
+            """,
+            (rid,),
+        )
+
+    def list_report_symbol_links(self, report_id: int) -> list[dict[str, Any]]:
+        rid = int(report_id)
+        if rid <= 0:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  report_id, symbol, name, asset_class, link_type, source,
+                  confidence, evidence, created_at, updated_at
+                FROM report_symbol_links
+                WHERE report_id = ?
+                ORDER BY confidence DESC, symbol ASC, link_type ASC
+                """,
+                (rid,),
+            ).fetchall()
+        return [self._format_report_symbol_link(row) for row in rows]
+
+    def latest_symbol_linked_reports(
+        self,
+        symbol: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        code = _clean_report_symbol(symbol)
+        if not code:
+            return []
+        max_rows = max(min(int(limit), 100), 1)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  r.report_id,
+                  r.doc_id,
+                  r.category,
+                  r.title,
+                  r.company_name,
+                  r.broker,
+                  r.analyst,
+                  COALESCE(NULLIF(r.symbol, ''), l.symbol) AS symbol,
+                  r.published_at,
+                  r.crawled_at,
+                  r.pdf_sha256,
+                  r.pdf_url,
+                  r.pdf_archived_path,
+                  r.content_source,
+                  r.detail_url,
+                  r.updated_at,
+                  l.name AS link_name,
+                  l.asset_class,
+                  l.link_type,
+                  l.confidence AS link_confidence,
+                  l.evidence AS link_evidence
+                FROM report_symbol_links l
+                JOIN reports r ON r.report_id = l.report_id
+                WHERE l.symbol = ?
+                ORDER BY r.published_at DESC, r.updated_at DESC, l.confidence DESC
+                LIMIT ?
+                """,
+                (code, max_rows),
+            ).fetchall()
+        return [
+            {
+                "report_id": int(row["report_id"]),
+                "doc_id": str(row["doc_id"] or ""),
+                "category": str(row["category"] or "unknown"),
+                "title": str(row["title"] or ""),
+                "company_name": str(row["company_name"] or row["link_name"] or ""),
+                "broker": str(row["broker"] or ""),
+                "analyst": str(row["analyst"] or ""),
+                "symbol": str(row["symbol"] or ""),
+                "published_at": str(row["published_at"] or ""),
+                "crawled_at": str(row["crawled_at"] or ""),
+                "pdf_sha256": str(row["pdf_sha256"] or ""),
+                "pdf_url": str(row["pdf_url"] or ""),
+                "pdf_archived_path": str(row["pdf_archived_path"] or ""),
+                "content_source": str(row["content_source"] or ""),
+                "detail_url": str(row["detail_url"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+                "linked_name": str(row["link_name"] or ""),
+                "asset_class": str(row["asset_class"] or "stock"),
+                "link_type": str(row["link_type"] or "mention"),
+                "link_confidence": float(row["link_confidence"] or 0.0),
+                "link_evidence": str(row["link_evidence"] or ""),
+            }
+            for row in rows
+        ]
+
+    def backfill_report_symbol_links(
+        self,
+        limit: int = 0,
+        asset_class: str = "etf",
+    ) -> dict[str, Any]:
+        requested_asset_class = str(asset_class or "etf").strip().lower() or "etf"
+        max_rows = max(int(limit), 0)
+        now = utc_now_iso()
+        with self._connect() as conn:
+            directory_rows = conn.execute(
+                """
+                SELECT symbol, company_name, market, source, confidence
+                FROM symbol_directory
+                ORDER BY symbol ASC
+                """
+            ).fetchall()
+            symbol_names: dict[str, str] = {}
+            asset_class_by_symbol: dict[str, str] = {}
+            directory_by_symbol: dict[str, dict[str, Any]] = {}
+            for row in directory_rows:
+                symbol = str(row["symbol"] or "").strip()
+                name = _clean_symbol_link_name(row["company_name"])
+                item_asset_class = _symbol_asset_class_from_market(row["market"])
+                if _is_six_digit_symbol(symbol):
+                    directory_by_symbol[symbol] = {
+                        "name": name,
+                        "asset_class": item_asset_class,
+                        "source": str(row["source"] or ""),
+                        "confidence": float(row["confidence"] or 0.0),
+                    }
+                if (
+                    not _is_six_digit_symbol(symbol)
+                    or not name
+                    or item_asset_class != requested_asset_class
+                ):
+                    continue
+                symbol_names[symbol] = name
+                asset_class_by_symbol[symbol] = item_asset_class
+            if not symbol_names:
+                return {
+                    "ok": True,
+                    "asset_class": requested_asset_class,
+                    "scanned_reports": 0,
+                    "updated_reports": 0,
+                    "linked_symbols": [],
+                    "updated_at": now,
+                }
+            if requested_asset_class in {"etf", "etn"}:
+                sql = """
+                    SELECT report_id, title, content, published_at
+                    FROM reports
+                    WHERE category IN ('invest_info', 'market_info', 'industry_analysis')
+                      AND (
+                        title LIKE '%ETF%'
+                        OR content LIKE '%ETF%'
+                        OR title LIKE '%상장지수펀드%'
+                        OR content LIKE '%상장지수펀드%'
+                      )
+                    ORDER BY published_at DESC, updated_at DESC, report_id DESC
+                """
+            else:
+                sql = """
+                    SELECT report_id, title, content, published_at
+                    FROM reports
+                    WHERE category IN ('invest_info', 'market_info', 'industry_analysis')
+                    ORDER BY published_at DESC, updated_at DESC, report_id DESC
+                """
+            params: list[Any] = []
+            if max_rows > 0:
+                sql += " LIMIT ?"
+                params.append(max_rows)
+            report_rows = conn.execute(sql, params).fetchall()
+            scanned_reports = 0
+            updated_reports = 0
+            linked_symbols: set[str] = set()
+            for row in report_rows:
+                scanned_reports += 1
+                title = str(row["title"] or "")
+                content = str(row["content"] or "")
+                text = (
+                    f"{title}\n{content[:12000]}"
+                    f"\n{content[-12000:] if len(content) > 12000 else ''}"
+                )
+                scan_symbol_names = symbol_names
+                scan_asset_classes = asset_class_by_symbol
+                if requested_asset_class == "stock":
+                    mentioned_codes = {
+                        match.group(1)
+                        for match in re.finditer(r"(?<!\d)(\d{6})(?!\d)", text)
+                        if not _is_probable_short_date_symbol(match.group(1))
+                    }
+                    if not mentioned_codes:
+                        continue
+                    scan_symbol_names = {
+                        code: symbol_names[code]
+                        for code in mentioned_codes
+                        if code in symbol_names
+                    }
+                    if not scan_symbol_names:
+                        continue
+                    scan_asset_classes = {
+                        code: asset_class_by_symbol.get(code, requested_asset_class)
+                        for code in scan_symbol_names
+                    }
+                links = _extract_report_symbol_links(
+                    text,
+                    symbol_names=scan_symbol_names,
+                    asset_class_by_symbol=scan_asset_classes,
+                    published_at=str(row["published_at"] or ""),
+                )
+                written = self._upsert_report_symbol_links_with_conn(
+                    conn=conn,
+                    report_id=int(row["report_id"] or 0),
+                    links=links,
+                    directory_by_symbol=directory_by_symbol,
+                )
+                if written:
+                    updated_reports += 1
+                    linked_symbols.update(str(link["symbol"]) for link in links)
+            return {
+                "ok": True,
+                "asset_class": requested_asset_class,
+                "scanned_reports": scanned_reports,
+                "updated_reports": updated_reports,
+                "linked_symbols": sorted(linked_symbols),
+                "updated_at": now,
+            }
+
+    @staticmethod
+    def _format_report_symbol_link(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "report_id": int(row["report_id"]),
+            "symbol": str(row["symbol"] or ""),
+            "name": str(row["name"] or ""),
+            "asset_class": str(row["asset_class"] or "stock"),
+            "link_type": str(row["link_type"] or "mention"),
+            "source": str(row["source"] or "unknown"),
+            "confidence": float(row["confidence"] or 0.0),
+            "evidence": str(row["evidence"] or ""),
+            "created_at": str(row["created_at"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+        }
 
     def resolve_symbol_names(self, symbols: list[str]) -> dict[str, str]:
         codes = [
@@ -2053,6 +3439,91 @@ class NaverReportRepository:
                 out[code] = name
         return out
 
+    def list_symbol_directory(
+        self,
+        *,
+        market: str = "",
+        limit: int = 100,
+        exclude_symbols: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        market_filter = str(market or "").strip().upper()
+        max_rows = max(int(limit), 1)
+        excluded = {
+            str(item or "").strip()
+            for item in (exclude_symbols or set())
+            if str(item or "").strip()
+        }
+        with self._connect() as conn:
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(symbol_directory)").fetchall()
+            }
+            required = {"symbol", "company_name"}
+            if not required.issubset(columns):
+                return []
+
+            select_columns = ["symbol", "company_name"]
+            for column in ("market", "source", "confidence", "updated_at"):
+                if column in columns:
+                    select_columns.append(column)
+            where = ["TRIM(COALESCE(symbol, '')) <> ''"]
+            where.append("TRIM(COALESCE(company_name, '')) <> ''")
+            params: list[Any] = []
+            if "market" in columns:
+                where.append("UPPER(COALESCE(market, '')) NOT IN ('ETF', 'ETN')")
+                if market_filter:
+                    where.append("UPPER(COALESCE(market, '')) = ?")
+                    params.append(market_filter)
+            if "asset_class" in columns:
+                where.append(
+                    "LOWER(COALESCE(NULLIF(asset_class, ''), 'stock')) = 'stock'"
+                )
+            if "status" in columns:
+                where.append(
+                    """
+                    LOWER(COALESCE(NULLIF(status, ''), 'active')) NOT IN (
+                        'halted', 'managed', 'delisted', 'suspended',
+                        'inactive', 'deleted'
+                    )
+                    """
+                )
+            query = f"""
+                SELECT {', '.join(select_columns)}
+                FROM symbol_directory
+                WHERE {' AND '.join(where)}
+                ORDER BY symbol ASC
+                LIMIT ?
+            """
+            params.append(max_rows + len(excluded))
+            rows = conn.execute(query, tuple(params)).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            symbol = str(row["symbol"] or "").strip()
+            name = _clean_company_name(row["company_name"])
+            if not _is_six_digit_symbol(symbol) or not name or symbol in excluded:
+                continue
+            out.append(
+                {
+                    "symbol": symbol,
+                    "name": name,
+                    "market": str(row["market"] or "") if "market" in row.keys() else "",
+                    "source": str(row["source"] or "") if "source" in row.keys() else "",
+                    "confidence": (
+                        float(row["confidence"] or 0.0)
+                        if "confidence" in row.keys()
+                        else 0.0
+                    ),
+                    "updated_at": (
+                        str(row["updated_at"] or "") if "updated_at" in row.keys() else ""
+                    ),
+                    "asset_class": "stock",
+                }
+            )
+            if len(out) >= max_rows:
+                break
+        return out
+
     def get_symbol_name(self, symbol: str) -> str:
         return str(
             self.resolve_symbol_names([symbol]).get(str(symbol or "").strip()) or ""
@@ -2061,90 +3532,7 @@ class NaverReportRepository:
     def refresh_symbol_directory_from_krx(self, as_of: str = "") -> dict[str, Any]:
         as_of_date = str(as_of or date.today().isoformat())
         now = utc_now_iso()
-        rows: list[tuple[str, str, str]] = []
-        errors: list[str] = []
-
-        try:
-            from pykrx import stock  # type: ignore
-
-            market_labels = {
-                "KOSPI": "KOSPI",
-                "KOSDAQ": "KOSDAQ",
-                "KONEX": "KONEX",
-            }
-            for market, label in market_labels.items():
-                try:
-                    tickers = list(
-                        stock.get_market_ticker_list(as_of_date, market=market)
-                    )
-                except Exception as exc:
-                    errors.append(f"{market}: {exc}")
-                    continue
-                for ticker in tickers:
-                    code = str(ticker or "").strip()
-                    if not _is_six_digit_symbol(code):
-                        continue
-                    try:
-                        name = _clean_company_name(stock.get_market_ticker_name(code))
-                    except Exception:
-                        name = ""
-                    if name:
-                        rows.append((code, name, label))
-
-            for getter, label in (
-                ("get_etf_ticker_list", "ETF"),
-                ("get_etn_ticker_list", "ETN"),
-            ):
-                fn = getattr(stock, getter, None)
-                if fn is None:
-                    continue
-                try:
-                    tickers = list(fn(as_of_date))
-                except Exception as exc:
-                    errors.append(f"{label}: {exc}")
-                    continue
-                for ticker in tickers:
-                    code = str(ticker or "").strip()
-                    if not _is_six_digit_symbol(code):
-                        continue
-                    try:
-                        name = _clean_company_name(stock.get_market_ticker_name(code))
-                    except Exception:
-                        name = ""
-                    if name:
-                        rows.append((code, name, label))
-        except Exception as exc:
-            return {
-                "ok": False,
-                "reason": "pykrx_unavailable",
-                "detail": str(exc),
-                "updated": 0,
-            }
-
-        if not rows:
-            try:
-                with self._connect() as conn:
-                    existing_rows = conn.execute(
-                        """
-                        SELECT DISTINCT symbol FROM reports
-                        WHERE TRIM(COALESCE(symbol, '')) <> ''
-                        UNION
-                        SELECT DISTINCT symbol FROM symbol_directory
-                        WHERE TRIM(COALESCE(symbol, '')) <> ''
-                        """
-                    ).fetchall()
-                for row in existing_rows:
-                    code = str(row["symbol"] or "").strip()
-                    if not _is_six_digit_symbol(code):
-                        continue
-                    try:
-                        name = _clean_company_name(stock.get_market_ticker_name(code))
-                    except Exception:
-                        name = ""
-                    if name:
-                        rows.append((code, name, "KRX_LOOKUP"))
-            except Exception as exc:
-                errors.append(f"known_symbols: {exc}")
+        rows, errors = _fetch_krx_symbol_directory_direct()
 
         merged: dict[str, tuple[str, str]] = {}
         for code, name, market in rows:
@@ -2155,9 +3543,11 @@ class NaverReportRepository:
         if not merged:
             return {
                 "ok": False,
-                "reason": "empty_snapshot",
+                "reason": "krx_symbol_directory_unavailable",
                 "detail": "; ".join(errors)[:300],
                 "updated": 0,
+                "as_of": as_of_date,
+                "updated_at": now,
             }
 
         with self._connect() as conn:
@@ -2167,11 +3557,12 @@ class NaverReportRepository:
                     symbol=code,
                     company_name=name,
                     market=market,
-                    source="pykrx",
+                    source="krx",
                     confidence=1.0,
                     status="active",
                     verified_at=now,
                 )
+        self._invalidate_status_cache()
 
         return {
             "ok": True,
@@ -2199,13 +3590,17 @@ class NaverReportRepository:
         corrected_brokers = 0
         cleaned_symbol_directory = 0
         deleted_symbol_directory = 0
+        cleaned_published_at = 0
+        canonicalized_symbol_links = 0
+        deleted_symbol_links = 0
 
         with self._connect() as conn:
             symbol_rows = conn.execute(
-                "SELECT symbol, company_name, source, confidence FROM symbol_directory"
+                "SELECT symbol, company_name, market, source, confidence FROM symbol_directory"
             ).fetchall()
             clean_symbol_map: dict[str, str] = {}
             clean_symbol_meta: dict[str, tuple[str, float]] = {}
+            asset_class_by_symbol: dict[str, str] = {}
             for row in symbol_rows:
                 code = str(row["symbol"] or "").strip()
                 name = _clean_company_candidate(row["company_name"])
@@ -2217,6 +3612,9 @@ class NaverReportRepository:
                 clean_symbol_meta[code] = (
                     str(row["source"] or ""),
                     float(row["confidence"] or 0.0),
+                )
+                asset_class_by_symbol[code] = _symbol_asset_class_from_market(
+                    row["market"]
                 )
                 if name != str(row["company_name"] or ""):
                     conn.execute(
@@ -2249,7 +3647,10 @@ class NaverReportRepository:
                 current_broker = str(row["broker"] or "")
                 current_analyst = str(row["analyst"] or "")
                 current_symbol = str(row["symbol"] or "").strip()
-                published_at = str(row["published_at"] or "")
+                current_published_at = str(row["published_at"] or "")
+                published_at = _normalize_report_date(current_published_at)
+                if current_published_at and published_at != current_published_at:
+                    cleaned_published_at += 1
                 content = str(row["content"] or "")
                 content_tail = content[-12000:] if len(content) > 12000 else ""
                 metadata_text = f"{current_title}\n{content[:12000]}\n{content_tail}"
@@ -2270,6 +3671,10 @@ class NaverReportRepository:
                 if category != "company_analysis":
                     symbol = ""
                     company_name = ""
+                    title = _improve_non_company_report_title(
+                        title,
+                        content=content,
+                    )
 
                 inferred_symbol = ""
                 inferred_company = ""
@@ -2333,6 +3738,13 @@ class NaverReportRepository:
                     if symbol and symbol not in clean_symbol_map and not company_name:
                         symbol = ""
 
+                    title = _improve_company_report_title(
+                        title,
+                        content=content,
+                        company_name=company_name,
+                        symbol=symbol,
+                    )
+
                 strong_broker = _extract_strong_broker_from_text(metadata_text)
                 if strong_broker and broker != strong_broker:
                     broker = strong_broker
@@ -2390,6 +3802,7 @@ class NaverReportRepository:
                     and broker == current_broker
                     and symbol == current_symbol
                     and analyst == current_analyst
+                    and published_at == current_published_at
                 ):
                     if (
                         identity_verified
@@ -2412,10 +3825,20 @@ class NaverReportRepository:
                 conn.execute(
                     """
                     UPDATE reports
-                    SET title = ?, company_name = ?, broker = ?, analyst = ?, symbol = ?, updated_at = ?
+                    SET title = ?, company_name = ?, broker = ?, analyst = ?,
+                        symbol = ?, published_at = ?, updated_at = ?
                     WHERE report_id = ?
                     """,
-                    (title, company_name, broker, analyst, symbol, now, report_id),
+                    (
+                        title,
+                        company_name,
+                        broker,
+                        analyst,
+                        symbol,
+                        published_at,
+                        now,
+                        report_id,
+                    ),
                 )
                 updated_reports += 1
 
@@ -2432,6 +3855,96 @@ class NaverReportRepository:
                     )
                     clean_symbol_map[symbol] = company_name
                     clean_symbol_meta[symbol] = ("metadata_repair", 0.9)
+
+            link_rows = conn.execute(
+                """
+                SELECT
+                  l.report_id,
+                  l.symbol,
+                  l.name,
+                  l.asset_class,
+                  l.link_type,
+                  l.source,
+                  l.evidence
+                FROM report_symbol_links l
+                ORDER BY l.report_id ASC
+                """
+            ).fetchall()
+            for link in link_rows:
+                code = str(link["symbol"] or "").strip()
+                if not _is_six_digit_symbol(code):
+                    continue
+                asset_class = str(link["asset_class"] or "stock").strip().lower()
+                if asset_class_by_symbol.get(code, asset_class) != "stock":
+                    continue
+                directory_name = clean_symbol_map.get(code, "")
+                directory_source, directory_confidence = clean_symbol_meta.get(
+                    code,
+                    ("", 0.0),
+                )
+                link_name = _clean_symbol_link_name(link["name"])
+                if (
+                    not directory_name
+                    or not link_name
+                    or _company_names_overlap(link_name, directory_name)
+                    or not _is_trusted_symbol_link_directory(
+                        directory_source,
+                        directory_confidence,
+                    )
+                ):
+                    continue
+                source = str(link["source"] or "")
+                if source in {"text_extract", "reports.symbol"}:
+                    conn.execute(
+                        """
+                        DELETE FROM report_symbol_links
+                        WHERE report_id = ? AND symbol = ? AND link_type = ?
+                        """,
+                        (
+                            int(link["report_id"] or 0),
+                            code,
+                            str(link["link_type"] or "mention"),
+                        ),
+                    )
+                    deleted_symbol_links += 1
+                    continue
+                conn.execute(
+                    """
+                    UPDATE report_symbol_links
+                    SET name = ?, updated_at = ?
+                    WHERE report_id = ? AND symbol = ? AND link_type = ?
+                    """,
+                    (
+                        directory_name,
+                        now,
+                        int(link["report_id"] or 0),
+                        code,
+                        str(link["link_type"] or "mention"),
+                    ),
+                )
+                canonicalized_symbol_links += 1
+
+        if (
+            updated_reports
+            or cleaned_titles
+            or cleaned_company_names
+            or cleaned_brokers
+            or cleaned_analysts
+            or cleared_symbols
+            or backfilled_symbols
+            or backfilled_company_names
+            or backfilled_brokers
+            or backfilled_analysts
+            or corrected_symbols
+            or corrected_company_names
+            or corrected_brokers
+            or cleaned_symbol_directory
+            or deleted_symbol_directory
+            or cleaned_published_at
+            or canonicalized_symbol_links
+            or deleted_symbol_links
+        ):
+            self._invalidate_status_cache()
 
         return {
             "status": "ok",
@@ -2450,8 +3963,11 @@ class NaverReportRepository:
             "corrected_symbols": corrected_symbols,
             "corrected_company_names": corrected_company_names,
             "corrected_brokers": corrected_brokers,
+            "cleaned_published_at": cleaned_published_at,
             "cleaned_symbol_directory": cleaned_symbol_directory,
             "deleted_symbol_directory": deleted_symbol_directory,
+            "canonicalized_symbol_links": canonicalized_symbol_links,
+            "deleted_symbol_links": deleted_symbol_links,
         }
 
     def upsert_report_facts(self, report_id: int, facts: dict[str, Any]) -> None:
@@ -2461,6 +3977,7 @@ class NaverReportRepository:
                 report_id=report_id,
                 facts=facts,
             )
+        self._invalidate_status_cache()
 
     def _upsert_report_facts_with_conn(
         self,
@@ -2625,6 +4142,112 @@ class NaverReportRepository:
         return []
 
     def status(self) -> dict[str, Any]:
+        now = time.monotonic()
+        mtime_ns = self._db_mtime_ns()
+        if self.status_cache_ttl_sec > 0 and self._status_cache is not None:
+            cached_at, cached_mtime_ns, cached_payload = self._status_cache
+            if (
+                cached_mtime_ns == mtime_ns
+                and now - cached_at <= self.status_cache_ttl_sec
+            ):
+                return copy.deepcopy(cached_payload)
+
+        payload = self._compute_status()
+        self._status_cache = (now, self._db_mtime_ns(), copy.deepcopy(payload))
+        return payload
+
+    def ops_status(self) -> dict[str, Any]:
+        now = time.monotonic()
+        mtime_ns = self._db_mtime_ns()
+        if self.status_cache_ttl_sec > 0 and self._ops_status_cache is not None:
+            cached_at, cached_mtime_ns, cached_payload = self._ops_status_cache
+            if (
+                cached_mtime_ns == mtime_ns
+                and now - cached_at <= self.status_cache_ttl_sec
+            ):
+                return copy.deepcopy(cached_payload)
+
+        disk_payload = self._read_ops_status_disk_cache(mtime_ns=mtime_ns)
+        if disk_payload is not None:
+            self._ops_status_cache = (now, mtime_ns, copy.deepcopy(disk_payload))
+            return disk_payload
+
+        payload = self._compute_ops_status()
+        cached_mtime_ns = self._db_mtime_ns()
+        self._ops_status_cache = (now, cached_mtime_ns, copy.deepcopy(payload))
+        self._write_ops_status_disk_cache(
+            mtime_ns=cached_mtime_ns,
+            status=payload,
+        )
+        return payload
+
+    def _compute_ops_status(self) -> dict[str, Any]:
+        with self._connect_readonly() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  COUNT(*) AS total_reports,
+                  MAX(updated_at) AS last_updated_at,
+                  MAX(published_at) AS last_published_at
+                FROM reports
+                """
+            ).fetchone()
+            cat_rows = conn.execute(
+                "SELECT category, COUNT(*) AS cnt FROM reports GROUP BY category ORDER BY cnt DESC"
+            ).fetchall()
+            symbol_row = conn.execute(
+                "SELECT COUNT(*) AS cnt, MAX(updated_at) AS last_updated_at FROM symbol_directory"
+            ).fetchone()
+            symbol_link_row = conn.execute(
+                """
+                SELECT
+                  COUNT(*) AS symbol_link_count,
+                  SUM(CASE WHEN asset_class = 'etf' THEN 1 ELSE 0 END) AS etf_link_count,
+                  COUNT(DISTINCT report_id) AS linked_report_count,
+                  MAX(updated_at) AS last_symbol_link_updated_at
+                FROM report_symbol_links
+                """
+            ).fetchone()
+            facts_row = conn.execute(
+                """
+                SELECT
+                  COUNT(*) AS total_facts,
+                  SUM(CASE WHEN target_price_value > 0 THEN 1 ELSE 0 END) AS target_price_count,
+                  SUM(CASE WHEN rating <> 'UNKNOWN' THEN 1 ELSE 0 END) AS rating_count
+                FROM report_facts
+                """
+            ).fetchone()
+            return {
+                "status": "ok",
+                "quality_mode": "lightweight",
+                "total_reports": int(row["total_reports"] or 0),
+                "last_updated_at": str(row["last_updated_at"] or ""),
+                "last_published_at": str(row["last_published_at"] or ""),
+                "category_counts": {
+                    str(item["category"] or "unknown"): int(item["cnt"] or 0)
+                    for item in cat_rows
+                },
+                "total_symbols": int(symbol_row["cnt"] or 0),
+                "symbol_last_updated_at": str(symbol_row["last_updated_at"] or ""),
+                "symbol_link_count": int(
+                    symbol_link_row["symbol_link_count"] or 0
+                ),
+                "etf_link_count": int(symbol_link_row["etf_link_count"] or 0),
+                "linked_report_count": int(
+                    symbol_link_row["linked_report_count"] or 0
+                ),
+                "last_symbol_link_updated_at": str(
+                    symbol_link_row["last_symbol_link_updated_at"] or ""
+                ),
+                "facts": {
+                    "total_facts": int(facts_row["total_facts"] or 0),
+                    "target_price_count": int(facts_row["target_price_count"] or 0),
+                    "rating_count": int(facts_row["rating_count"] or 0),
+                },
+                "db_path": str(self.path),
+            }
+
+    def _compute_status(self) -> dict[str, Any]:
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -2648,6 +4271,35 @@ class NaverReportRepository:
                   SUM(CASE WHEN target_price_value > 0 THEN 1 ELSE 0 END) AS target_price_count,
                   SUM(CASE WHEN rating <> 'UNKNOWN' THEN 1 ELSE 0 END) AS rating_count
                 FROM report_facts
+                """
+            ).fetchone()
+            symbol_link_row = conn.execute(
+                """
+                SELECT
+                  COUNT(*) AS symbol_link_count,
+                  SUM(CASE WHEN asset_class = 'etf' THEN 1 ELSE 0 END) AS etf_link_count,
+                  COUNT(DISTINCT report_id) AS linked_report_count,
+                  MAX(updated_at) AS last_symbol_link_updated_at
+                FROM report_symbol_links
+                """
+            ).fetchone()
+            unlinked_etf_row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM reports r
+                WHERE r.category IN ('invest_info', 'market_info', 'industry_analysis')
+                  AND (
+                    r.title LIKE '%ETF%'
+                    OR r.content LIKE '%ETF%'
+                    OR r.title LIKE '%상장지수펀드%'
+                    OR r.content LIKE '%상장지수펀드%'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM report_symbol_links l
+                    WHERE l.report_id = r.report_id
+                      AND l.asset_class = 'etf'
+                  )
                 """
             ).fetchone()
             quality_row = conn.execute(
@@ -2747,7 +4399,34 @@ class NaverReportRepository:
                 """
             ).fetchall()
             directory_quality_rows = conn.execute(
-                "SELECT symbol, company_name FROM symbol_directory"
+                "SELECT symbol, company_name, source, confidence FROM symbol_directory"
+            ).fetchall()
+            published_rows = conn.execute(
+                """
+                SELECT report_id, published_at, title
+                FROM reports
+                WHERE TRIM(COALESCE(published_at, '')) <> ''
+                ORDER BY report_id DESC
+                """
+            ).fetchall()
+            symbol_link_quality_rows = conn.execute(
+                """
+                SELECT
+                  l.report_id,
+                  l.symbol,
+                  l.name,
+                  l.asset_class,
+                  l.link_type,
+                  l.source,
+                  l.evidence,
+                  s.company_name AS directory_name,
+                  s.source AS directory_source,
+                  s.confidence AS directory_confidence
+                FROM report_symbol_links l
+                LEFT JOIN symbol_directory s ON s.symbol = l.symbol
+                WHERE LOWER(COALESCE(NULLIF(l.asset_class, ''), 'stock')) = 'stock'
+                ORDER BY l.updated_at DESC, l.report_id DESC
+                """
             ).fetchall()
             category_counts = {
                 str(item["category"] or "unknown"): int(item["cnt"] or 0)
@@ -2794,6 +4473,52 @@ class NaverReportRepository:
                         "reason": suspect_reason,
                     }
                 )
+            invalid_published_at_count = 0
+            invalid_published_at_samples: list[dict[str, Any]] = []
+            for item in published_rows:
+                published_at = str(item["published_at"] or "")
+                if _normalize_report_date(published_at):
+                    continue
+                invalid_published_at_count += 1
+                if len(invalid_published_at_samples) >= 8:
+                    continue
+                invalid_published_at_samples.append(
+                    {
+                        "report_id": int(item["report_id"] or 0),
+                        "published_at": published_at,
+                        "title": str(item["title"] or "")[:140],
+                    }
+                )
+
+            suspicious_symbol_link_count = 0
+            suspicious_symbol_link_samples: list[dict[str, Any]] = []
+            for item in symbol_link_quality_rows:
+                link_name = _clean_symbol_link_name(item["name"])
+                directory_name = _clean_symbol_link_name(item["directory_name"])
+                if (
+                    not link_name
+                    or not directory_name
+                    or _company_names_overlap(link_name, directory_name)
+                    or not _is_trusted_symbol_link_directory(
+                        item["directory_source"],
+                        item["directory_confidence"],
+                    )
+                ):
+                    continue
+                suspicious_symbol_link_count += 1
+                if len(suspicious_symbol_link_samples) >= 8:
+                    continue
+                suspicious_symbol_link_samples.append(
+                    {
+                        "report_id": int(item["report_id"] or 0),
+                        "symbol": str(item["symbol"] or ""),
+                        "link_name": str(item["name"] or ""),
+                        "directory_name": str(item["directory_name"] or ""),
+                        "link_type": str(item["link_type"] or "mention"),
+                        "source": str(item["source"] or ""),
+                        "evidence": str(item["evidence"] or "")[:140],
+                    }
+                )
             return {
                 "total_reports": int(row["total_reports"] or 0),
                 "last_updated_at": str(row["last_updated_at"] or ""),
@@ -2801,6 +4526,19 @@ class NaverReportRepository:
                 "category_counts": category_counts,
                 "total_symbols": int(symbol_row["cnt"] or 0),
                 "symbol_last_updated_at": str(symbol_row["last_updated_at"] or ""),
+                "symbol_link_count": int(
+                    symbol_link_row["symbol_link_count"] or 0
+                ),
+                "etf_link_count": int(symbol_link_row["etf_link_count"] or 0),
+                "linked_report_count": int(
+                    symbol_link_row["linked_report_count"] or 0
+                ),
+                "unlinked_etf_keyword_report_count": int(
+                    unlinked_etf_row["cnt"] or 0
+                ),
+                "last_symbol_link_updated_at": str(
+                    symbol_link_row["last_symbol_link_updated_at"] or ""
+                ),
                 "facts": {
                     "total_facts": int(facts_row["total_facts"] or 0),
                     "target_price_count": int(facts_row["target_price_count"] or 0),
@@ -2829,10 +4567,71 @@ class NaverReportRepository:
                     "symbol_directory_drift_count": int(drift_row["cnt"] or 0),
                     "identity_suspect_count": identity_suspect_count,
                     "generic_symbol_directory_count": generic_symbol_directory_count,
+                    "invalid_published_at_count": invalid_published_at_count,
+                    "suspicious_symbol_link_count": suspicious_symbol_link_count,
                     "identity_drift_samples": identity_drift_samples,
+                    "invalid_published_at_samples": invalid_published_at_samples,
+                    "suspicious_symbol_link_samples": suspicious_symbol_link_samples,
                 },
                 "db_path": str(self.path),
             }
+
+    def resolve_symbol_from_text(self, text: str) -> dict[str, Any] | None:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        symbol_match = re.search(r"(?<!\d)(\d{6})(?!\d)", raw)
+        with self._connect() as conn:
+            if symbol_match:
+                symbol = symbol_match.group(1)
+                row = conn.execute(
+                    """
+                    SELECT symbol, company_name, market, source, confidence,
+                           updated_at, last_verified_at
+                    FROM symbol_directory
+                    WHERE symbol = ?
+                    """,
+                    (symbol,),
+                ).fetchone()
+                if row:
+                    return {
+                        "symbol": str(row["symbol"] or ""),
+                        "company_name": str(row["company_name"] or ""),
+                        "market": str(row["market"] or ""),
+                        "source": str(row["source"] or ""),
+                        "confidence": float(row["confidence"] or 0.0),
+                        "updated_at": str(row["updated_at"] or ""),
+                        "last_verified_at": str(row["last_verified_at"] or ""),
+                        "match_type": "symbol",
+                    }
+            rows = conn.execute(
+                """
+                SELECT symbol, company_name, market, source, confidence,
+                       updated_at, last_verified_at
+                FROM symbol_directory
+                WHERE status = 'active'
+                  AND company_name != ''
+                ORDER BY LENGTH(company_name) DESC, confidence DESC, symbol ASC
+                """
+            ).fetchall()
+        normalized = re.sub(r"\s+", "", raw).lower()
+        for row in rows:
+            name = str(row["company_name"] or "").strip()
+            if len(name) < 2:
+                continue
+            name_key = re.sub(r"\s+", "", name).lower()
+            if name_key and name_key in normalized:
+                return {
+                    "symbol": str(row["symbol"] or ""),
+                    "company_name": name,
+                    "market": str(row["market"] or ""),
+                    "source": str(row["source"] or ""),
+                    "confidence": float(row["confidence"] or 0.0),
+                    "updated_at": str(row["updated_at"] or ""),
+                    "last_verified_at": str(row["last_verified_at"] or ""),
+                    "match_type": "company_name",
+                }
+        return None
 
     def search(
         self,
@@ -2853,11 +4652,19 @@ class NaverReportRepository:
         published_from = str(date_from or "").strip()
         published_to = str(date_to or "").strip()
         max_rows = max(min(int(limit), 100), 1)
+        prefix_sql = ""
+        prefix_params: list[Any] = []
         where: list[str] = []
         params: list[Any] = []
         if sym:
-            where.append("r.symbol = ?")
-            params.append(sym)
+            prefix_sql = """
+                WITH candidate_reports AS (
+                  SELECT report_id FROM reports WHERE symbol = ?
+                  UNION
+                  SELECT report_id FROM report_symbol_links WHERE symbol = ?
+                )
+            """
+            prefix_params.extend([sym, sym])
         if cat:
             where.append("r.category = ?")
             params.append(cat)
@@ -2878,7 +4685,77 @@ class NaverReportRepository:
             where.append("(r.title LIKE ? OR r.content LIKE ? OR c.content LIKE ?)")
             params.extend([like, like, like])
 
-        sql = """
+        if not q:
+            sql = (
+                prefix_sql
+                + """
+                SELECT
+                  r.report_id,
+                  r.doc_id,
+                  r.category,
+                  r.title,
+                  r.company_name,
+                  r.broker,
+                  r.analyst,
+                  r.symbol,
+                  r.published_at,
+                  r.crawled_at,
+                  r.pdf_sha256,
+                  r.pdf_url,
+                  r.pdf_archived_path,
+                  r.content_source,
+                  r.detail_url,
+                  r.updated_at,
+                  SUBSTR(r.content, 1, 480) AS snippet
+                FROM """
+            )
+            if sym:
+                sql += """
+                candidate_reports candidate
+                JOIN reports r ON r.report_id = candidate.report_id
+                """
+            else:
+                sql += "reports r"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY r.published_at DESC, r.updated_at DESC LIMIT ?"
+            params = [*prefix_params, *params, max_rows]
+
+            with self._connect_readonly() as conn:
+                rows = conn.execute(sql, params).fetchall()
+                return [self._format_search_row(row) for row in rows]
+
+        snippet_sql = """
+              COALESCE(
+                (
+                  SELECT c2.content
+                  FROM report_chunks c2
+                  WHERE c2.report_id = r.report_id
+                    AND c2.content LIKE ?
+                  ORDER BY c2.chunk_index ASC
+                  LIMIT 1
+                ),
+                CASE
+                  WHEN INSTR(r.content, ?) > 0 THEN
+                    SUBSTR(
+                      r.content,
+                      CASE
+                        WHEN INSTR(r.content, ?) > 80 THEN INSTR(r.content, ?) - 80
+                        ELSE 1
+                      END,
+                      480
+                    )
+                  ELSE NULL
+                END,
+                MAX(c.content),
+                r.content
+              ) AS snippet
+        """
+        snippet_params = [like, q, q, q]
+
+        sql = (
+            prefix_sql
+            + """
             SELECT
               r.report_id,
               r.doc_id,
@@ -2896,44 +4773,58 @@ class NaverReportRepository:
               r.content_source,
               r.detail_url,
               r.updated_at,
-              COALESCE(MAX(c.content), r.content) AS snippet
-            FROM reports r
+        """
+            + snippet_sql
+            + """
+            FROM """
+        )
+        if sym:
+            sql += """
+            candidate_reports candidate
+            JOIN reports r ON r.report_id = candidate.report_id
+            """
+        else:
+            sql += "reports r"
+        sql += """
             LEFT JOIN report_chunks c ON c.report_id = r.report_id
         """
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " GROUP BY r.report_id ORDER BY r.published_at DESC, r.updated_at DESC LIMIT ?"
-        params.append(max_rows)
+        params = [*prefix_params, *snippet_params, *params, max_rows]
 
-        with self._connect() as conn:
+        with self._connect_readonly() as conn:
             rows = conn.execute(sql, params).fetchall()
-            out: list[dict[str, Any]] = []
-            for row in rows:
-                snippet = str(row["snippet"] or "")
-                if len(snippet) > 480:
-                    snippet = snippet[:480]
-                out.append(
-                    {
-                        "report_id": int(row["report_id"]),
-                        "doc_id": str(row["doc_id"] or ""),
-                        "category": str(row["category"] or "unknown"),
-                        "title": str(row["title"] or ""),
-                        "company_name": str(row["company_name"] or ""),
-                        "broker": str(row["broker"] or ""),
-                        "analyst": str(row["analyst"] or ""),
-                        "symbol": str(row["symbol"] or ""),
-                        "published_at": str(row["published_at"] or ""),
-                        "crawled_at": str(row["crawled_at"] or ""),
-                        "pdf_sha256": str(row["pdf_sha256"] or ""),
-                        "pdf_url": str(row["pdf_url"] or ""),
-                        "pdf_archived_path": str(row["pdf_archived_path"] or ""),
-                        "content_source": str(row["content_source"] or ""),
-                        "detail_url": str(row["detail_url"] or ""),
-                        "updated_at": str(row["updated_at"] or ""),
-                        "snippet": snippet,
-                    }
-                )
-            return out
+            return [self._format_search_row(row) for row in rows]
+
+    @staticmethod
+    def _format_search_row(row: sqlite3.Row) -> dict[str, Any]:
+        snippet = _normalize_search_snippet(
+            row["snippet"],
+            company_name=row["company_name"],
+            symbol=row["symbol"],
+        )
+        if len(snippet) > 480:
+            snippet = snippet[:480]
+        return {
+            "report_id": int(row["report_id"]),
+            "doc_id": str(row["doc_id"] or ""),
+            "category": str(row["category"] or "unknown"),
+            "title": str(row["title"] or ""),
+            "company_name": str(row["company_name"] or ""),
+            "broker": str(row["broker"] or ""),
+            "analyst": str(row["analyst"] or ""),
+            "symbol": str(row["symbol"] or ""),
+            "published_at": str(row["published_at"] or ""),
+            "crawled_at": str(row["crawled_at"] or ""),
+            "pdf_sha256": str(row["pdf_sha256"] or ""),
+            "pdf_url": str(row["pdf_url"] or ""),
+            "pdf_archived_path": str(row["pdf_archived_path"] or ""),
+            "content_source": str(row["content_source"] or ""),
+            "detail_url": str(row["detail_url"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+            "snippet": snippet,
+        }
 
     def get_report(self, report_id: int) -> dict[str, Any] | None:
         rid = int(report_id)
@@ -3097,8 +4988,20 @@ class NaverReportRepository:
                 )
             return out
 
-    def list_chunks_for_rag(self, limit: int = 50000) -> list[dict[str, Any]]:
+    def list_chunks_for_rag(
+        self,
+        limit: int = 50000,
+        *,
+        updated_since: str | None = None,
+    ) -> list[dict[str, Any]]:
         max_rows = max(min(int(limit), 200000), 1)
+        filters: list[str] = []
+        params: list[Any] = []
+        clean_updated_since = str(updated_since or "").strip()
+        if clean_updated_since:
+            filters.append("r.updated_at >= ?")
+            params.append(clean_updated_since)
+        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
         sql = """
             SELECT
               r.report_id,
@@ -3121,14 +5024,38 @@ class NaverReportRepository:
               c.page_start,
               c.page_end,
               c.section_title,
-              c.content
+              c.content,
+              COALESCE(linked.linked_symbols, '') AS linked_symbols,
+              COALESCE(linked.linked_names, '') AS linked_names,
+              COALESCE(linked.linked_asset_classes, '') AS linked_asset_classes
             FROM reports r
             JOIN report_chunks c ON c.report_id = r.report_id
+            LEFT JOIN (
+              SELECT
+                report_id,
+                GROUP_CONCAT(symbol, ',') AS linked_symbols,
+                GROUP_CONCAT(name, ',') AS linked_names,
+                GROUP_CONCAT(asset_class, ',') AS linked_asset_classes
+              FROM (
+                SELECT
+                  report_id,
+                  symbol,
+                  MAX(name) AS name,
+                  MAX(asset_class) AS asset_class,
+                  MAX(confidence) AS confidence
+                FROM report_symbol_links
+                GROUP BY report_id, symbol
+                ORDER BY report_id ASC, confidence DESC, symbol ASC
+              )
+              GROUP BY report_id
+            ) linked ON linked.report_id = r.report_id
+            {where_sql}
             ORDER BY r.published_at DESC, r.updated_at DESC, c.chunk_index ASC
             LIMIT ?
-        """
+        """.format(where_sql=where_sql)
+        params.append(max_rows)
         with self._connect() as conn:
-            rows = conn.execute(sql, (max_rows,)).fetchall()
+            rows = conn.execute(sql, tuple(params)).fetchall()
             out: list[dict[str, Any]] = []
             for row in rows:
                 out.append(
@@ -3154,6 +5081,11 @@ class NaverReportRepository:
                         "page_end": int(row["page_end"] or 0),
                         "section_title": str(row["section_title"] or "unknown"),
                         "content": str(row["content"] or ""),
+                        "linked_symbols": str(row["linked_symbols"] or ""),
+                        "linked_names": str(row["linked_names"] or ""),
+                        "linked_asset_classes": str(
+                            row["linked_asset_classes"] or ""
+                        ),
                     }
                 )
             return out
@@ -3211,14 +5143,23 @@ class NaverSecuritiesCrawler:
         self._since_date = self._parse_since_date(config.since_date)
         self._archive_dir = Path(self.config.pdf_archive_dir)
         self._archive_dir.mkdir(parents=True, exist_ok=True)
-        self._llm_bridge = LLMBridge(
-            LLMBridgeConfig(
-                command=config.llm_bridge_command,
-                args=config.llm_bridge_args,
-                url=config.llm_bridge_url,
-                token=config.llm_bridge_token,
-                timeout_ms=config.llm_bridge_timeout_ms,
+        self._codex_runtime = CodexNativeRuntime(
+            CodexNativeConfig(
+                mode=config.codex_runtime_mode,
+                sdk_codex_bin=config.codex_runtime_sdk_codex_bin,
+                timeout_ms=config.codex_runtime_timeout_ms,
                 model=config.llm_model,
+                reasoning_effort=config.llm_reasoning_effort,
+                usage_enabled=config.llm_usage_enabled,
+                usage_db_path=config.llm_usage_db_path,
+                usage_component=config.llm_usage_component,
+                thread_mode=config.codex_native_thread_mode,
+                thread_db_path=config.codex_native_thread_db_path,
+                compact_after_turns=config.codex_native_compact_after_turns,
+                read_turns=config.codex_native_read_turns,
+                developer_instructions_enabled=(
+                    config.codex_native_developer_instructions_enabled
+                ),
             )
         )
 
@@ -3228,6 +5169,21 @@ class NaverSecuritiesCrawler:
         skipped = 0
         errors = 0
         pdf_seen: set[str] = set()
+
+        def snapshot(*, cycle_limited: bool = False) -> dict[str, Any]:
+            payload = {
+                "status": "ok",
+                "updated_at": utc_now_iso(),
+                "discovered": discovered,
+                "inserted": inserted,
+                "skipped": skipped,
+                "errors": errors,
+                "repository": self.repository.status(),
+            }
+            if cycle_limited:
+                payload["cycle_limited"] = True
+                payload["max_pdfs_per_cycle"] = int(self.config.max_pdfs_per_cycle)
+            return payload
 
         timeout = httpx.Timeout(max(self.config.timeout_sec, 3.0))
         headers = {
@@ -3254,6 +5210,9 @@ class NaverSecuritiesCrawler:
                                 skipped += 1
                                 continue
                             pdf_seen.add(link_url)
+                            if self.repository.has_pdf_url(link_url):
+                                skipped += 1
+                                continue
                             category = _infer_report_category(page_url, page_url)
                             ok = await self._ingest_pdf(
                                 client=client,
@@ -3271,6 +5230,8 @@ class NaverSecuritiesCrawler:
                                 inserted += 1
                             else:
                                 errors += 1
+                            if discovered >= max(int(self.config.max_pdfs_per_cycle), 1):
+                                return snapshot(cycle_limited=True)
                             continue
 
                         if not _is_research_detail_url(link_url):
@@ -3278,6 +5239,9 @@ class NaverSecuritiesCrawler:
                         if link_url in detail_pages_seen:
                             continue
                         detail_pages_seen.add(link_url)
+                        if self.repository.has_detail_url(link_url):
+                            skipped += 1
+                            continue
                         if len(detail_pages_seen) > max(
                             self.config.max_detail_pages, 1
                         ):
@@ -3309,6 +5273,9 @@ class NaverSecuritiesCrawler:
                                 skipped += 1
                                 continue
                             pdf_seen.add(pdf_url)
+                            if self.repository.has_pdf_url(pdf_url):
+                                skipped += 1
+                                continue
                             category = _infer_report_category(page_url, link_url)
                             ok = await self._ingest_pdf(
                                 client=client,
@@ -3326,16 +5293,10 @@ class NaverSecuritiesCrawler:
                                 inserted += 1
                             else:
                                 errors += 1
+                            if discovered >= max(int(self.config.max_pdfs_per_cycle), 1):
+                                return snapshot(cycle_limited=True)
 
-        return {
-            "status": "ok",
-            "updated_at": utc_now_iso(),
-            "discovered": discovered,
-            "inserted": inserted,
-            "skipped": skipped,
-            "errors": errors,
-            "repository": self.repository.status(),
-        }
+        return snapshot()
 
     async def rebuild_all_from_pdf(self, limit: int = 0) -> dict[str, Any]:
         targets = self.repository.list_report_sources(limit=limit)
@@ -3419,7 +5380,7 @@ class NaverSecuritiesCrawler:
         if not archived_path:
             return False
 
-        raw_pages = self._extract_pdf_pages(binary)
+        raw_pages = await self._extract_pdf_pages_with_timeout(binary)
         cleaned_pages = _remove_repeated_header_footer(raw_pages)
         page_rows: list[dict[str, Any]] = []
         for idx, page_text in enumerate(cleaned_pages, start=1):
@@ -3539,7 +5500,7 @@ class NaverSecuritiesCrawler:
             broker=normalized_broker,
             symbol=normalized_symbol,
         )
-        structured_facts = await self._refine_structured_facts_via_bridge(
+        structured_facts = await self._refine_structured_facts_via_native(
             facts=structured_facts,
             text=text,
         )
@@ -3681,7 +5642,24 @@ class NaverSecuritiesCrawler:
                 break
         return texts
 
-    async def _refine_structured_facts_via_bridge(
+    async def _extract_pdf_pages_with_timeout(self, payload: bytes) -> list[str]:
+        timeout_sec = max(float(self.config.timeout_sec) * 2.0, 30.0)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._extract_pdf_pages, payload),
+                timeout=timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "naver report pdf text extraction timeout after %.1fs",
+                timeout_sec,
+            )
+            return []
+        except Exception as exc:
+            logger.warning("naver report pdf text extraction failed: %s", exc)
+            return []
+
+    async def _refine_structured_facts_via_native(
         self,
         *,
         facts: dict[str, Any],
@@ -3689,14 +5667,20 @@ class NaverSecuritiesCrawler:
     ) -> dict[str, Any]:
         if not self.config.llm_facts_enabled:
             return facts
-        bridge = self._llm_bridge
-        if not bridge.ready:
+        runtime = self._codex_runtime
+        if not runtime.ready:
             return facts
 
         payload = {
-            "model": bridge.resolved_model,
+            "model": runtime.resolved_model,
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
+            "native_thread_mode": "ephemeral",
+            "telemetry": {
+                "component": self.config.llm_usage_component,
+                "operation": "report_fact_extraction",
+            },
+            "jue_workflow": {"workflow_id": "report_fact_extraction"},
             "messages": [
                 {
                     "role": "system",
@@ -3743,7 +5727,7 @@ class NaverSecuritiesCrawler:
         }
 
         async def _request_once() -> dict[str, Any] | None:
-            result = await bridge.complete(payload)
+            result = await runtime.complete(payload)
             if not bool(result.get("ok")):
                 return None
             out_text = str(result.get("content") or "").strip()
@@ -3823,9 +5807,9 @@ class NaverSecuritiesCrawler:
             if item and item.strip()
         ]
         if values:
-            return values
+            return _prioritize_research_seed_urls(values)
         single = self.config.seed_url.strip()
-        return [single] if single else []
+        return _prioritize_research_seed_urls([single]) if single else []
 
     @staticmethod
     def _extract_title(html: str) -> str:

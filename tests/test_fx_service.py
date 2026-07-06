@@ -40,7 +40,7 @@ def test_fx_service_prefers_external_sources(monkeypatch) -> None:
     assert snapshot["usd_source"] == "manana"
 
 
-def test_fx_service_falls_back_to_proxy_then_fallback(monkeypatch) -> None:
+def test_fx_service_uses_usdt_proxy_but_raises_when_all_sources_fail(monkeypatch) -> None:
     service = FxRateService(
         FxRateConfig(
             fallback_usdt_krw=1387.0,
@@ -88,11 +88,8 @@ def test_fx_service_falls_back_to_proxy_then_fallback(monkeypatch) -> None:
     monkeypatch.setattr(service_fallback, "_fetch_manana_usd_krw", zero)
     monkeypatch.setattr(service_fallback, "_fetch_er_api_usd_krw", zero)
 
-    snapshot2 = asyncio.run(service_fallback.get_snapshot())
-    assert snapshot2["usdt_krw"] == pytest.approx(1387.0)
-    assert snapshot2["usdt_source"] == "fallback"
-    assert snapshot2["usd_krw"] == pytest.approx(1391.0)
-    assert snapshot2["usd_source"] == "fallback"
+    with pytest.raises(RuntimeError, match="fx rate unavailable"):
+        asyncio.run(service_fallback.get_snapshot())
 
 
 def test_fx_service_cache(monkeypatch) -> None:

@@ -1,0 +1,23 @@
+{
+  "workflow_id": "policy_revision",
+  "version": 1,
+  "scope": "shared",
+  "model_policy": {
+    "default_model": "settings.llm_model",
+    "default_reasoning_effort": "settings.llm_reasoning_effort",
+    "expected_runtime_model": "gpt-5.5",
+    "expected_reasoning_effort": "xhigh"
+  },
+  "cadence": {"kind": "scheduled", "local_time": "weekly_or_monthly_close"},
+  "required_skills": ["execution_review", "thesis_tracker", "policy_revision", "portfolio_balance"],
+  "required_context": ["block_reflections", "policy_scorecards", "policy_outcomes", "period_reviews", "investment_memory"],
+  "output_contracts": ["policy_revision_contract", "reflection_contract"],
+  "authority": {
+    "can_read_untrusted_research": false,
+    "can_write_memory": true,
+    "can_create_blocks": false,
+    "can_submit_orders": false
+  },
+  "safety_gates": ["sample_count_check", "positive_expectancy_check", "no_hard_ban_policy", "memory_write_allowed", "no_order_submission"],
+  "prompt_budget": {"max_skill_chars": 5600, "max_workflow_chars": 1600, "max_contract_chars": 5200}
+}

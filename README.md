@@ -19,7 +19,7 @@
   - `/upbit` `/binance` `/krx` `/kr2` `/us`
   - `/sessions`
   - `/session <id>`
-- Tradecraft는 UI/제어/지식 계층을 담당하고, 거래소별 자산 조회와 KIS 직접 트레이더를 연동합니다.
+- Tradecraft는 UI/제어/지식 계층을 담당하고, 거래소별 자산 조회와 KIS/Binance 블록 트레이더를 연동합니다.
 - 백엔드: FastAPI
 
 Telegram 설정은 UI에서 변경하지 않고 `.env`로만 관리합니다.
@@ -39,35 +39,63 @@ Tradecraft Control Plane(UI + Telegram + Integrations):
 tradecraft-control
 ```
 
-리포트 수집 + RAG sync + KRX 리서치/조언 통합 러너:
+`tradecraft-ui`는 같은 FastAPI/static UI를 띄우는 compatibility alias입니다.
+
+HERMES/Jue 운영 러너 묶음:
+
+```bash
+tradecraft-runtime
+tradecraft-naver-reports
+tradecraft-strategy-insights
+tradecraft-market-pulse
+tradecraft-market-judge
+tradecraft-investment-memory
+tradecraft-live-evaluator
+tradecraft-jue-wiki
+tradecraft-kis-block-trader
+tradecraft-binance-block-trader
+tradecraft-crypto-market-research
+tradecraft-crypto-pattern-lab
+tradecraft-crypto-alpha
+tradecraft-watchdog
+```
+
+역할 요약:
+
+- `tradecraft-runtime`: generic runtime/session state writer
+- `tradecraft-naver-reports`: 네이버 리포트 수집 + RAG sync 기본 러너
+- `tradecraft-strategy-insights`: Whale/세시반 등 전략 신호 수집
+- `tradecraft-market-pulse`: 국장 지수/섹터/수급/프로그램/FX pulse
+- `tradecraft-market-judge`: KIS 계좌·시세 기반 장중 판단 루프
+- `tradecraft-investment-memory`: 쥬 메모리, 루틴, 반성, 정책 scorecard
+- `tradecraft-live-evaluator`: 실거래 성과/edge authority 평가
+- `tradecraft-jue-wiki`: RAG/거래/반성 압축 지식 레이어
+- `tradecraft-kis-block-trader`: 국장 KIS 블록 원장 + 룰 실행 + 쥬 매니저
+- `tradecraft-binance-block-trader`: Binance spot/futures 블록 원장 + 룰 실행 + 쥬 매니저
+- `tradecraft-crypto-market-research`: 크립토 market research/feature loop
+- `tradecraft-crypto-pattern-lab`: 크립토 패턴/전략 실험·백테스트 랩
+- `tradecraft-crypto-alpha`: 크립토 외부 이벤트 alpha 수집
+- `tradecraft-watchdog`: 주요 러너 상태 감시와 복구 보조
+
+Legacy/optional 리서치 루프:
 
 ```bash
 tradecraft-intelligence
-```
-
-KRX 리서치 스케줄러(Codex CLI + 리포트 URL 수집):
-
-```bash
 tradecraft-research
 ```
 
-`tradecraft-research`는 호환용으로 유지됩니다. 리포트 수집까지 함께 돌릴 때는
-`tradecraft-intelligence` 하나만 켜는 것을 권장합니다.
+`tradecraft-intelligence`와 `tradecraft-research`는 리서치/조언 루프용입니다.
+리포트 수집은 기본적으로 `tradecraft-naver-reports`가 담당합니다.
+`tradecraft-research`에서 리포트 수집까지 같이 돌리는 호환 모드는
+`TRADECRAFT_RESEARCH_RUNNER_COLLECT_REPORTS=true`를 명시한 경우에만 사용합니다.
 
-KIS LLM 트레이더 러너(리서치 기반 종목선정 + 주문 실행):
+예전 LLM 직접 주문 러너는 retired 상태입니다.
+현재 국장 실거래 주체는 KIS 블록 트레이더입니다.
 
-```bash
-tradecraft-kis-trader
-```
-
-네이버 증권 리포트 크롤러(DB 저장):
-
-```bash
-tradecraft-naver-reports
-```
-
-`tradecraft-naver-reports`는 리포트 수집만 따로 돌릴 때 사용합니다.
-`tradecraft-intelligence`와 동시에 켜면 리포트 수집이 중복될 수 있습니다.
+`tradecraft-naver-reports`는 리포트 수집과 RAG sync의 기본 러너입니다.
+`tradecraft-intelligence`와 함께 켜도 리포트 수집은 중복되지 않도록 설계되어 있습니다.
+단, `TRADECRAFT_RESEARCH_RUNNER_COLLECT_REPORTS=true`로 legacy research 수집 모드를
+켜는 경우에는 `tradecraft-naver-reports`와 동시에 돌리지 마세요.
 
 네이버 리포트 전용 API 서버(UI 포함):
 
@@ -98,7 +126,9 @@ npm run build
 `npm run build` 결과물은 `src/tradecraft/reports_api/web_dist/`에 생성되며, 저장소에는 커밋하지 않습니다.
 `tradecraft-reports-stack`은 UI 산출물이 없으면 자동으로 `npm install` + `npm run build`를 수행한 뒤 API/워커를 함께 시작합니다.
 
-브라우저에서 [http://127.0.0.1:8000](http://127.0.0.1:8000) 접속.
+이 작업공간의 로컬 운영 `.env` 기준 Control Plane은
+[http://127.0.0.1:18080](http://127.0.0.1:18080) 에서 확인합니다.
+`TRADECRAFT_PORT`를 따로 설정하지 않은 순수 기본 실행은 `8000` 포트를 사용합니다.
 
 ## Environment
 
@@ -145,18 +175,6 @@ npm run build
 - `TRADECRAFT_RESEARCH_CODEX_TIMEOUT_SEC`
 - `TRADECRAFT_RESEARCH_REPORT_URLS`
 - `TRADECRAFT_RESEARCH_STRATEGY_MD_PATH`
-- `TRADECRAFT_KIS_TRADER_ENABLED`
-- `TRADECRAFT_KIS_TRADER_STATE_PATH`
-- `TRADECRAFT_KIS_TRADER_INTERVAL_SEC`
-- `TRADECRAFT_KIS_TRADER_LLM_COMMAND`
-- `TRADECRAFT_KIS_TRADER_PERSONA`
-- `TRADECRAFT_KIS_TRADER_MAX_ORDERS_PER_CYCLE`
-- `TRADECRAFT_KIS_TRADER_MAX_BUDGET_PER_ORDER_KRW`
-- `TRADECRAFT_KIS_TRADER_MIN_CONFIDENCE`
-- `TRADECRAFT_KIS_TRADER_DEFAULT_ORDER_TYPE`
-- `TRADECRAFT_KIS_TRADER_ALLOW_SELL`
-- `TRADECRAFT_KIS_TRADER_MAX_CANDIDATE_CODES`
-- `TRADECRAFT_KIS_TRADER_REPORT_CONTEXT_TOP_K`
 - `TRADECRAFT_NAVER_REPORTS_ENABLED`
 - `TRADECRAFT_NAVER_REPORTS_DB_PATH`
 - `TRADECRAFT_NAVER_REPORTS_SEED_URL`
@@ -190,7 +208,7 @@ vector ids are skipped by default so the intelligence runner can keep the
 vector index fresh without re-embedding the full report corpus every cycle.
 
 운영 기준:
-- 자동매매 실행은 KIS 직접 트레이더와 거래소별 자산 어댑터를 중심으로 구성합니다.
+- 자동매매 실행은 KIS/Binance 블록 트레이더와 거래소별 자산 어댑터를 중심으로 구성합니다.
 - `TRADECRAFT_RUNTIME_*`는 로컬 런타임 스냅샷 호환용(옵션)입니다.
 
 ## Reference Docs
@@ -206,8 +224,10 @@ vector index fresh without re-embedding the full report corpus every cycle.
 - `GET /api/dashboard`
 - `GET /api/telegram/status`
 - `POST /api/telegram/webhook`
-- `GET /api/kis/trader/status`
-- `POST /api/kis/trader/run-once`
+- `GET /api/kis/blocks`
+- `GET /api/kis/blocks/status`
+- `POST /api/kis/blocks/manager/run-once`
+- `POST /api/kis/blocks/executor/tick`
 - `GET /api/reports/status`
 - `POST /api/reports/crawl-once`
 - `GET /api/reports/search`
@@ -263,9 +283,11 @@ Upbit 키가 설정되면 `GET /api/dashboard`의 업비트 자산이 실계정 
 pytest
 ```
 
-## Runtime Skeleton
+## Runtime State Writer
 
-`tradecraft.runtime`는 UI/Telegram(Control Plane)과 분리된 별도 실행체 골격입니다.
+`tradecraft.runtime`는 UI/Telegram(Control Plane)과 분리된 별도 실행체입니다.
+현재 역할은 주문 실행이 아니라 세션 heartbeat와 상태 스냅샷 기록입니다.
+실제 KIS/Binance 주문은 각각의 블록 트레이더 러너가 담당합니다.
 
 - `src/tradecraft/runtime/runner.py`
   - 런타임 프로세스 진입점
@@ -273,14 +295,15 @@ pytest
   - `TRADECRAFT_RUNTIME_SESSIONS_PATH` 설정 시 외부 JSON 세션 파일 로드
 - `src/tradecraft/runtime/engine.py`
   - 세션 루프 오케스트레이션
-  - `strategy -> risk -> broker` 파이프라인 순서로 tick 처리
+  - `state_writer_no_orders` 모드로 heartbeat, risk 상태, 세션 메타데이터만 기록
+  - 주문 실행 권한 없음(`executes_orders=false`)
 - `src/tradecraft/runtime/contracts.py`
   - Strategy/Risk/Broker 인터페이스(Protocol)
 - `src/tradecraft/runtime/session_loader.py`
   - 런타임 전용 세션 로더
-  - 파일이 없거나 깨졌을 때 기본 세션으로 자동 fallback
+  - 파일이 없거나 깨졌을 때 `safe_default_no_orders` 세션으로 전환하고 source에 사유 기록
 - `src/tradecraft/runtime/strategies.py`
-  - `NoopShortTermStrategy`, `NoopBalanceStrategy` (골격 전략)
+  - `NoopShortTermStrategy`, `NoopBalanceStrategy` (상태 신호만 생성)
   - 전략 레지스트리(`register_strategy`) 제공
 - `src/tradecraft/runtime/brokers.py`
   - `NoopBroker` (실주문 비활성, 인터페이스만 제공)

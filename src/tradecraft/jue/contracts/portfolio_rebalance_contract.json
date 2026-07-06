@@ -1,0 +1,7 @@
+{
+  "contract_id": "portfolio_rebalance_contract",
+  "version": 1,
+  "required": ["account_snapshot", "target_frame", "drift_summary", "cash_plan", "risk_checks", "rebalance_actions"],
+  "source_types": ["account", "positions", "cash", "blocks", "policy", "quotes", "memory"],
+  "reject_when": ["missing_account_snapshot", "missing_cash_plan", "action_without_risk_check", "target_frame_missing", "stale_account_data"]
+}

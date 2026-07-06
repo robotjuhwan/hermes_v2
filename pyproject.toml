@@ -14,11 +14,15 @@ dependencies = [
   "pydantic>=2.8.0",
   "pydantic-settings>=2.4.0",
   "httpx>=0.27.0",
+  "psutil>=5.9.0",
   "pypdf>=5.0.0",
   "chromadb>=0.5.0",
 ]
 
 [project.optional-dependencies]
+codex-sdk = [
+  "openai-codex>=0.1.0b2",
+]
 dev = [
   "pytest>=8.2.0",
   "ruff>=0.5.0",
@@ -29,6 +33,14 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+tradecraft = [
+  "jue/skills/*.md",
+  "jue/workflows/*.json",
+  "jue/contracts/*.json",
+  "jue/sources/*.json",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -42,10 +54,17 @@ tradecraft-runtime = "tradecraft.runtime.runner:run"
 tradecraft-intelligence = "tradecraft.runtime.intelligence_runner:run"
 tradecraft-strategy-insights = "tradecraft.runtime.strategy_insights_runner:run"
 tradecraft-market-judge = "tradecraft.runtime.market_judge_runner:run"
+tradecraft-market-pulse = "tradecraft.runtime.market_pulse_runner:run"
+tradecraft-jue-wiki = "tradecraft.runtime.jue_wiki_runner:run"
 tradecraft-investment-memory = "tradecraft.runtime.investment_memory_runner:run"
+tradecraft-live-evaluator = "tradecraft.runtime.live_evaluator_runner:run"
+tradecraft-watchdog = "tradecraft.runtime.watchdog_runner:run"
+tradecraft-crypto-market-research = "tradecraft.runtime.crypto_market_research_runner:run"
+tradecraft-crypto-pattern-lab = "tradecraft.runtime.crypto_pattern_lab_runner:run"
+tradecraft-crypto-alpha = "tradecraft.runtime.crypto_alpha_runner:run"
 tradecraft-research = "tradecraft.runtime.research_runner:run"
-tradecraft-kis-trader = "tradecraft.runtime.kis_trader_runner:run"
 tradecraft-kis-block-trader = "tradecraft.runtime.kis_block_trader_runner:run"
+tradecraft-binance-block-trader = "tradecraft.runtime.binance_block_trader_runner:run"
 tradecraft-naver-reports = "tradecraft.runtime.naver_reports_runner:run"
 tradecraft-reports-api = "tradecraft.reports_api.main:run"
 tradecraft-reports-worker = "tradecraft.reports_api.worker:run"

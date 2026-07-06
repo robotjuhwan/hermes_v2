@@ -5,7 +5,7 @@ import json
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,235 @@ def _today_iso() -> str:
 
 def _is_symbol(value: Any) -> bool:
     return bool(re.fullmatch(r"\d{6}", str(value or "").strip()))
+
+
+def jue_wiki_repair_target_symbols(
+    db_path: str | Path,
+    *,
+    limit: int = 80,
+) -> list[str]:
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    max_items = max(int(limit), 0)
+    if max_items <= 0:
+        return []
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        table_exists = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'wiki_repair_actions'
+            """
+        ).fetchone()
+        if table_exists is None:
+            return []
+        rows = conn.execute(
+            """
+            SELECT page_id, action_type, status, details_json, created_at, action_id
+            FROM wiki_repair_actions
+            WHERE status IN ('scheduled', 'unresolved')
+              AND action_type IN (
+                  'refresh_symbol_fundamentals',
+                  'refresh_symbol_financials',
+                  'refresh_symbol_quote'
+              )
+            ORDER BY created_at DESC, action_id DESC
+            LIMIT ?
+            """,
+            (max_items * 4,),
+        ).fetchall()
+    symbols: list[str] = []
+    for row in rows:
+        details = json.loads(str(row["details_json"] or "{}"))
+        raw_symbols = details.get("symbols") if isinstance(details, dict) else []
+        if isinstance(raw_symbols, list):
+            symbols.extend(str(item or "").strip() for item in raw_symbols)
+        page_id = str(row["page_id"] or "")
+        page_symbol = page_id.rsplit(".", 1)[-1] if "." in page_id else page_id
+        symbols.append(page_symbol)
+    return [
+        symbol
+        for symbol in dict.fromkeys(symbols)
+        if _is_symbol(symbol)
+    ][:max_items]
+
+
+def merge_fundamental_target_symbols(
+    *,
+    watchlist: list[str],
+    repair_targets: list[str],
+    discovered: list[str],
+    limit: int = 80,
+) -> list[str]:
+    max_items = max(int(limit), 0)
+    if max_items <= 0:
+        return []
+    symbols = [*watchlist, *repair_targets, *discovered]
+    return [
+        symbol
+        for symbol in dict.fromkeys(str(item or "").strip() for item in symbols)
+        if _is_symbol(symbol)
+    ][:max_items]
+
+
+def resolve_jue_wiki_fundamental_repair_actions(
+    db_path: str | Path,
+    *,
+    latest_by_symbol: dict[str, dict[str, Any]],
+    resolved_at: str | None = None,
+) -> dict[str, Any]:
+    path = Path(db_path)
+    if not path.exists():
+        return {
+            "status": "missing",
+            "resolved_count": 0,
+            "checked_count": 0,
+            "resolved_action_ids": [],
+        }
+    now = resolved_at or _now_iso()
+    latest = {
+        str(symbol or "").strip(): payload
+        for symbol, payload in latest_by_symbol.items()
+        if _is_symbol(symbol) and isinstance(payload, dict)
+    }
+    if not latest:
+        return {
+            "status": "ok",
+            "resolved_count": 0,
+            "checked_count": 0,
+            "resolved_action_ids": [],
+        }
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        table_exists = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'wiki_repair_actions'
+            """
+        ).fetchone()
+        if table_exists is None:
+            return {
+                "status": "missing_table",
+                "resolved_count": 0,
+                "checked_count": 0,
+                "resolved_action_ids": [],
+            }
+        rows = conn.execute(
+            """
+            SELECT action_id, page_id, action_type, details_json
+            FROM wiki_repair_actions
+            WHERE status IN ('scheduled', 'unresolved')
+              AND action_type IN (
+                  'refresh_symbol_fundamentals',
+                  'refresh_symbol_financials',
+                  'refresh_symbol_quote'
+              )
+            ORDER BY created_at DESC, action_id DESC
+            """
+        ).fetchall()
+        checked_count = 0
+        resolved_ids: list[str] = []
+        for row in rows:
+            symbols = _repair_action_symbols(row)
+            matched_symbol = next((symbol for symbol in symbols if symbol in latest), "")
+            if not matched_symbol:
+                continue
+            checked_count += 1
+            payload = latest[matched_symbol]
+            if not _fundamental_repair_action_is_resolved(
+                action_type=str(row["action_type"] or ""),
+                latest=payload,
+            ):
+                continue
+            details = json.loads(str(row["details_json"] or "{}"))
+            if not isinstance(details, dict):
+                details = {}
+            details["resolved_by"] = "symbol_fundamentals_collect"
+            details["resolved_symbol"] = matched_symbol
+            details["resolved_at"] = now
+            conn.execute(
+                """
+                UPDATE wiki_repair_actions
+                SET status = 'resolved',
+                    finished_at = ?,
+                    details_json = ?
+                WHERE action_id = ?
+                """,
+                (
+                    now,
+                    json.dumps(details, ensure_ascii=False, sort_keys=True),
+                    str(row["action_id"]),
+                ),
+            )
+            resolved_ids.append(str(row["action_id"]))
+    return {
+        "status": "ok",
+        "resolved_count": len(resolved_ids),
+        "checked_count": checked_count,
+        "resolved_action_ids": resolved_ids,
+    }
+
+
+def _repair_action_symbols(row: sqlite3.Row) -> list[str]:
+    symbols: list[str] = []
+    details = json.loads(str(row["details_json"] or "{}"))
+    raw_symbols = details.get("symbols") if isinstance(details, dict) else []
+    if isinstance(raw_symbols, list):
+        symbols.extend(str(item or "").strip() for item in raw_symbols)
+    page_id = str(row["page_id"] or "")
+    page_symbol = page_id.rsplit(".", 1)[-1] if "." in page_id else page_id
+    symbols.append(page_symbol)
+    return [
+        symbol
+        for symbol in dict.fromkeys(symbols)
+        if _is_symbol(symbol)
+    ]
+
+
+def _fundamental_repair_action_is_resolved(
+    *,
+    action_type: str,
+    latest: dict[str, Any],
+) -> bool:
+    if str(latest.get("status") or "") != "ok":
+        return False
+    valuation = latest.get("valuation") if isinstance(latest.get("valuation"), dict) else {}
+    financials = latest.get("financials") if isinstance(latest.get("financials"), list) else []
+    if action_type == "refresh_symbol_quote":
+        return valuation.get("price") is not None
+    if action_type == "refresh_symbol_financials":
+        return any(
+            isinstance(row, dict)
+            and any(
+                row.get(key) is not None
+                for key in (
+                    "revenue",
+                    "operating_profit",
+                    "net_income",
+                    "roe",
+                    "debt_ratio",
+                    "operating_margin",
+                )
+            )
+            for row in financials
+        )
+    if action_type == "refresh_symbol_fundamentals":
+        return any(
+            valuation.get(key) is not None
+            for key in (
+                "price",
+                "market_cap_krw",
+                "per",
+                "eps",
+                "pbr",
+                "bps",
+                "industry_per",
+            )
+        )
+    return False
 
 
 def _clean_text(value: Any, *, limit: int = 500) -> str:
@@ -150,6 +379,14 @@ def parse_naver_coinfo_html(
     if industry_match:
         industry_per = _safe_float(_clean_text(industry_match.group(1), limit=30))
 
+    raw_payload: dict[str, Any] = {
+        "market_cap_text": market_cap_text,
+    }
+    industry_name = ""
+    if _looks_like_etf_name(name):
+        raw_payload["asset_class"] = "etf"
+        industry_name = "ETF"
+
     return {
         "symbol": symbol,
         "name": name,
@@ -161,12 +398,10 @@ def parse_naver_coinfo_html(
         "bps": bps,
         "dividend_yield_pct": dividend_yield,
         "industry_per": industry_per,
-        "industry_name": "",
+        "industry_name": industry_name,
         "as_of": _today_iso(),
         "source_url": source_url,
-        "raw": {
-            "market_cap_text": market_cap_text,
-        },
+        "raw": raw_payload,
     }
 
 
@@ -180,9 +415,67 @@ def _extract_table_rows(raw_html: str) -> list[list[str]]:
     return rows
 
 
-def parse_wisereport_financials(raw_html: str, *, symbol: str) -> list[dict[str, Any]]:
-    rows = _extract_table_rows(raw_html)
+_ETF_BRAND_PREFIXES = (
+    "KODEX",
+    "TIGER",
+    "ACE",
+    "RISE",
+    "SOL",
+    "PLUS",
+    "KBSTAR",
+    "HANARO",
+    "ARIRANG",
+    "TIMEFOLIO",
+)
+
+
+def _looks_like_etf_name(value: Any) -> bool:
+    text = str(value or "").strip().upper()
+    return bool(text) and text.startswith(_ETF_BRAND_PREFIXES)
+
+
+def _extract_tables(raw_html: str) -> list[str]:
+    tables = re.findall(r"<table[^>]*>[\s\S]*?</table>", raw_html, flags=re.IGNORECASE)
+    return tables or [raw_html]
+
+
+def _clean_wisereport_period(value: Any) -> str:
+    text = _clean_text(value, limit=40)
+    text = re.sub(r"\s+", "", text)
+    if not text or "[" in text or "]" in text:
+        return ""
+    if re.fullmatch(r"20\d{2}(?:[./-](?:03|06|09|12))?(?:\([A-Za-z가-힣]+\))?", text):
+        return text.replace(".", "/").replace("-", "/")
+    return ""
+
+
+def _wisereport_period_type(period: str) -> str:
+    base = re.sub(r"\([^)]*\)", "", str(period or "")).strip()
+    if re.fullmatch(r"20\d{2}(?:/12)?", base):
+        return "annual"
+    if re.fullmatch(r"20\d{2}/(?:03|06|09)", base):
+        return "quarterly"
+    return "mixed"
+
+
+def _extract_wisereport_candidate(rows: list[list[str]], *, symbol: str) -> list[dict[str, Any]]:
+    header_idx = -1
     periods: list[str] = []
+    for idx, cells in enumerate(rows):
+        if len(cells) < 2:
+            continue
+        clean_periods = [_clean_wisereport_period(cell) for cell in cells[1:9]]
+        clean_periods = [item for item in clean_periods if item]
+        if len(clean_periods) >= 2 or (
+            len(clean_periods) >= 1
+            and re.search(r"IFRS|재무|실적", str(cells[0] or ""), flags=re.IGNORECASE)
+        ):
+            header_idx = idx
+            periods = clean_periods[:8]
+            break
+    if header_idx < 0 or not periods:
+        return []
+
     metrics: dict[str, list[str]] = {}
     metric_names = [
         ("영업이익률", "operating_margin"),
@@ -192,16 +485,19 @@ def parse_wisereport_financials(raw_html: str, *, symbol: str) -> list[dict[str,
         ("매출액", "revenue"),
         ("ROE", "roe"),
     ]
-    for cells in rows:
+    for cells in rows[header_idx + 1 :]:
         if len(cells) < 2:
             continue
-        if not periods and any(re.search(r"\d{4}", cell) for cell in cells[1:]):
-            periods = cells[1:8]
-            continue
         row_label = re.sub(r"\s+", "", cells[0])
+        if "/" in row_label and "률" not in row_label:
+            continue
+        if any(marker in row_label for marker in ("컨센서스", "신용등급", "투자의견")):
+            continue
         key = next((out_key for label, out_key in metric_names if label in row_label), "")
         if key:
-            metrics[key] = cells[1 : len(periods) + 1] if periods else cells[1:8]
+            values = cells[1 : len(periods) + 1]
+            if any(_safe_float(value) is not None for value in values):
+                metrics[key] = values
     if not periods or not metrics:
         return []
 
@@ -211,20 +507,71 @@ def parse_wisereport_financials(raw_html: str, *, symbol: str) -> list[dict[str,
             continue
         row: dict[str, Any] = {
             "symbol": symbol,
-            "period_type": "annual" if re.fullmatch(r"\d{4}(?:/12)?", period) else "mixed",
+            "period_type": _wisereport_period_type(period),
             "period": period,
             "raw": {},
         }
+        has_value = False
         for key, values in metrics.items():
             value = values[idx] if idx < len(values) else ""
             parsed = _safe_float(value)
             row[key] = parsed
             row["raw"][key] = value
+            if parsed is not None:
+                has_value = True
+        if not has_value:
+            continue
         out.append(row)
     return out[:12]
 
 
+def parse_wisereport_financials(raw_html: str, *, symbol: str) -> list[dict[str, Any]]:
+    best: list[dict[str, Any]] = []
+    best_score = 0
+    for table_html in _extract_tables(raw_html):
+        rows = _extract_table_rows(table_html)
+        candidate = _extract_wisereport_candidate(rows, symbol=symbol)
+        if not candidate:
+            continue
+        metric_count = len(
+            {
+                key
+                for row in candidate
+                for key in (
+                    "revenue",
+                    "operating_profit",
+                    "net_income",
+                    "roe",
+                    "debt_ratio",
+                    "operating_margin",
+                )
+                if row.get(key) is not None
+            }
+        )
+        score = len(candidate) + metric_count * 10
+        if score > best_score:
+            best = candidate
+            best_score = score
+    return best
+
+
 def score_valuation(valuation: dict[str, Any], financials: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    raw = valuation.get("raw") if isinstance(valuation.get("raw"), dict) else {}
+    if str(raw.get("asset_class") or "").lower() in {"etf", "etn"} or _looks_like_etf_name(
+        valuation.get("name")
+    ):
+        return {
+            "undervalued_score": 0,
+            "overvalued_risk": 0,
+            "quality_score": 0,
+            "growth_score": 0,
+            "relative_per_discount_pct": None,
+            "pbr_roe_fit": None,
+            "label": "unknown",
+            "reasons": [],
+            "risks": ["ETF는 기업 PER/PBR 대신 ETF 리서치 지표로 판단"],
+            "scored_at": _now_iso(),
+        }
     per = _safe_float(valuation.get("per"))
     pbr = _safe_float(valuation.get("pbr"))
     eps = _safe_float(valuation.get("eps"))
@@ -327,6 +674,7 @@ class SymbolFundamentalsConfig:
     timeout_sec: float = 8.0
     min_refresh_hours: int = 12
     max_symbols_per_collect: int = 80
+    jue_wiki_db_path: str = ""
 
 
 class SymbolFundamentalsRepository:
@@ -689,9 +1037,10 @@ class SymbolFundamentalsRepository:
                 latest_by_symbol[symbol] = item
 
         stale_count = 0
+        fresh_symbol_count = 0
         ok_count = 0
         error_symbol_count = 0
-        latest_symbols: list[dict[str, Any]] = []
+        symbol_rows: list[tuple[datetime, dict[str, Any]]] = []
         refresh_hours = max(int(min_refresh_hours or 0), 0)
         cutoff = (
             datetime.now(timezone.utc) - timedelta(hours=refresh_hours)
@@ -714,24 +1063,58 @@ class SymbolFundamentalsRepository:
                     stale = True
             if stale:
                 stale_count += 1
-            if len(latest_symbols) < 8:
-                latest_symbols.append(
+            if status == "ok" and not stale:
+                fresh_symbol_count += 1
+            try:
+                sort_at = datetime.fromisoformat(crawled_at)
+            except ValueError:
+                sort_at = datetime.min.replace(tzinfo=timezone.utc)
+            symbol_rows.append(
+                (
+                    sort_at,
                     {
                         "symbol": symbol,
                         "name": str(item["name"] or ""),
                         "status": status,
                         "crawled_at": crawled_at,
                         "stale": stale,
-                    }
+                    },
                 )
+            )
+        latest_symbols = [
+            item
+            for _, item in sorted(
+                symbol_rows,
+                key=lambda row: row[0],
+                reverse=True,
+            )[:8]
+        ]
+        latest_symbols_count = len(latest_symbols)
+        latest_symbols_stale_count = sum(1 for item in latest_symbols if item["stale"])
+        latest_symbols_fresh_count = sum(
+            1
+            for item in latest_symbols
+            if item["status"] == "ok" and not item["stale"]
+        )
+        total_symbols = len(latest_by_symbol)
         return {
             "status": "ok",
             "db_path": self.db_path,
             "total_snapshots": int(row["total"] or 0),
-            "total_symbols": len(latest_by_symbol),
+            "total_symbols": total_symbols,
             "ok_symbol_count": ok_count,
             "error_symbol_count": error_symbol_count,
             "stale_symbol_count": stale_count,
+            "fresh_symbol_count": fresh_symbol_count,
+            "stale_ratio": (stale_count / total_symbols) if total_symbols else 0.0,
+            "latest_symbols_count": latest_symbols_count,
+            "latest_symbols_fresh_count": latest_symbols_fresh_count,
+            "latest_symbols_stale_count": latest_symbols_stale_count,
+            "latest_symbols_stale_ratio": (
+                latest_symbols_stale_count / latest_symbols_count
+                if latest_symbols_count
+                else 0.0
+            ),
             "error_count": int(row["errors"] or 0),
             "latest_crawled_at": str(row["latest_crawled_at"] or ""),
             "latest_symbols": latest_symbols,
@@ -772,6 +1155,7 @@ class SymbolFundamentalsService:
             "items": [],
             "updated_at": _now_iso(),
         }
+        collected_latest: dict[str, dict[str, Any]] = {}
         timeout = httpx.Timeout(float(self.config.timeout_sec))
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             for symbol in unique_symbols:
@@ -801,6 +1185,14 @@ class SymbolFundamentalsService:
                     continue
                 summary["collected"] += 1
                 summary["items"].append({"symbol": symbol, "status": "ok", "latest": item})
+                collected_latest[symbol] = item
+        if self.config.jue_wiki_db_path and collected_latest:
+            summary["jue_wiki_repair_resolution"] = (
+                resolve_jue_wiki_fundamental_repair_actions(
+                    self.config.jue_wiki_db_path,
+                    latest_by_symbol=collected_latest,
+                )
+            )
         if summary["errors"] and summary["collected"] == 0:
             summary["status"] = "error"
         elif summary["errors"]:

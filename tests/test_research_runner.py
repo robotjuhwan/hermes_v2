@@ -1,25 +1,60 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from tradecraft.runtime.research_runner import (
     _build_advice_message,
-    _extract_rebalance_target_weights_from_payload,
-    _extract_total_value_krw_from_payload,
-    _extract_target_cash_weight_from_payload,
     _resolve_symbol_names_for_codes,
     _next_advice_slot,
-    _parse_krw_amount,
-    _sync_kis_rebalance_targets_to_trader_state,
-    _sync_kis_trader_targets_from_morning_advice,
+    _service_reports_enabled,
     _should_run_learning,
+    _write_research_disabled_snapshot,
 )
 from tradecraft.runtime.state_store import RuntimeStateStore
 
 
 KST = ZoneInfo("Asia/Seoul")
+
+
+def test_intelligence_service_does_not_duplicate_report_collection() -> None:
+    assert not _service_reports_enabled("tradecraft-research", True)
+    assert _service_reports_enabled(
+        "tradecraft-research",
+        True,
+        research_runner_collect_reports=True,
+    )
+    assert not _service_reports_enabled("tradecraft-intelligence", True)
+    assert not _service_reports_enabled("tradecraft-research", False)
+
+
+def test_write_research_disabled_snapshot_clears_stale_running_state(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "research.json"
+    store = RuntimeStateStore(state_path)
+    store.write_snapshot(
+        {
+            "updated_at": "2026-06-28T15:05:42+00:00",
+            "service": "tradecraft-research",
+            "status": "report_collection_running",
+        }
+    )
+
+    snapshot = _write_research_disabled_snapshot(
+        state_store=store,
+        service_name="tradecraft-research",
+        research_enabled=False,
+        reports_enabled=False,
+    )
+    saved = store.read_snapshot() or {}
+
+    assert snapshot["status"] == "disabled"
+    assert saved["status"] == "disabled"
+    assert saved["research_enabled"] is False
+    assert saved["reports_enabled"] is False
+    assert saved["reason"] == "research_and_reports_disabled"
 
 
 def test_next_advice_slot_same_open_day() -> None:
@@ -105,87 +140,6 @@ def test_should_run_learning_without_snapshot_even_if_db_unchanged() -> None:
     )
 
 
-def test_sync_kis_trader_targets_from_morning_advice_writes_target_symbols(
-    tmp_path,
-) -> None:
-    state_path = tmp_path / "kis_trader.json"
-    codes = _sync_kis_trader_targets_from_morning_advice(
-        snapshot={
-            "items": [
-                {"picks": ["005930", "000660"]},
-                {"summary": "관심 종목 005930, 035420"},
-            ]
-        },
-        label="장전",
-        scheduled_at=datetime(2026, 2, 19, 8, 0, tzinfo=KST),
-        trader_state_path=str(state_path),
-        max_symbols=3,
-    )
-    saved = RuntimeStateStore(state_path).read_snapshot() or {}
-    assert codes == ["005930", "000660", "035420"]
-    assert saved.get("target_symbols") == ["005930", "000660", "035420"]
-
-
-def test_sync_kis_trader_targets_from_morning_advice_skips_non_morning(
-    tmp_path,
-) -> None:
-    state_path = tmp_path / "kis_trader.json"
-    codes = _sync_kis_trader_targets_from_morning_advice(
-        snapshot={"items": [{"picks": ["005930"]}]},
-        label="장마감",
-        scheduled_at=datetime(2026, 2, 19, 15, 40, tzinfo=KST),
-        trader_state_path=str(state_path),
-        max_symbols=5,
-    )
-    assert codes == []
-    assert RuntimeStateStore(state_path).read_snapshot() is None
-
-
-def test_extract_rebalance_target_weights_from_payload() -> None:
-    payload = {
-        "pack": {
-            "advice_seed_json": {
-                "model_portfolio": {
-                    "targets": [
-                        {"ticker": "005930", "target_weight": 0.2},
-                        {"ticker": "000660", "target_weight": 0.15},
-                    ]
-                }
-            }
-        }
-    }
-    out = _extract_rebalance_target_weights_from_payload(payload, max_symbols=5)
-    assert out == {"005930": 0.2, "000660": 0.15}
-
-
-def test_extract_target_cash_weight_from_payload() -> None:
-    payload = {
-        "pack": {
-            "advice_seed_json": {
-                "model_portfolio": {
-                    "targets": [{"ticker": "005930", "target_weight": 0.2}],
-                    "target_cash_weight": 0.12,
-                }
-            }
-        }
-    }
-    out = _extract_target_cash_weight_from_payload(payload)
-    assert out == 0.12
-
-
-def test_extract_target_cash_weight_prefers_strategy_spec() -> None:
-    payload = {
-        "pack": {
-            "advice_seed_json": {
-                "strategy_spec": {"target_cash_weight": 0.2},
-                "model_portfolio": {"target_cash_weight": 0.1},
-            }
-        }
-    }
-    out = _extract_target_cash_weight_from_payload(payload)
-    assert out == 0.2
-
-
 def test_resolve_symbol_names_for_codes_uses_pykrx_fallback(monkeypatch) -> None:
     class _Repo:
         def resolve_symbol_names(self, symbols):
@@ -217,125 +171,3 @@ def test_resolve_symbol_names_for_codes_uses_pykrx_fallback(monkeypatch) -> None
     )
 
     assert out == {"123456": "테스트기업"}
-
-
-def test_parse_krw_amount_parses_currency_text() -> None:
-    assert _parse_krw_amount("2,330,000원") == 2330000.0
-
-
-def test_extract_total_value_krw_from_payload_uses_total_krw_text() -> None:
-    payload = {
-        "pack": {
-            "advice_seed_json": {
-                "portfolio": {
-                    "total_krw": "2,330,000원",
-                }
-            }
-        }
-    }
-    assert _extract_total_value_krw_from_payload(payload) == 2330000.0
-
-
-def test_sync_kis_rebalance_targets_to_trader_state(tmp_path) -> None:
-    state_path = tmp_path / "kis_trader.json"
-    out = _sync_kis_rebalance_targets_to_trader_state(
-        payload={
-            "pack": {
-                "advice_seed_json": {
-                    "model_portfolio": {
-                        "targets": [
-                            {"ticker": "005930", "target_weight": 0.2},
-                            {"ticker": "000660", "target_weight": 0.15},
-                        ]
-                    }
-                }
-            }
-        },
-        trader_state_path=str(state_path),
-        max_symbols=6,
-    )
-    saved = RuntimeStateStore(state_path).read_snapshot() or {}
-    assert out == {"005930": 0.2, "000660": 0.15}
-    assert saved.get("target_weights") == {
-        "005930": 0.2,
-        "000660": 0.15,
-    }
-    assert saved.get("target_symbols") == ["005930", "000660"]
-    assert saved.get("target_weights_source") == "research_runner_portfolio_coach"
-
-
-def test_sync_kis_rebalance_targets_to_trader_state_writes_cash_weight(
-    tmp_path,
-) -> None:
-    state_path = tmp_path / "kis_trader.json"
-    out = _sync_kis_rebalance_targets_to_trader_state(
-        payload={
-            "pack": {
-                "advice_seed_json": {
-                    "strategy_spec": {"target_cash_weight": 0.25},
-                    "model_portfolio": {
-                        "targets": [
-                            {"ticker": "005930", "target_weight": 0.6},
-                            {"ticker": "000660", "target_weight": 0.4},
-                        ]
-                    },
-                }
-            }
-        },
-        trader_state_path=str(state_path),
-        max_symbols=6,
-    )
-    saved = RuntimeStateStore(state_path).read_snapshot() or {}
-    assert round(sum(out.values()), 6) == 0.75
-    assert saved.get("target_cash_weight") == 0.25
-    assert round(sum(saved.get("target_weights", {}).values()), 6) == 0.75
-
-
-def test_sync_kis_rebalance_targets_to_trader_state_adds_snapshot_picks(
-    tmp_path,
-) -> None:
-    state_path = tmp_path / "kis_trader.json"
-    out = _sync_kis_rebalance_targets_to_trader_state(
-        payload={
-            "pack": {
-                "advice_seed_json": {
-                    "model_portfolio": {
-                        "targets": [
-                            {"ticker": "005930", "target_weight": 0.2},
-                        ]
-                    }
-                }
-            }
-        },
-        snapshot={
-            "items": [
-                {"picks": ["005930", "000660", "012450"]},
-            ]
-        },
-        trader_state_path=str(state_path),
-        max_symbols=6,
-    )
-    saved = RuntimeStateStore(state_path).read_snapshot() or {}
-    assert out.get("005930") == 0.2
-    assert out.get("000660") == 0.08
-    assert out.get("012450") == 0.08
-    assert saved.get("target_symbols") == ["005930", "000660", "012450"]
-
-
-def test_sync_kis_rebalance_targets_to_trader_state_uses_snapshot_when_no_targets(
-    tmp_path,
-) -> None:
-    state_path = tmp_path / "kis_trader.json"
-    out = _sync_kis_rebalance_targets_to_trader_state(
-        payload={"pack": {"advice_seed_json": {"model_portfolio": {"targets": []}}}},
-        snapshot={
-            "items": [
-                {"picks": ["005930", "000660"]},
-            ]
-        },
-        trader_state_path=str(state_path),
-        max_symbols=6,
-    )
-    saved = RuntimeStateStore(state_path).read_snapshot() or {}
-    assert out == {"005930": 0.5, "000660": 0.5}
-    assert saved.get("target_weights") == {"005930": 0.5, "000660": 0.5}

@@ -4,6 +4,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 
+import pytest
+
 from tradecraft.config import AppSettings
 from tradecraft.reports_api import worker as reports_worker
 
@@ -47,8 +49,10 @@ def test_run_cycle_executes_refresh_and_rag(monkeypatch) -> None:
             docs: list[dict[str, object]],
             *,
             force_update: bool = False,
+            prune_missing: bool = False,
         ) -> dict[str, object]:
             _ = force_update
+            _ = prune_missing
             return {"status": "ok", "synced": len(docs)}
 
     settings = AppSettings()
@@ -81,3 +85,46 @@ def test_run_writes_disabled_worker_state(monkeypatch, tmp_path) -> None:
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     assert payload["status"] == "disabled"
     assert payload["service"] == "reports_worker"
+
+
+def test_run_logs_rag_sync_error_detail(monkeypatch, tmp_path, caplog) -> None:
+    class StopLoop(Exception):
+        pass
+
+    state_path = tmp_path / "reports-worker.json"
+    monkeypatch.setenv("TRADECRAFT_NAVER_REPORTS_ENABLED", "true")
+    monkeypatch.setenv("TRADECRAFT_REPORTS_WORKER_STATE_PATH", str(state_path))
+    monkeypatch.setenv("TRADECRAFT_NAVER_REPORTS_DB_PATH", str(tmp_path / "reports.db"))
+    monkeypatch.setenv("TRADECRAFT_NAVER_REPORTS_INTERVAL_SEC", "300")
+
+    monkeypatch.setattr(reports_worker, "build_crawler", lambda settings: object())
+    monkeypatch.setattr(reports_worker, "build_rag_store", lambda settings: object())
+    monkeypatch.setattr(
+        reports_worker,
+        "NaverReportRepository",
+        lambda path: object(),
+    )
+
+    async def fake_run_cycle(**kwargs):
+        return {
+            "snapshot": {"inserted": 0, "repository": {"total_reports": 12}},
+            "rag_sync": {
+                "status": "error",
+                "synced": 0,
+                "error_message": "chroma fts corruption",
+            },
+        }
+
+    monkeypatch.setattr(reports_worker, "run_cycle", fake_run_cycle)
+    monkeypatch.setattr(
+        reports_worker.time,
+        "sleep",
+        lambda seconds: (_ for _ in ()).throw(StopLoop()),
+    )
+    caplog.set_level("INFO", logger="tradecraft.reports_api.worker")
+
+    with pytest.raises(StopLoop):
+        reports_worker.run()
+
+    assert "rag sync status=error synced=0" in caplog.text
+    assert "error=chroma fts corruption" in caplog.text

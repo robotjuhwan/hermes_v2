@@ -143,6 +143,7 @@ type Toast = {
 
 const AUTO_REFRESH_MS = 10_000;
 const RESULT_LIMIT = 20;
+const REPORTS_ADMIN_TOKEN_KEY = "hermes_reports_admin_token_v1";
 const EMPTY_FILTERS: SearchFilters = {
   query: "",
   symbol: "",
@@ -153,11 +154,38 @@ const EMPTY_FILTERS: SearchFilters = {
   date_to: "",
 };
 
+function readReportsAdminToken(): string {
+  try {
+    return window.sessionStorage.getItem(REPORTS_ADMIN_TOKEN_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function writeReportsAdminToken(token: string): void {
+  try {
+    if (token) {
+      window.sessionStorage.setItem(REPORTS_ADMIN_TOKEN_KEY, token);
+    } else {
+      window.sessionStorage.removeItem(REPORTS_ADMIN_TOKEN_KEY);
+    }
+  } catch {
+    // sessionStorage can be unavailable in restricted browser modes.
+  }
+}
+
 async function requestJSON<T>(path: string, options?: RequestInit): Promise<T> {
+  const token = readReportsAdminToken().trim();
   const response = await fetch(path, {
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...(token
+        ? {
+            Authorization: `Bearer ${token}`,
+            "X-TradeCraft-Admin-Token": token,
+          }
+        : {}),
       ...(options?.headers || {}),
     },
   });
@@ -238,6 +266,7 @@ export default function App() {
   const [savedViewAlertTarget, setSavedViewAlertTarget] = useState("");
   const [previewMessage, setPreviewMessage] = useState("");
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [adminTokenDraft, setAdminTokenDraft] = useState(readReportsAdminToken());
 
   const pushToast = (tone: Toast["tone"], message: string) => {
     const id = Date.now() + Math.floor(Math.random() * 1000);
@@ -258,6 +287,13 @@ export default function App() {
     } finally {
       setSavedViewsLoading(false);
     }
+  };
+
+  const saveAdminToken = () => {
+    writeReportsAdminToken(adminTokenDraft.trim());
+    pushToast("ok", "운영 토큰을 이 브라우저 세션에 저장했습니다.");
+    void loadDashboard(activeFilters, true);
+    void loadSavedViews(true);
   };
 
   const loadDashboard = async (filters: SearchFilters, silent = false) => {
@@ -493,6 +529,21 @@ export default function App() {
         <div className="hero-actions">
           <span className="chip">자동 갱신 10초</span>
           <span className="chip mono">{refreshing ? "동기화 중" : "대기"}</span>
+          <label className="token-field">
+            <span>Admin token</span>
+            <input
+              type="password"
+              value={adminTokenDraft}
+              onChange={(event) => setAdminTokenDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") saveAdminToken();
+              }}
+              placeholder="Reports API token"
+            />
+          </label>
+          <button type="button" className="btn secondary" onClick={saveAdminToken}>
+            인증 저장
+          </button>
           <button
             type="button"
             className="btn secondary"

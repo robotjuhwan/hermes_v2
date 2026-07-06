@@ -1,0 +1,19 @@
+{
+  "contract_id": "research_cycle_contract",
+  "version": 1,
+  "required": [
+    "query",
+    "summary",
+    "picks",
+    "source_signals_to_watch",
+    "self_score_100",
+    "self_score_reason"
+  ],
+  "source_types": ["reports", "rag", "strategy_insights", "market_intelligence", "memory"],
+  "reject_when": [
+    "summary_without_evidence",
+    "pick_not_6_digit_symbol",
+    "self_score_outside_0_100",
+    "source_signal_claim_without_source"
+  ]
+}

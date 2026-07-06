@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
+from typing import Any
 
-from tradecraft.runtime.state_store import RuntimeStateStore, utc_now_iso
+from tradecraft.runtime.state_store import RuntimeStateStore
+from tradecraft.services.intelligence import sync_report_rag
 from tradecraft.services.research_pipeline import (
     ResearchPipeline,
     ResearchPipelineConfig,
@@ -56,6 +59,85 @@ def test_research_pipeline_writes_snapshot_and_markdown(tmp_path: Path) -> None:
     content = md_path.read_text(encoding="utf-8")
     assert "Watchlist Codes: 005930, 000660" in content
     assert "KRX signal" in content
+
+
+def test_sync_report_rag_forwards_prune_missing_to_full_sync() -> None:
+    class FakeRepository:
+        def list_chunks_for_rag(self, limit: int) -> list[dict[str, Any]]:
+            assert limit == 10
+            return [
+                {"report_id": 1, "chunk_index": 0, "content": "문서 1"},
+                {"report_id": 2, "chunk_index": 0, "content": "문서 2"},
+            ]
+
+    class FakeRagStore:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def sync_documents(self, docs: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+            self.calls.append({"docs": docs, **kwargs})
+            return {"status": "ok", "synced": len(docs), "deleted_orphans": 1}
+
+    rag_store = FakeRagStore()
+
+    result = sync_report_rag(
+        repository=FakeRepository(),
+        rag_store=rag_store,
+        enabled=True,
+        limit=10,
+        prune_missing=True,
+    )
+
+    assert result == {"status": "ok", "synced": 2, "deleted_orphans": 1}
+    assert rag_store.calls == [
+        {
+            "docs": [
+                {"report_id": 1, "chunk_index": 0, "content": "문서 1"},
+                {"report_id": 2, "chunk_index": 0, "content": "문서 2"},
+            ],
+            "force_update": False,
+            "prune_missing": True,
+        }
+    ]
+
+
+def test_sync_report_rag_can_limit_repository_chunks_by_updated_since() -> None:
+    class FakeRepository:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def list_chunks_for_rag(
+            self,
+            limit: int,
+            *,
+            updated_since: str | None = None,
+        ) -> list[dict[str, Any]]:
+            self.calls.append({"limit": limit, "updated_since": updated_since})
+            return [{"report_id": 3, "chunk_index": 0, "content": "새 문서"}]
+
+    class FakeRagStore:
+        def status(self) -> dict[str, Any]:
+            return {"available": True, "count": 100}
+
+        def sync_documents(self, docs: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+            return {"status": "ok", "synced": len(docs), "input_docs": len(docs)}
+
+    repository = FakeRepository()
+    result = sync_report_rag(
+        repository=repository,
+        rag_store=FakeRagStore(),
+        enabled=True,
+        limit=50_000,
+        updated_since="2026-06-30T10:00:00+00:00",
+    )
+
+    assert result == {"status": "ok", "synced": 1, "input_docs": 1}
+    assert repository.calls == [
+        {
+            "limit": 50_000,
+            "updated_since": "2026-06-30T10:00:00+00:00",
+        }
+    ]
 
 
 def test_research_pipeline_persists_learning_total_count(tmp_path: Path) -> None:
@@ -355,31 +437,85 @@ def test_research_pipeline_ignores_non_ok_lessons(tmp_path: Path) -> None:
     assert "should not enter lessons" not in persistent_section
 
 
-def test_research_pipeline_adds_trader_feedback_lessons(tmp_path: Path) -> None:
+def test_research_pipeline_adds_kis_block_feedback_lessons(tmp_path: Path) -> None:
     md_path = tmp_path / "strategy.md"
-    trader_state = tmp_path / "kis_trader.json"
-    RuntimeStateStore(trader_state).write_snapshot(
-        {
-            "updated_at": utc_now_iso(),
-            "decisions": [
-                {
-                    "symbol": "005930",
-                    "side": "buy",
-                    "confidence": 0.81,
-                    "reason": "earnings revision up",
-                }
-            ],
-            "orders": [
-                {
-                    "status": "sent",
-                    "symbol": "005930",
-                    "side": "buy",
-                    "qty": 2,
-                    "reason": "breakout + liquidity",
-                }
-            ],
-        }
-    )
+    block_db = tmp_path / "kis_blocks.db"
+    with sqlite3.connect(block_db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE blocks (
+                block_id TEXT PRIMARY KEY,
+                symbol TEXT,
+                name TEXT,
+                status TEXT,
+                qty_initial INTEGER,
+                qty_open INTEGER,
+                entry_price REAL,
+                target_price REAL,
+                stop_price REAL,
+                thesis TEXT,
+                risk_note TEXT,
+                updated_at TEXT,
+                closed_at TEXT
+            );
+            CREATE TABLE block_orders (
+                id INTEGER PRIMARY KEY,
+                block_id TEXT,
+                symbol TEXT,
+                side TEXT,
+                qty INTEGER,
+                limit_price INTEGER,
+                status TEXT,
+                reason TEXT,
+                updated_at TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO blocks (
+                block_id, symbol, name, status, qty_initial, qty_open,
+                entry_price, target_price, stop_price, thesis, risk_note,
+                updated_at, closed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "kis-1",
+                "005930",
+                "삼성전자",
+                "open",
+                2,
+                2,
+                70000,
+                76000,
+                67000,
+                "earnings revision up",
+                "gap risk",
+                "2026-06-30T00:00:00+00:00",
+                "",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO block_orders (
+                id, block_id, symbol, side, qty, limit_price, status, reason,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                "kis-1",
+                "005930",
+                "buy",
+                2,
+                70100,
+                "sent",
+                "breakout + liquidity",
+                "2026-06-30T00:01:00+00:00",
+            ),
+        )
 
     cfg = ResearchPipelineConfig(
         state_path=str(tmp_path / "research.json"),
@@ -389,7 +525,7 @@ def test_research_pipeline_adds_trader_feedback_lessons(tmp_path: Path) -> None:
         codex_query="국장",
         codex_timeout_sec=10,
         report_urls=[],
-        trader_state_path=str(trader_state),
+        kis_block_db_path=str(block_db),
     )
     pipeline = ResearchPipeline(cfg)
 
@@ -406,11 +542,11 @@ def test_research_pipeline_adds_trader_feedback_lessons(tmp_path: Path) -> None:
     _ = asyncio.run(pipeline.run_once())
 
     content = md_path.read_text(encoding="utf-8")
-    assert "Decision 005930 buy" in content
-    assert "Executed 005930 buy" in content
+    assert "KIS Block 삼성전자(005930) status=open" in content
+    assert "KIS Order 005930 buy status=sent" in content
 
 
-def test_codex_bridge_uses_codex_timeout_seconds(tmp_path: Path) -> None:
+def test_codex_native_uses_codex_timeout_seconds(tmp_path: Path) -> None:
     cfg = ResearchPipelineConfig(
         state_path=str(tmp_path / "research.json"),
         strategy_md_path=str(tmp_path / "strategy.md"),
@@ -419,7 +555,6 @@ def test_codex_bridge_uses_codex_timeout_seconds(tmp_path: Path) -> None:
         codex_query="국장",
         codex_timeout_sec=123,
         report_urls=[],
-        llm_bridge_command="dummy",
     )
     pipeline = ResearchPipeline(cfg)
 
@@ -434,16 +569,16 @@ def test_codex_bridge_uses_codex_timeout_seconds(tmp_path: Path) -> None:
             "content": '{"query":"국장","summary":"반도체 모멘텀","picks":["005930"],"self_score_100":72}',
         }
 
-    setattr(pipeline.llm_bridge, "complete", fake_complete)
+    setattr(pipeline.codex_runtime, "complete", fake_complete)
 
-    item = asyncio.run(pipeline._collect_codex_item_via_bridge())
+    item = asyncio.run(pipeline._collect_codex_item_via_native())
     assert isinstance(item, dict)
     assert item["status"] == "ok"
     assert seen["calls"] == 1
     assert seen["timeout_ms"] == 123000
 
 
-def test_collect_codex_item_skips_bridge_timeout_error(tmp_path: Path) -> None:
+def test_collect_codex_item_skips_native_timeout_error(tmp_path: Path) -> None:
     cfg = ResearchPipelineConfig(
         state_path=str(tmp_path / "research.json"),
         strategy_md_path=str(tmp_path / "strategy.md"),
@@ -452,25 +587,24 @@ def test_collect_codex_item_skips_bridge_timeout_error(tmp_path: Path) -> None:
         codex_query="국장",
         codex_timeout_sec=30,
         report_urls=[],
-        llm_bridge_command="dummy",
     )
     pipeline = ResearchPipeline(cfg)
 
-    async def fake_bridge_item() -> dict:
+    async def fake_native_item() -> dict:
         return {
             "source": "codex_cli",
             "status": "error",
             "title": "Codex research failed",
-            "summary": "llm bridge command timed out after 120.0s",
+            "summary": "codex native runtime sdk timed out after 120.0s",
         }
 
-    setattr(pipeline, "_collect_codex_item_via_bridge", fake_bridge_item)
+    setattr(pipeline, "_collect_codex_item_via_native", fake_native_item)
 
     item = asyncio.run(pipeline._collect_codex_item())
     assert item is None
 
 
-def test_codex_bridge_retries_once_after_first_failure(tmp_path: Path) -> None:
+def test_codex_native_retries_once_after_first_failure(tmp_path: Path) -> None:
     cfg = ResearchPipelineConfig(
         state_path=str(tmp_path / "research.json"),
         strategy_md_path=str(tmp_path / "strategy.md"),
@@ -479,7 +613,6 @@ def test_codex_bridge_retries_once_after_first_failure(tmp_path: Path) -> None:
         codex_query="국장",
         codex_timeout_sec=60,
         report_urls=[],
-        llm_bridge_command="dummy",
     )
     pipeline = ResearchPipeline(cfg)
 
@@ -491,16 +624,16 @@ def test_codex_bridge_retries_once_after_first_failure(tmp_path: Path) -> None:
         if seen["calls"] == 1:
             return {
                 "ok": False,
-                "error": "llm bridge command failed (code=1): codex 브릿지 타임아웃",
+                "error": "codex native runtime sdk failed: codex native runtime 타임아웃",
             }
         return {
             "ok": True,
             "content": '{"query":"국장","summary":"반도체 강세","picks":["005930"],"self_score_100":65}',
         }
 
-    setattr(pipeline.llm_bridge, "complete", fake_complete)
+    setattr(pipeline.codex_runtime, "complete", fake_complete)
 
-    item = asyncio.run(pipeline._collect_codex_item_via_bridge())
+    item = asyncio.run(pipeline._collect_codex_item_via_native())
     assert isinstance(item, dict)
     assert item["status"] == "ok"
     assert item["title"].startswith("Codex KRX Research")

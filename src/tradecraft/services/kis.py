@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -45,6 +49,11 @@ class KISConfig:
     tr_id_order_cancelable: str = "TTTC0084R"
     exchange_id: str = "KRX"
     cust_type: str = "P"
+    rate_limit_enabled: bool = True
+    rest_rate_limit_per_sec: float = 8.0
+    account_min_interval_sec: float = 8.0
+    token_min_interval_sec: float = 65.0
+    rate_limit_db_path: str = ".runtime/kis_rate_limit.db"
 
     @property
     def ready(self) -> bool:
@@ -53,12 +62,221 @@ class KISConfig:
         )
 
 
+class KISSharedRateLimiter:
+    def __init__(
+        self,
+        *,
+        db_path: str | Path,
+        rest_rate_limit_per_sec: float,
+        token_min_interval_sec: float,
+        account_min_interval_sec: float = 1.0,
+        enabled: bool = True,
+    ) -> None:
+        self.path = Path(db_path)
+        self.rest_rate_limit_per_sec = max(float(rest_rate_limit_per_sec), 0.0)
+        self.account_min_interval_sec = max(float(account_min_interval_sec), 0.0)
+        self.token_min_interval_sec = max(float(token_min_interval_sec), 0.0)
+        self.enabled = bool(enabled)
+        self._ready = False
+        self._ready_lock = asyncio.Lock()
+
+    async def wait(self, bucket: str = "rest") -> None:
+        if not self.enabled:
+            return
+        await self._ensure_schema()
+        await asyncio.to_thread(self._wait_sync, bucket)
+
+    async def penalize(self, bucket: str = "rest", *, delay_sec: float) -> None:
+        if not self.enabled:
+            return
+        delay = max(float(delay_sec or 0.0), 0.0)
+        if delay <= 0:
+            return
+        await self._ensure_schema()
+        await asyncio.to_thread(self._penalize_sync, bucket, delay)
+
+    async def get_token(self, token_key: str) -> tuple[str, datetime] | None:
+        if not self.enabled:
+            return None
+        await self._ensure_schema()
+        return await asyncio.to_thread(self._get_token_sync, token_key)
+
+    async def save_token(
+        self,
+        *,
+        token_key: str,
+        access_token: str,
+        expires_at: datetime,
+    ) -> None:
+        if not self.enabled:
+            return
+        await self._ensure_schema()
+        await asyncio.to_thread(
+            self._save_token_sync,
+            token_key,
+            access_token,
+            expires_at.astimezone(timezone.utc).timestamp(),
+        )
+
+    async def _ensure_schema(self) -> None:
+        if self._ready:
+            return
+        async with self._ready_lock:
+            if self._ready:
+                return
+            await asyncio.to_thread(self._ensure_schema_sync)
+            self._ready = True
+
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        return sqlite3.connect(str(self.path), timeout=30.0)
+
+    def _ensure_schema_sync(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS rate_limits (
+                    bucket TEXT PRIMARY KEY,
+                    next_at REAL NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS access_tokens (
+                    token_key TEXT PRIMARY KEY,
+                    access_token TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                """
+            )
+
+    def _wait_sync(self, bucket: str) -> None:
+        name = self._bucket_name(bucket)
+        interval = self._interval_for_bucket(name)
+        while True:
+            now = time.time()
+            with self._connect() as conn:
+                conn.isolation_level = None
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT next_at FROM rate_limits WHERE bucket = ?",
+                    (name,),
+                ).fetchone()
+                next_at = float(row[0]) if row else 0.0
+                wait_for = max(next_at - now, 0.0)
+                if wait_for <= 0:
+                    if interval > 0:
+                        conn.execute(
+                            """
+                            INSERT INTO rate_limits(bucket, next_at)
+                            VALUES(?, ?)
+                            ON CONFLICT(bucket) DO UPDATE SET next_at = excluded.next_at
+                            """,
+                            (name, now + interval),
+                        )
+                    conn.execute("COMMIT")
+                    return
+                conn.execute("ROLLBACK")
+            time.sleep(min(wait_for, 1.0))
+
+    def _penalize_sync(self, bucket: str, delay_sec: float) -> None:
+        name = self._bucket_name(bucket)
+        next_at = time.time() + max(float(delay_sec or 0.0), 0.0)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO rate_limits(bucket, next_at)
+                VALUES(?, ?)
+                ON CONFLICT(bucket) DO UPDATE SET
+                    next_at = max(rate_limits.next_at, excluded.next_at)
+                """,
+                (name, next_at),
+            )
+
+    @staticmethod
+    def _bucket_name(bucket: str) -> str:
+        raw_name = str(bucket or "").strip().lower()
+        if raw_name == "token":
+            return "token"
+        if raw_name.startswith("account:") or raw_name.startswith("balance:"):
+            return raw_name
+        if raw_name in {"account", "balance"}:
+            return "account"
+        return "rest"
+
+    @staticmethod
+    def _is_account_bucket(bucket: str) -> bool:
+        raw_name = KISSharedRateLimiter._bucket_name(bucket)
+        return raw_name == "account" or raw_name.startswith(("account:", "balance:"))
+
+    def _interval_for_bucket(self, bucket: str) -> float:
+        if bucket == "token":
+            return self.token_min_interval_sec
+        if self._is_account_bucket(bucket):
+            rest_interval = 0.0
+            if self.rest_rate_limit_per_sec > 0:
+                rest_interval = 1.0 / self.rest_rate_limit_per_sec
+            return max(rest_interval, self.account_min_interval_sec)
+        if self.rest_rate_limit_per_sec <= 0:
+            return 0.0
+        return 1.0 / self.rest_rate_limit_per_sec
+
+    def _get_token_sync(self, token_key: str) -> tuple[str, datetime] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT access_token, expires_at
+                FROM access_tokens
+                WHERE token_key = ?
+                LIMIT 1
+                """,
+                (str(token_key or ""),),
+            ).fetchone()
+        if not row:
+            return None
+        token = str(row[0] or "").strip()
+        expires_at = datetime.fromtimestamp(float(row[1] or 0.0), tz=timezone.utc)
+        if not token:
+            return None
+        return token, expires_at
+
+    def _save_token_sync(
+        self,
+        token_key: str,
+        access_token: str,
+        expires_at: float,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO access_tokens(token_key, access_token, expires_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(token_key) DO UPDATE SET
+                    access_token = excluded.access_token,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (str(token_key or ""), str(access_token or ""), float(expires_at), time.time()),
+            )
+
+
 class KISAdapter:
     def __init__(self, config: KISConfig) -> None:
         self.config = config
         self._access_token = ""
         self._token_expiry = datetime.fromtimestamp(0, tz=timezone.utc)
         self._token_lock = asyncio.Lock()
+        self._rate_limiter = KISSharedRateLimiter(
+            db_path=config.rate_limit_db_path,
+            rest_rate_limit_per_sec=config.rest_rate_limit_per_sec,
+            account_min_interval_sec=config.account_min_interval_sec,
+            token_min_interval_sec=config.token_min_interval_sec,
+            enabled=config.rate_limit_enabled,
+        )
+        self._token_key = hashlib.sha256(
+            f"{config.base_url.rstrip('/')}|{config.app_key}".encode("utf-8")
+        ).hexdigest()
+
+    def _account_bucket(self) -> str:
+        return f"account:{self._token_key}"
 
     async def fetch_balance_assets(self) -> list[dict[str, Any]]:
         rows, summary = await self._fetch_balance_rows()
@@ -92,11 +310,13 @@ class KISAdapter:
             "Accept": "application/json",
         }
         url = f"{self.config.base_url.rstrip('/')}/uapi/domestic-stock/v1/quotations/inquire-price"
-        timeout = httpx.Timeout(10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url, params=params, headers=headers)
-
-        payload = self._parse_json(response)
+        response, payload = await self._request_json(
+            "get",
+            url,
+            params=params,
+            headers=headers,
+            timeout=httpx.Timeout(10.0),
+        )
         if response.status_code >= 400:
             raise KISAPIError(f"kis quote request failed: {payload}")
         if str(payload.get("rt_cd")) != "0":
@@ -142,7 +362,6 @@ class KISAdapter:
         if norm_side not in {"buy", "sell"}:
             raise KISAPIError("side must be buy or sell")
 
-        token = await self._get_access_token()
         cano, product_code = self._account_parts()
         payload = {
             "CANO": cano,
@@ -155,33 +374,41 @@ class KISAdapter:
             "SLL_TYPE": "",
             "CNDT_PRIC": "",
         }
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "appkey": self.config.app_key,
-            "appsecret": self.config.app_secret,
-            "tr_id": (
-                self.config.tr_id_order_buy
-                if norm_side == "buy"
-                else self.config.tr_id_order_sell
-            ),
-            "custtype": self.config.cust_type,
-            "Accept": "application/json",
-            "Content-Type": "application/json; charset=UTF-8",
-        }
-
         url = f"{self.config.base_url.rstrip('/')}/uapi/domestic-stock/v1/trading/order-cash"
-        timeout = httpx.Timeout(10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                url, content=json.dumps(payload), headers=headers
+        body: dict[str, Any] = {}
+        for attempt in range(2):
+            token = await self._get_access_token(force_refresh=attempt > 0)
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "appkey": self.config.app_key,
+                "appsecret": self.config.app_secret,
+                "tr_id": (
+                    self.config.tr_id_order_buy
+                    if norm_side == "buy"
+                    else self.config.tr_id_order_sell
+                ),
+                "custtype": self.config.cust_type,
+                "Accept": "application/json",
+                "Content-Type": "application/json; charset=UTF-8",
+            }
+            response, body = await self._request_json(
+                "post",
+                url,
+                content=json.dumps(payload),
+                headers=headers,
+                timeout=httpx.Timeout(10.0),
             )
-
-        body = self._parse_json(response)
-        if response.status_code >= 400:
-            raise KISAPIError(f"kis order request failed: {body}")
-        if str(body.get("rt_cd")) != "0":
-            msg = str(body.get("msg1") or body.get("msg_cd") or body)
-            raise KISAPIError(f"kis order request rejected: {msg}")
+            if self._is_access_token_expired_payload(body) and attempt == 0:
+                self._clear_access_token()
+                continue
+            if response.status_code >= 400:
+                raise KISAPIError(f"kis order request failed: {body}")
+            if str(body.get("rt_cd")) != "0":
+                msg = str(body.get("msg1") or body.get("msg_cd") or body)
+                raise KISAPIError(f"kis order request rejected: {msg}")
+            break
+        else:
+            raise KISAPIError(f"kis order request failed after token refresh: {body}")
 
         out = body.get("output")
         output = out if isinstance(out, dict) else {}
@@ -337,19 +564,26 @@ class KISAdapter:
             raise KISAPIError("order_no is required")
 
         cancelable_match: dict[str, Any] = {}
+        cancelable_lookup_error: Exception | None = None
         try:
             cancelable = await self.fetch_domestic_cancelable_orders(max_pages=3)
             for row in cancelable.get("orders") or []:
                 if str(row.get("order_no") or "").strip() == resolved_order_no:
                     cancelable_match = row if isinstance(row, dict) else {}
                     break
-        except Exception:
+        except Exception as exc:
+            cancelable_lookup_error = exc
             cancelable_match = {}
 
         resolved_orgno = str(order_orgno or "").strip() or str(
             cancelable_match.get("order_orgno") or ""
         ).strip()
         if not resolved_orgno:
+            if cancelable_lookup_error is not None:
+                raise KISAPIError(
+                    "cancelable order lookup failed before resolving order_orgno: "
+                    f"{cancelable_lookup_error}"
+                ) from cancelable_lookup_error
             raise KISAPIError("cancelable order orgno not found")
 
         remaining_qty = _positive_int(cancelable_match.get("cancelable_qty"))
@@ -384,13 +618,13 @@ class KISAdapter:
         }
 
         url = f"{self.config.base_url.rstrip('/')}/uapi/domestic-stock/v1/trading/order-rvsecncl"
-        timeout = httpx.Timeout(10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                url, content=json.dumps(payload), headers=headers
-            )
-
-        body = self._parse_json(response)
+        response, body = await self._request_json(
+            "post",
+            url,
+            content=json.dumps(payload),
+            headers=headers,
+            timeout=httpx.Timeout(10.0),
+        )
         if response.status_code >= 400:
             raise KISAPIError(f"kis cancel request failed: {body}")
         if str(body.get("rt_cd")) != "0":
@@ -461,11 +695,13 @@ class KISAdapter:
             headers["tr_cont"] = tr_cont
 
         url = f"{self.config.base_url.rstrip('/')}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
-        timeout = httpx.Timeout(10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url, params=params, headers=headers)
-
-        payload = self._parse_json(response)
+        response, payload = await self._request_json(
+            "get",
+            url,
+            params=params,
+            headers=headers,
+            timeout=httpx.Timeout(10.0),
+        )
         if response.status_code >= 400:
             raise KISAPIError(f"kis order inquiry request failed: {payload}")
         if str(payload.get("rt_cd")) != "0":
@@ -505,11 +741,13 @@ class KISAdapter:
             headers["tr_cont"] = tr_cont
 
         url = f"{self.config.base_url.rstrip('/')}/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
-        timeout = httpx.Timeout(10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url, params=params, headers=headers)
-
-        payload = self._parse_json(response)
+        response, payload = await self._request_json(
+            "get",
+            url,
+            params=params,
+            headers=headers,
+            timeout=httpx.Timeout(10.0),
+        )
         if response.status_code >= 400:
             raise KISAPIError(f"kis cancelable inquiry request failed: {payload}")
         if str(payload.get("rt_cd")) != "0":
@@ -592,11 +830,14 @@ class KISAdapter:
             headers["tr_cont"] = tr_cont
 
         url = f"{self.config.base_url.rstrip('/')}/uapi/domestic-stock/v1/trading/inquire-balance"
-        timeout = httpx.Timeout(10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url, params=params, headers=headers)
-
-        payload = self._parse_json(response)
+        response, payload = await self._request_json(
+            "get",
+            url,
+            bucket=self._account_bucket(),
+            params=params,
+            headers=headers,
+            timeout=httpx.Timeout(10.0),
+        )
         if response.status_code >= 400:
             raise KISAPIError(f"kis balance request failed: {payload}")
         if str(payload.get("rt_cd")) != "0":
@@ -665,11 +906,14 @@ class KISAdapter:
             headers["tr_cont"] = tr_cont
 
         url = f"{self.config.base_url.rstrip('/')}/uapi/overseas-stock/v1/trading/inquire-present-balance"
-        timeout = httpx.Timeout(10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url, params=params, headers=headers)
-
-        payload = self._parse_json(response)
+        response, payload = await self._request_json(
+            "get",
+            url,
+            bucket=self._account_bucket(),
+            params=params,
+            headers=headers,
+            timeout=httpx.Timeout(10.0),
+        )
         if response.status_code >= 400:
             raise KISAPIError(f"kis us balance request failed: {payload}")
         if str(payload.get("rt_cd")) != "0":
@@ -679,15 +923,26 @@ class KISAdapter:
         next_tr_cont = str(response.headers.get("tr_cont") or "").upper().strip()
         return payload, next_tr_cont
 
-    async def _get_access_token(self) -> str:
+    async def _get_access_token(self, *, force_refresh: bool = False) -> str:
         now = datetime.now(timezone.utc)
-        if self._access_token and now < self._token_expiry:
+        if not force_refresh and self._access_token and now < self._token_expiry:
             return self._access_token
 
         async with self._token_lock:
             now = datetime.now(timezone.utc)
-            if self._access_token and now < self._token_expiry:
+            if not force_refresh and self._access_token and now < self._token_expiry:
                 return self._access_token
+            if not force_refresh:
+                cached = await self._rate_limiter.get_token(self._token_key)
+                if cached is not None:
+                    token, expiry = cached
+                    # Refresh slightly early to avoid boundary expiry failures.
+                    if token and now < expiry - timedelta(seconds=90):
+                        self._access_token = token
+                        self._token_expiry = expiry - timedelta(seconds=90)
+                        return token
+            else:
+                self._clear_access_token()
 
             payload = {
                 "grant_type": "client_credentials",
@@ -699,13 +954,15 @@ class KISAdapter:
                 "Accept": "application/json",
             }
             url = f"{self.config.base_url.rstrip('/')}/oauth2/tokenP"
-            timeout = httpx.Timeout(10.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    url, content=json.dumps(payload), headers=headers
-                )
-
-            body = self._parse_json(response)
+            response, body = await self._request_json(
+                "post",
+                url,
+                bucket="token",
+                retry_rate_limit=False,
+                content=json.dumps(payload),
+                headers=headers,
+                timeout=httpx.Timeout(10.0),
+            )
             if response.status_code >= 400:
                 raise KISAPIError(f"kis token request failed: {body}")
 
@@ -717,14 +974,104 @@ class KISAdapter:
             # Refresh slightly early to avoid boundary expiry failures.
             self._access_token = token
             self._token_expiry = expiry - timedelta(seconds=90)
+            await self._rate_limiter.save_token(
+                token_key=self._token_key,
+                access_token=token,
+                expires_at=expiry,
+            )
             return token
+
+    def _clear_access_token(self) -> None:
+        self._access_token = ""
+        self._token_expiry = datetime.fromtimestamp(0, tz=timezone.utc)
+
+    async def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        bucket: str = "rest",
+        retry_rate_limit: bool = True,
+        timeout: httpx.Timeout | None = None,
+        **kwargs: Any,
+    ) -> tuple[httpx.Response, dict[str, Any]]:
+        method_name = str(method or "get").lower()
+        timeout = timeout or httpx.Timeout(10.0)
+        response: httpx.Response | None = None
+        payload: dict[str, Any] = {}
+        bucket_name = KISSharedRateLimiter._bucket_name(bucket)
+        is_account_bucket = KISSharedRateLimiter._is_account_bucket(bucket_name)
+        wait_buckets = self._rate_limit_buckets(bucket_name)
+        attempts = 3 if retry_rate_limit and is_account_bucket else 2 if retry_rate_limit else 1
+        for attempt in range(attempts):
+            for wait_bucket in wait_buckets:
+                await self._rate_limiter.wait(wait_bucket)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                if method_name == "post":
+                    response = await client.post(url, **kwargs)
+                else:
+                    response = await client.get(url, **kwargs)
+            payload = self._parse_json(response)
+            if (
+                retry_rate_limit
+                and attempt < attempts - 1
+                and self._is_rest_rate_limit_payload(payload)
+            ):
+                retry_delay = self._rate_limit_retry_delay(bucket_name, attempt)
+                for wait_bucket in wait_buckets:
+                    await self._rate_limiter.penalize(wait_bucket, delay_sec=retry_delay)
+                await asyncio.sleep(retry_delay)
+                continue
+            return response, payload
+        if response is None:
+            raise KISAPIError("kis request did not run")
+        return response, payload
+
+    @staticmethod
+    def _rate_limit_buckets(bucket: str) -> list[str]:
+        bucket_name = KISSharedRateLimiter._bucket_name(bucket)
+        if (
+            KISSharedRateLimiter._is_account_bucket(bucket_name)
+            and bucket_name != "account"
+        ):
+            return ["account", bucket_name]
+        return [bucket_name]
+
+    def _rate_limit_retry_delay(self, bucket: str, attempt: int) -> float:
+        rest_delay = 1.0 / max(float(self.config.rest_rate_limit_per_sec or 0.0), 1.0)
+        if not KISSharedRateLimiter._is_account_bucket(bucket):
+            return max(1.0, rest_delay * float(attempt + 1))
+        account_interval = max(float(self.config.account_min_interval_sec or 0.0), 4.0)
+        return max(10.0, account_interval * float(attempt + 2), rest_delay)
+
+    @staticmethod
+    def _is_rest_rate_limit_payload(payload: dict[str, Any]) -> bool:
+        text = json.dumps(payload, ensure_ascii=False)
+        return (
+            "EGW00201" in text
+            or "EGW00215" in text
+            or "초당 거래건수" in text
+            or "허용 가능한 초당" in text
+            or "호출 유량" in text
+        )
+
+    @staticmethod
+    def _is_access_token_expired_payload(payload: dict[str, Any]) -> bool:
+        text = json.dumps(payload, ensure_ascii=False).lower()
+        return (
+            "egw00123" in text
+            or "기간이 만료된 token" in text
+            or "expired token" in text
+            or "token expired" in text
+        )
 
     def _to_assets(
         self, rows: list[dict[str, Any]], summary: dict[str, Any]
     ) -> list[dict[str, Any]]:
         assets: list[dict[str, Any]] = []
 
-        cash_krw = self._select_cash_value(summary)
+        cash_breakdown = self._select_cash_breakdown(summary)
+        cash_krw = cash_breakdown["cash_krw"]
         if cash_krw > 0:
             assets.append(
                 {
@@ -732,12 +1079,13 @@ class KISAdapter:
                     "asset_name": "KRW",
                     "kind": "cash",
                     "qty": cash_krw,
-                    "available": cash_krw,
+                    "available": cash_breakdown["orderable_cash_krw"],
                     "locked": 0.0,
                     "avg_price": 1.0,
                     "mark_price": 1.0,
                     "value_krw": cash_krw,
                     "pnl_krw": 0.0,
+                    **cash_breakdown,
                 }
             )
 
@@ -965,25 +1313,58 @@ class KISAdapter:
         return assets
 
     def _select_cash_value(self, summary: dict[str, Any]) -> float:
-        if not isinstance(summary, dict):
-            return 0.0
+        return self._select_cash_breakdown(summary)["cash_krw"]
 
-        for key in (
-            "dnca_tot_amt",
-            "ord_psbl_cash",
-            "nass_amt",
-            "tot_evlu_amt",
-        ):
-            value = self._to_float(summary.get(key))
-            if value > 0:
-                if key == "tot_evlu_amt":
-                    scts = self._to_float(summary.get("scts_evlu_amt"))
-                    inferred_cash = max(value - scts, 0.0)
-                    if inferred_cash > 0:
-                        return inferred_cash
-                else:
-                    return value
-        return 0.0
+    def _select_cash_breakdown(self, summary: dict[str, Any]) -> dict[str, float]:
+        if not isinstance(summary, dict):
+            return {
+                "cash_krw": 0.0,
+                "settled_cash_krw": 0.0,
+                "orderable_cash_krw": 0.0,
+                "receivable_cash_krw": 0.0,
+                "settlement_cash_krw": 0.0,
+                "next_day_cash_krw": 0.0,
+                "net_asset_krw": 0.0,
+                "today_sell_amount_krw": 0.0,
+                "today_fee_tax_krw": 0.0,
+            }
+
+        settled_cash = self._to_float(summary.get("dnca_tot_amt"))
+        orderable_cash = self._to_float(summary.get("ord_psbl_cash"))
+        settlement_cash = self._to_float(summary.get("prvs_rcdl_excc_amt"))
+        next_day_cash = self._to_float(summary.get("nxdy_excc_amt"))
+        net_asset = self._to_float(summary.get("nass_amt") or summary.get("tot_evlu_amt"))
+        stock_value = self._to_float(summary.get("scts_evlu_amt"))
+        inferred_cash = max(net_asset - stock_value, 0.0) if net_asset > 0 else 0.0
+        today_sell_amount = self._to_float(summary.get("thdt_sll_amt"))
+        today_fee_tax = self._to_float(summary.get("thdt_tlex_amt"))
+
+        cash_krw = max(
+            settled_cash,
+            settlement_cash,
+            orderable_cash,
+            next_day_cash,
+            inferred_cash,
+        )
+        if orderable_cash <= 0:
+            # Some KIS balance payloads omit explicit orderable cash but include
+            # provisional settlement cash after same-day sells. Keep the broker
+            # order endpoint as the final gate, but expose this buying power to
+            # the block manager so the cash does not appear to vanish.
+            orderable_cash = max(settlement_cash, settled_cash, next_day_cash)
+
+        return {
+            "cash_krw": cash_krw,
+            "settled_cash_krw": settled_cash if settled_cash > 0 else cash_krw,
+            "orderable_cash_krw": orderable_cash,
+            "receivable_cash_krw": max(settlement_cash - settled_cash, 0.0),
+            "settlement_cash_krw": settlement_cash,
+            "next_day_cash_krw": next_day_cash,
+            "net_asset_krw": net_asset,
+            "today_sell_amount_krw": today_sell_amount,
+            "today_fee_tax_krw": today_fee_tax,
+        }
+
 
     def _select_usd_krw_rate(
         self, rows: list[dict[str, Any]], summary: dict[str, Any]

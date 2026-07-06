@@ -1,0 +1,7 @@
+{
+  "contract_id": "earnings_event_contract",
+  "version": 1,
+  "required": ["symbol", "event_date", "reported_metrics", "expectation_bridge", "guidance_delta", "thesis_impact"],
+  "source_types": ["company_report", "consensus", "quote", "research", "memory", "filing"],
+  "reject_when": ["missing_symbol", "missing_event_date", "reported_metrics_without_source", "guidance_claim_without_source", "thesis_impact_missing"]
+}

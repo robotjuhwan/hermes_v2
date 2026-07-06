@@ -10,7 +10,7 @@
 - Prompt assembly and bridge request:
   - `_collect_codex_item_via_bridge()` in `src/tradecraft/services/research_pipeline.py`
   - `_request_self_score_via_bridge()` in `src/tradecraft/services/research_pipeline.py`
-- Shared LLM wrapper: `LLMBridge` in `src/tradecraft/services/llm_bridge.py`
+- Shared LLM wrapper: `CodexNativeRuntime` in `src/tradecraft/services/codex_native.py`
 - Report facts LLM enrichment is opt-in via `TRADECRAFT_NAVER_REPORTS_LLM_FACTS_ENABLED`; plain report collection/RAG can run without per-report LLM calls.
 
 ## 2) Crawling output locations
@@ -40,7 +40,7 @@
   - `tradecraft-intelligence` -> `src/tradecraft/runtime/intelligence_runner.py`
   - `tradecraft-research` -> `src/tradecraft/runtime/research_runner.py`
   - `tradecraft-naver-reports` -> `src/tradecraft/runtime/naver_reports_runner.py`
-  - `tradecraft-kis-trader` -> `src/tradecraft/runtime/kis_trader_runner.py`
+  - `tradecraft-kis-block-trader` -> `src/tradecraft/runtime/kis_block_trader_runner.py`
 
 ## 5) Existing document processing/search code
 

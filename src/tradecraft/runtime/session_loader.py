@@ -211,7 +211,7 @@ def _default_sessions(now_iso: str) -> list[dict[str, Any]]:
         {
             "session_id": "krx_balance",
             "venue_id": "kr_stock",
-            "venue_label": "국장",
+            "venue_label": "국장1",
             "name": "밸런스 세션",
             "bot_name": "krx_balance_core",
             "mode": "mid_long_term",
@@ -387,16 +387,16 @@ def load_runtime_sessions(session_path: str) -> tuple[list[dict[str, Any]], str]
 
     if not raw_path:
         defaults = _default_sessions(now_iso)
-        return _normalize_rows(defaults, now_iso), "default"
+        return _normalize_rows(defaults, now_iso), "safe_default_no_orders"
 
     path = Path(raw_path)
     if not path.exists():
         defaults = _default_sessions(now_iso)
-        return _normalize_rows(defaults, now_iso), f"default (missing: {path})"
+        return _normalize_rows(defaults, now_iso), f"safe_default_no_orders (missing: {path})"
 
     rows = _read_session_file(path)
     if rows is None:
         defaults = _default_sessions(now_iso)
-        return _normalize_rows(defaults, now_iso), f"default (invalid file: {path})"
+        return _normalize_rows(defaults, now_iso), f"safe_default_no_orders (invalid file: {path})"
 
     return _normalize_rows(rows, now_iso), f"file:{path}"

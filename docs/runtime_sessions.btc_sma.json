@@ -1,0 +1,61 @@
+{
+  "sessions": [
+    {
+      "session_id": "kis_jue_blocks_state",
+      "venue_id": "kr_stock",
+      "venue_label": "국장1",
+      "name": "KIS 쥬 블록 상태",
+      "bot_name": "jue_kis_block_trader",
+      "mode": "mid_long_term",
+      "strategy_id": "noop_balance",
+      "cycle_sec": 3600,
+      "active_markets": ["KRX"],
+      "display_note": "KIS 실거래 블록은 tradecraft-kis-block-trader가 실행하고, runtime은 상태 스냅샷만 기록",
+      "risk_guard": "ON",
+      "enabled": true
+    },
+    {
+      "session_id": "binance_jue_futures_state",
+      "venue_id": "binance_futures",
+      "venue_label": "바이낸스 선물",
+      "name": "Binance 쥬 선물 상태",
+      "bot_name": "jue_binance_block_trader",
+      "mode": "short_term",
+      "strategy_id": "noop_short_term",
+      "cycle_sec": 60,
+      "active_markets": ["BINANCE_FUTURES"],
+      "trade_symbol": "USDT-M",
+      "display_note": "Binance 선물 블록은 tradecraft-binance-block-trader가 실행하고, runtime은 상태 스냅샷만 기록",
+      "risk_guard": "ON",
+      "enabled": true
+    },
+    {
+      "session_id": "binance_jue_spot_state",
+      "venue_id": "binance",
+      "venue_label": "바이낸스 현물",
+      "name": "Binance 쥬 현물 상태",
+      "bot_name": "jue_binance_spot_blocks",
+      "mode": "mid_long_term",
+      "strategy_id": "noop_balance",
+      "cycle_sec": 1800,
+      "active_markets": ["BINANCE_SPOT"],
+      "display_note": "현물 블록/잔고 운용 상태를 UI에 안정적으로 전달하기 위한 state writer 세션",
+      "risk_guard": "ON",
+      "enabled": true
+    },
+    {
+      "session_id": "upbit_jue_state",
+      "venue_id": "upbit",
+      "venue_label": "업비트",
+      "name": "Upbit 쥬 상태",
+      "bot_name": "jue_upbit_blocks",
+      "mode": "mid_long_term",
+      "strategy_id": "noop_balance",
+      "cycle_sec": 1800,
+      "active_markets": ["UPBIT"],
+      "display_note": "업비트 실거래 가능 상태와 잔고 연결을 runtime UI에 표시",
+      "risk_guard": "ON",
+      "enabled": true
+    }
+  ]
+}

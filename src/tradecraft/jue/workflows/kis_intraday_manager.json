@@ -1,0 +1,23 @@
+{
+  "workflow_id": "kis_intraday_manager",
+  "version": 1,
+  "scope": "kis",
+  "model_policy": {
+    "default_model": "settings.llm_model",
+    "default_reasoning_effort": "settings.llm_reasoning_effort",
+    "expected_runtime_model": "gpt-5.5",
+    "expected_reasoning_effort": "xhigh"
+  },
+  "cadence": {"kind": "market_hours", "interval_sec": 1800},
+  "required_skills": ["thesis_tracker", "block_design", "risk_sizing", "execution_review", "portfolio_balance", "evidence_audit"],
+  "required_context": ["account", "blocks", "quotes", "strategy", "investment_memory", "decision_packet_v2"],
+  "output_contracts": ["block_action_contract", "thesis_update_contract"],
+  "authority": {
+    "can_read_untrusted_research": false,
+    "can_write_memory": true,
+    "can_create_blocks": true,
+    "can_submit_orders": false
+  },
+  "safety_gates": ["kill_switch", "cash_available", "position_available", "duplicate_order", "rate_limit", "executable_price_structure"],
+  "prompt_budget": {"max_skill_chars": 9200, "max_workflow_chars": 1600, "max_contract_chars": 5200}
+}

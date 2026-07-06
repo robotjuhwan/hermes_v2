@@ -1,0 +1,23 @@
+{
+  "workflow_id": "kis_pre_open",
+  "version": 1,
+  "scope": "kis",
+  "model_policy": {
+    "default_model": "settings.llm_model",
+    "default_reasoning_effort": "settings.llm_reasoning_effort",
+    "expected_runtime_model": "gpt-5.5",
+    "expected_reasoning_effort": "xhigh"
+  },
+  "cadence": {"kind": "scheduled", "local_time": "08:30"},
+  "required_skills": ["portfolio_balance", "catalyst_calendar", "idea_generation", "evidence_audit"],
+  "required_context": ["account", "positions", "cash", "market_calendar", "catalysts", "investment_memory", "research"],
+  "output_contracts": ["evidence_claim_contract", "thesis_update_contract"],
+  "authority": {
+    "can_read_untrusted_research": false,
+    "can_write_memory": true,
+    "can_create_blocks": true,
+    "can_submit_orders": false
+  },
+  "safety_gates": ["kill_switch", "market_calendar", "cash_available", "concentration_limit", "evidence_freshness"],
+  "prompt_budget": {"max_skill_chars": 7200, "max_workflow_chars": 1600, "max_contract_chars": 5200}
+}

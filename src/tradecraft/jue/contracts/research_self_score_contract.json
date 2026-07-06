@@ -1,0 +1,11 @@
+{
+  "contract_id": "research_self_score_contract",
+  "version": 1,
+  "required": ["self_score_100", "self_score_reason"],
+  "source_types": ["research_summary", "picks", "cycle_context"],
+  "reject_when": [
+    "self_score_outside_0_100",
+    "score_without_reason",
+    "reason_too_long"
+  ]
+}

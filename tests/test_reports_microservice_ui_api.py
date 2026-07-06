@@ -8,6 +8,12 @@ from tradecraft.reports_api import main as reports_main
 from tradecraft.reports_api.saved_views import ReportsSavedViewStore
 
 
+def _auth_header(monkeypatch) -> dict[str, str]:
+    monkeypatch.setattr(reports_main.settings, "reports_api_token", "secret")
+    monkeypatch.setattr(reports_main.settings, "reports_api_tokens", "")
+    return {"Authorization": "Bearer secret"}
+
+
 def test_ui_overview_allowed_for_local(monkeypatch) -> None:
     fresh_now = datetime.now(timezone.utc).isoformat()
     monkeypatch.setattr(
@@ -40,7 +46,7 @@ def test_ui_overview_allowed_for_local(monkeypatch) -> None:
     )
 
     with TestClient(reports_main.app) as client:
-        response = client.get("/ui-api/overview")
+        response = client.get("/ui-api/overview", headers=_auth_header(monkeypatch))
 
     assert response.status_code == 200
     payload = response.json()
@@ -68,6 +74,22 @@ def test_ui_api_blocks_non_allowed_forwarded_ip(monkeypatch) -> None:
     assert response.status_code == 403
 
 
+def test_ui_api_requires_bearer_token_for_allowed_local_ip(monkeypatch) -> None:
+    monkeypatch.setattr(
+        reports_main.settings,
+        "reports_ui_allowed_cidrs",
+        "127.0.0.1/32",
+    )
+    monkeypatch.setattr(reports_main.settings, "reports_ui_trust_proxy", False)
+    monkeypatch.setattr(reports_main.settings, "reports_api_token", "secret")
+    monkeypatch.setattr(reports_main.settings, "reports_api_tokens", "")
+
+    with TestClient(reports_main.app) as client:
+        response = client.get("/ui-api/overview")
+
+    assert response.status_code == 401
+
+
 def test_ui_action_crawl_once(monkeypatch) -> None:
     async def _crawl_once() -> dict[str, object]:
         return {
@@ -86,7 +108,11 @@ def test_ui_action_crawl_once(monkeypatch) -> None:
     monkeypatch.setattr(reports_main.crawler, "crawl_once", _crawl_once)
 
     with TestClient(reports_main.app) as client:
-        response = client.post("/ui-api/actions/crawl-once", json={})
+        response = client.post(
+            "/ui-api/actions/crawl-once",
+            json={},
+            headers=_auth_header(monkeypatch),
+        )
 
     assert response.status_code == 200
     payload = response.json()
@@ -130,7 +156,11 @@ def test_ui_report_detail_with_chunks(monkeypatch) -> None:
     )
 
     with TestClient(reports_main.app) as client:
-        response = client.get("/ui-api/reports/7", params={"include_chunks": True})
+        response = client.get(
+            "/ui-api/reports/7",
+            params={"include_chunks": True},
+            headers=_auth_header(monkeypatch),
+        )
 
     assert response.status_code == 200
     payload = response.json()
@@ -180,6 +210,7 @@ def test_ui_saved_views_crud_and_alert_preview(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(reports_main.repository, "search", _search)
 
     with TestClient(reports_main.app) as client:
+        headers = _auth_header(monkeypatch)
         create = client.post(
             "/ui-api/saved-views",
             json={
@@ -192,29 +223,34 @@ def test_ui_saved_views_crud_and_alert_preview(monkeypatch, tmp_path) -> None:
                 },
                 "alert": {"enabled": True, "channel": "telegram", "target": "123"},
             },
+            headers=headers,
         )
         assert create.status_code == 200
         view_id = create.json()["view"]["view_id"]
 
-        listing = client.get("/ui-api/saved-views")
+        listing = client.get("/ui-api/saved-views", headers=headers)
         assert listing.status_code == 200
         payload = listing.json()
         assert payload["count"] == 1
         assert payload["items"][0]["name"] == "반도체 모니터"
         assert payload["items"][0]["filters"]["broker"] == "테스트증권"
 
-        preview = client.post(f"/ui-api/saved-views/{view_id}/alert-preview", json={"limit": 3})
+        preview = client.post(
+            f"/ui-api/saved-views/{view_id}/alert-preview",
+            json={"limit": 3},
+            headers=headers,
+        )
         assert preview.status_code == 200
         preview_payload = preview.json()
         assert preview_payload["count"] == 1
         assert "반도체 모니터" in preview_payload["message"]
         assert "삼성전자" in preview_payload["message"]
 
-        deleted = client.delete(f"/ui-api/saved-views/{view_id}")
+        deleted = client.delete(f"/ui-api/saved-views/{view_id}", headers=headers)
         assert deleted.status_code == 200
         assert deleted.json()["deleted"] is True
 
-        empty_listing = client.get("/ui-api/saved-views")
+        empty_listing = client.get("/ui-api/saved-views", headers=headers)
         assert empty_listing.json()["count"] == 0
 
 
@@ -255,6 +291,7 @@ def test_ui_saved_view_alert_test(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(reports_main.TelegramBridge, "send_message", _send_message)
 
     with TestClient(reports_main.app) as client:
+        headers = _auth_header(monkeypatch)
         create = client.post(
             "/ui-api/saved-views",
             json={
@@ -262,10 +299,15 @@ def test_ui_saved_view_alert_test(monkeypatch, tmp_path) -> None:
                 "filters": {"query": "자동차"},
                 "alert": {"enabled": True, "channel": "telegram", "target": "room-7"},
             },
+            headers=headers,
         )
         view_id = create.json()["view"]["view_id"]
 
-        alert = client.post(f"/ui-api/saved-views/{view_id}/alert-test", json={"limit": 2})
+        alert = client.post(
+            f"/ui-api/saved-views/{view_id}/alert-test",
+            json={"limit": 2},
+            headers=headers,
+        )
 
     assert alert.status_code == 200
     payload = alert.json()

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-import types
+import os
 from pathlib import Path
 
+import tradecraft.services.naver_reports as naver_reports
 from tradecraft.services.naver_reports import (
     NaverReportCrawlerConfig,
     NaverReportRepository,
@@ -14,9 +14,11 @@ from tradecraft.services.naver_reports import (
     _extract_broker_from_text,
     _extract_company_symbol_from_text,
     _extract_department_author_from_text,
+    _extract_report_symbol_links,
     _infer_default_department_author_from_context,
     _is_research_detail_url,
     _looks_like_garbled_pdf_text,
+    _parse_date,
 )
 
 
@@ -98,6 +100,764 @@ def test_naver_report_repository_upsert_and_search(tmp_path: Path) -> None:
     assert chunk_rows[0]["report_id"] == report_id
 
 
+def test_naver_report_empty_query_search_does_not_require_chunk_table(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="market_info",
+        source_url="https://finance.naver.com/research/market_info_list.naver",
+        detail_url="https://finance.naver.com/research/market_info_read.naver?nid=chunkless",
+        pdf_url="https://stock.pstatic.net/stock-research/market/chunkless.pdf",
+        pdf_sha256="chunkless",
+        pdf_archived_path=".runtime/naver_reports/pdfs/chunkless.pdf",
+        title="청크 없는 빈 검색",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2025-01-12",
+        crawled_at="2026-01-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="빈 검색은 청크 테이블을 스캔하지 않고 원문 앞부분으로 스니펫을 만든다.",
+        chunk_size=20,
+        max_chunks_per_report=10,
+    )
+
+    with repo._connect() as conn:  # noqa: SLF001 - verifies query-plan dependency
+        conn.execute("DROP TABLE report_chunks")
+
+    rows = repo.search(query="", category="market_info", limit=5)
+
+    assert [row["report_id"] for row in rows] == [report_id]
+    assert "원문 앞부분" in rows[0]["snippet"]
+
+
+def test_search_keyword_snippet_prefers_matching_chunk_over_noisy_chunk(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="industry_analysis",
+        source_url="https://finance.naver.com/research/industry_list.naver",
+        detail_url="https://finance.naver.com/research/industry_read.naver?nid=snippet",
+        pdf_url="https://stock.pstatic.net/stock-research/industry/snippet.pdf",
+        pdf_sha256="snippet",
+        pdf_archived_path=".runtime/naver_reports/pdfs/snippet.pdf",
+        title="반도체 산업 점검",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-07-01",
+        crawled_at="2026-07-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "힣힣 본 조사분석자료는 참고 문구입니다. "
+            "반도체 사이클은 HBM 수요와 장비 투자 재개를 중심으로 개선된다."
+        ),
+        chunk_size=200,
+        max_chunks_per_report=10,
+        chunks=[
+            {
+                "content": "힣힣 본 조사분석자료는 참고 문구입니다.",
+                "page_start": 1,
+                "page_end": 1,
+                "section_title": "disclaimer",
+            },
+            {
+                "content": "반도체 사이클은 HBM 수요와 장비 투자 재개를 중심으로 개선된다.",
+                "page_start": 2,
+                "page_end": 2,
+                "section_title": "thesis",
+            },
+        ],
+    )
+
+    rows = repo.search(query="반도체", limit=5)
+
+    row = next(item for item in rows if item["report_id"] == report_id)
+    assert "반도체 사이클" in row["snippet"]
+    assert "본 조사분석자료" not in row["snippet"]
+
+
+def test_search_keyword_snippet_strips_leading_report_disclaimer(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=snippet-disclaimer",
+        pdf_url="https://stock.pstatic.net/stock-research/company/snippet-disclaimer.pdf",
+        pdf_sha256="snippet-disclaimer",
+        pdf_archived_path=".runtime/naver_reports/pdfs/snippet-disclaimer.pdf",
+        title="삼성전기 (009150) MLCC 대규모 수주 공시",
+        company_name="삼성전기",
+        broker="IBK투자증권",
+        analyst="김운호",
+        symbol="009150",
+        published_at="2026-07-01",
+        crawled_at="2026-07-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "www.ibks.com 본 조사분석자료는 참고 문구입니다. "
+            "고객께서는 자신의 판단과 책임 하에 결정하시기 바랍니다. "
+            "IBKS Spot Comment 2026. 7.1 IT/반도체 [삼성전기] MLCC 대규모 수주 공시"
+        ),
+        chunk_size=200,
+        max_chunks_per_report=10,
+        chunks=[
+            {
+                "content": (
+                    "www.ibks.com 본 조사분석자료는 참고 문구입니다. "
+                    "고객께서는 자신의 판단과 책임 하에 결정하시기 바랍니다. "
+                    "IBKS Spot Comment 2026. 7.1 IT/반도체 [삼성전기] MLCC 대규모 수주 공시"
+                ),
+                "page_start": 1,
+                "page_end": 1,
+                "section_title": "unknown",
+            }
+        ],
+    )
+
+    rows = repo.search(query="반도체", limit=5)
+
+    row = next(item for item in rows if item["report_id"] == report_id)
+    assert row["snippet"].startswith("IBKS Spot Comment")
+    assert "본 조사분석자료" not in row["snippet"]
+
+
+def test_search_keyword_snippet_normalizes_company_market_suffix_prefix(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=snippet-market-suffix",
+        pdf_url="https://stock.pstatic.net/stock-research/company/snippet-market-suffix.pdf",
+        pdf_sha256="snippet-market-suffix",
+        pdf_archived_path=".runtime/naver_reports/pdfs/snippet-market-suffix.pdf",
+        title="한국금융지주 (071050) ETF 타고 브로커리지 왕좌를 노린다",
+        company_name="한국금융지주",
+        broker="테스트증권",
+        analyst="홍길동",
+        symbol="071050",
+        published_at="2026-07-01",
+        crawled_at="2026-07-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "00 한국금융지주 (071050/KS) ETF 타고 브로커리지 왕좌를 노린다 "
+            "ETF 까지 합산 시 브로커리지 점유율 1 등에 근접"
+        ),
+        chunk_size=200,
+        max_chunks_per_report=10,
+        chunks=[
+            {
+                "content": (
+                    "00 한국금융지주 (071050/KS) ETF 타고 브로커리지 왕좌를 노린다 "
+                    "ETF 까지 합산 시 브로커리지 점유율 1 등에 근접"
+                ),
+                "page_start": 1,
+                "page_end": 1,
+                "section_title": "summary",
+            }
+        ],
+    )
+
+    rows = repo.search(query="ETF", limit=5)
+
+    row = next(item for item in rows if item["report_id"] == report_id)
+    assert row["snippet"].startswith("한국금융지주 (071050) ETF 타고")
+    assert not row["snippet"].startswith("00 ")
+    assert "(071050/KS)" not in row["snippet"]
+
+
+def test_search_keyword_snippet_strips_leading_compliance_notice(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=compliance-snippet",
+        pdf_url="https://stock.pstatic.net/stock-research/company/compliance-snippet.pdf",
+        pdf_sha256="compliance-snippet",
+        pdf_archived_path=".runtime/naver_reports/pdfs/compliance-snippet.pdf",
+        title="아이엠티 (451220) 2026년 예상 매출 성장률 51%",
+        company_name="아이엠티",
+        broker="테스트증권",
+        analyst="홍길동",
+        symbol="451220",
+        published_at="2026-07-01",
+        crawled_at="2026-07-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "금융투자분석사의 확인 및 중요 공시는 Appendix 참조 NOT RATED "
+            "현재주가 (6/29) 12,620원 2026년 장비와 소재, 동반 성장 가시화 "
+            "반도체 HBM 고단화로 세정장비 수요 증가를 전망한다."
+        ),
+        chunk_size=220,
+        max_chunks_per_report=10,
+        chunks=[
+            {
+                "content": (
+                    "금융투자분석사의 확인 및 중요 공시는 Appendix 참조 NOT RATED "
+                    "현재주가 (6/29) 12,620원 2026년 장비와 소재, 동반 성장 가시화 "
+                    "반도체 HBM 고단화로 세정장비 수요 증가를 전망한다."
+                ),
+                "page_start": 1,
+                "page_end": 1,
+                "section_title": "unknown",
+            }
+        ],
+    )
+
+    rows = repo.search(query="반도체", limit=5)
+
+    row = next(item for item in rows if item["report_id"] == report_id)
+    assert row["snippet"].startswith("NOT RATED")
+    assert "금융투자분석사의 확인" not in row["snippet"]
+    assert "Appendix 참조" not in row["snippet"]
+
+
+def test_upsert_report_trims_noisy_company_report_title_prefix(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=noisy-title",
+        pdf_url="https://stock.pstatic.net/stock-research/company/noisy-title.pdf",
+        pdf_sha256="noisy-title",
+        pdf_archived_path=".runtime/naver_reports/pdfs/noisy-title.pdf",
+        title=(
+            "주가 및 주요이벤트 재무지표 밸류에이션 지표 체크포인트 "
+            "기업분석ㅣ2026.07.01 KOSPIㅣ식품,음료,담배 현대그린푸드 (453340)"
+        ),
+        company_name="현대그린푸드",
+        broker="테스트증권",
+        analyst="홍길동",
+        symbol="453340",
+        published_at="2026-07-01",
+        crawled_at="2026-07-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "주가 및 주요이벤트 재무지표 밸류에이션 지표 체크포인트 "
+            "기업분석ㅣ2026.07.01 KOSPIㅣ식품,음료,담배 현대그린푸드 (453340) "
+            "영업실적도, 주주환원도 레벨업 ■ 기업가치 제고계획"
+        ),
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    detail = repo.get_report(report_id)
+
+    assert detail is not None
+    assert detail["title"] == "현대그린푸드 (453340) 영업실적도, 주주환원도 레벨업"
+
+
+def test_upsert_report_normalizes_company_title_with_market_suffix_code(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=market-suffix",
+        pdf_url="https://stock.pstatic.net/stock-research/company/market-suffix.pdf",
+        pdf_sha256="market-suffix",
+        pdf_archived_path=".runtime/naver_reports/pdfs/market-suffix.pdf",
+        title=(
+            "00 한국금융지주 (071050/KS) ETF 타고 브로커리지 왕좌를 노린다 "
+            "ETF 까지 합산 시 브로커리지 점유율 1 등에 근접"
+        ),
+        company_name="한국금융지주",
+        broker="테스트증권",
+        analyst="홍길동",
+        symbol="071050",
+        published_at="2026-07-01",
+        crawled_at="2026-07-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "00 한국금융지주 (071050/KS) ETF 타고 브로커리지 왕좌를 노린다 "
+            "ETF 까지 합산 시 브로커리지 점유율 1 등에 근접 ETF 일평균 거래대금이 급성장함에 따라"
+        ),
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    detail = repo.get_report(report_id)
+
+    assert detail is not None
+    assert detail["title"] == "한국금융지주 (071050) ETF 타고 브로커리지 왕좌를 노린다"
+
+
+def test_upsert_report_derives_company_spot_comment_title_without_code_in_text(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=company-spot",
+        pdf_url="https://stock.pstatic.net/stock-research/company/company-spot.pdf",
+        pdf_sha256="company-spot",
+        pdf_archived_path=".runtime/naver_reports/pdfs/company-spot.pdf",
+        title="www.ibks.com 본 조사분석자료는 당사 리서치본부에서 신뢰할 만한 자료",
+        company_name="삼성전기",
+        broker="IBK투자증권",
+        analyst="김운호",
+        symbol="009150",
+        published_at="2026-07-01",
+        crawled_at="2026-07-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "www.ibks.com 본 조사분석자료입니다. "
+            "IBKS Spot Comment 2026. 7.1 IT/반도체 김운호 "
+            "unokim88@ibks.com [삼성전기] MLCC 대규모 수주 공시 "
+            "What’s New: 단일판매공급 계약 공시"
+        ),
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    detail = repo.get_report(report_id)
+
+    assert detail is not None
+    assert detail["title"] == "삼성전기 (009150) MLCC 대규모 수주 공시"
+
+
+def test_upsert_report_company_spot_comment_title_stops_before_body_context(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=company-spot-long",
+        pdf_url="https://stock.pstatic.net/stock-research/company/company-spot-long.pdf",
+        pdf_sha256="company-spot-long",
+        pdf_archived_path=".runtime/naver_reports/pdfs/company-spot-long.pdf",
+        title="www.ibks.com 본 조사분석자료는 당사 리서치본부에서 신뢰할 만한 자료",
+        company_name="한미약품",
+        broker="IBK투자증권",
+        analyst="정이수",
+        symbol="128940",
+        published_at="2026-06-02",
+        crawled_at="2026-06-02T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "www.ibks.com 본 조사분석자료입니다. "
+            "IBKS Spot Comment 2026. 6. 2 제약/바이오 정이수 "
+            "[한미약품] 일라이 릴리 기술이전으로 실적과 신약가치 ‘일석이조’ "
+            "약 6년 만에 글로벌 빅파마와 기술이전 계약 체결 한미약품은 6월 1일 "
+            "일라이 릴리와 라이선스 계약 체결을 발표했다."
+        ),
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    detail = repo.get_report(report_id)
+
+    assert detail is not None
+    assert detail["title"] == "한미약품 (128940) 일라이 릴리 기술이전으로 실적과 신약가치 ‘일석이조’"
+
+
+def test_upsert_report_company_spot_comment_title_stops_before_repeated_company(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=company-repeat",
+        pdf_url="https://stock.pstatic.net/stock-research/company/company-repeat.pdf",
+        pdf_sha256="company-repeat",
+        pdf_archived_path=".runtime/naver_reports/pdfs/company-repeat.pdf",
+        title="www.ibks.com 본 조사분석자료는 당사 리서치본부에서 신뢰할 만한 자료",
+        company_name="녹십자",
+        broker="IBK투자증권",
+        analyst="정이수",
+        symbol="006280",
+        published_at="2026-03-11",
+        crawled_at="2026-03-11T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "www.ibks.com 본 조사분석자료입니다. "
+            "IBKS Spot Comment 2026. 3. 11 제약/바이오 정이수 "
+            "[녹십자] Investor Day 후기 녹십자는 2026년 3월 10일 "
+            "핵심 품목인 알리글로의 미국 사업 전략을 공유했다."
+        ),
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    detail = repo.get_report(report_id)
+
+    assert detail is not None
+    assert detail["title"] == "녹십자 (006280) Investor Day 후기"
+
+
+def test_upsert_report_derives_non_company_weekly_comment_title(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="industry_analysis",
+        source_url="https://finance.naver.com/research/industry_list.naver",
+        detail_url="https://finance.naver.com/research/industry_read.naver?nid=weekly",
+        pdf_url="https://stock.pstatic.net/stock-research/industry/weekly.pdf",
+        pdf_sha256="weekly-comment",
+        pdf_archived_path=".runtime/naver_reports/pdfs/weekly-comment.pdf",
+        title="1 제목입니다 2026.07.01 Yuanta Research ■ Valuation ■ 2026E 실적",
+        company_name="",
+        broker="유안타증권",
+        analyst="",
+        symbol="",
+        published_at="2026-07-01",
+        crawled_at="2026-07-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "1 제목입니다 2026.07.01 Yuanta Research ■ Valuation ■ 2026E 실적 "
+            "■ 수급 현황 자료: 에프앤가이드 Quantiwise, 유안타증권 리서치센터 "
+            "■ 주간 Comment(06/24~06/30) ■ 주가 현황 PER(x) PBR(x)"
+        ),
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    detail = repo.get_report(report_id)
+
+    assert detail is not None
+    assert detail["title"] == "주간 Comment(06/24~06/30)"
+
+
+def test_upsert_report_derives_non_company_spot_comment_title(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="industry_analysis",
+        source_url="https://finance.naver.com/research/industry_list.naver",
+        detail_url="https://finance.naver.com/research/industry_read.naver?nid=spot",
+        pdf_url="https://stock.pstatic.net/stock-research/industry/spot.pdf",
+        pdf_sha256="spot-comment",
+        pdf_archived_path=".runtime/naver_reports/pdfs/spot-comment.pdf",
+        title=(
+            "www.ibks.com 본 조사분석자료는 당사 리서치본부에서 신뢰할 만한 자료 및 "
+            "정보를 바탕으로 작성한 것이나"
+        ),
+        company_name="",
+        broker="IBK투자증권",
+        analyst="",
+        symbol="",
+        published_at="2026-06-30",
+        crawled_at="2026-06-30T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "www.ibks.com 본 조사분석자료는 당사 리서치본부에서 신뢰할 만한 자료 및 "
+            "정보를 바탕으로 작성한 것이나 과거의 자료입니다. "
+            "IBKS Spot Comment 2026. 6.30 IT/반도체 김운호 02) 6915-5656 "
+            "unokim88@ibks.com [반도체] 한국도 국가와 기업이 AI 기치 아래 공조 "
+            "What’s New"
+        ),
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    detail = repo.get_report(report_id)
+
+    assert detail is not None
+    assert detail["title"] == "IBKS Spot Comment [반도체] 한국도 국가와 기업이 AI 기치 아래 공조"
+
+
+def test_upsert_report_spot_comment_title_stops_before_body_sentence(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="industry_analysis",
+        source_url="https://finance.naver.com/research/industry_list.naver",
+        detail_url="https://finance.naver.com/research/industry_read.naver?nid=spot-long",
+        pdf_url="https://stock.pstatic.net/stock-research/industry/spot-long.pdf",
+        pdf_sha256="spot-comment-long",
+        pdf_archived_path=".runtime/naver_reports/pdfs/spot-comment-long.pdf",
+        title="www.ibks.com 본 조사분석자료는 당사 리서치본부에서 신뢰할 만한 자료",
+        company_name="",
+        broker="IBK투자증권",
+        analyst="",
+        symbol="",
+        published_at="2026-04-29",
+        crawled_at="2026-04-29T00:00:00+00:00",
+        content_source="pdf_extract",
+        content=(
+            "www.ibks.com 본 조사분석자료입니다. "
+            "IBKS Spot Comment 2026. 4.29 에너지/소재 연구원 "
+            "energy@ibks.com [에너지/소재] 한화솔루션 유증, 얼마가 아니라 언제의 문제 "
+            "이번 유상증자의 본질은 조달 선택권 방어에 있다"
+        ),
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    detail = repo.get_report(report_id)
+
+    assert detail is not None
+    assert detail["title"] == "IBKS Spot Comment [에너지/소재] 한화솔루션 유증, 얼마가 아니라 언제의 문제"
+
+
+def test_naver_report_status_uses_short_cache_until_repository_changes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = NaverReportRepository(
+        str(tmp_path / "reports.db"),
+        status_cache_ttl_sec=60,
+    )
+
+    repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=cache1",
+        pdf_url="https://stock.pstatic.net/stock-research/company/cache1.pdf",
+        pdf_sha256="cache1",
+        pdf_archived_path=".runtime/naver_reports/pdfs/cache1.pdf",
+        title="삼성전자 리포트",
+        company_name="삼성전자",
+        broker="테스트증권",
+        analyst="홍길동",
+        symbol="005930",
+        published_at="2025-01-10",
+        crawled_at="2026-01-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="삼성전자 실적 개선 전망",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    calls = 0
+    original_compute_status = repo._compute_status
+
+    def counted_compute_status() -> dict:
+        nonlocal calls
+        calls += 1
+        return original_compute_status()
+
+    monkeypatch.setattr(repo, "_compute_status", counted_compute_status)
+
+    first = repo.status()
+    first["total_reports"] = 999
+    second = repo.status()
+
+    assert calls == 1
+    assert second["total_reports"] == 1
+
+    repo.upsert_report(
+        category="market_info",
+        source_url="https://finance.naver.com/research/market_info_list.naver",
+        detail_url="https://finance.naver.com/research/market_info_read.naver?nid=cache2",
+        pdf_url="https://stock.pstatic.net/stock-research/market/cache2.pdf",
+        pdf_sha256="cache2",
+        pdf_archived_path=".runtime/naver_reports/pdfs/cache2.pdf",
+        title="코스피 ETF 시황",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2025-01-11",
+        crawled_at="2026-01-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="ETF 시장 점검",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    third = repo.status()
+
+    assert calls == 2
+    assert third["total_reports"] == 2
+
+
+def test_naver_report_status_cache_tracks_sqlite_wal_timestamp(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = NaverReportRepository(
+        str(tmp_path / "reports.db"),
+        status_cache_ttl_sec=60,
+    )
+
+    calls = 0
+    original_compute_status = repo._compute_status
+
+    def counted_compute_status() -> dict:
+        nonlocal calls
+        calls += 1
+        return original_compute_status()
+
+    monkeypatch.setattr(repo, "_compute_status", counted_compute_status)
+
+    repo.status()
+    wal_path = Path(f"{repo.path}-wal")
+    wal_path.write_bytes(b"external wal activity")
+    future = repo.path.stat().st_mtime_ns + 1_000_000_000
+    os.utime(wal_path, ns=(future, future))
+    repo.status()
+
+    assert calls == 2
+
+
+def test_naver_report_ops_status_uses_lightweight_summary_without_deep_quality_scan(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=ops1",
+        pdf_url="https://stock.pstatic.net/stock-research/company/ops1.pdf",
+        pdf_sha256="ops1",
+        pdf_archived_path=".runtime/naver_reports/pdfs/ops1.pdf",
+        title="삼성전자 리포트",
+        company_name="삼성전자",
+        broker="테스트증권",
+        analyst="홍길동",
+        symbol="005930",
+        published_at="2025-01-10",
+        crawled_at="2026-01-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="삼성전자 실적 개선 전망",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    def fail_deep_status() -> dict:
+        raise AssertionError("ops status must not run deep report quality scan")
+
+    monkeypatch.setattr(repo, "_compute_status", fail_deep_status)
+
+    payload = repo.ops_status()
+
+    assert payload["status"] == "ok"
+    assert payload["total_reports"] == 1
+    assert payload["category_counts"] == {"company_analysis": 1}
+    assert payload["last_updated_at"]
+    assert payload["quality_mode"] == "lightweight"
+    assert "identity_drift_samples" not in str(payload)
+
+
+def test_naver_report_ops_status_uses_read_only_connection_without_wal_reset(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.upsert_report(
+        category="market_info",
+        source_url="https://finance.naver.com/research/market_info_list.naver",
+        detail_url="https://finance.naver.com/research/market_info_read.naver?nid=ops-ro",
+        pdf_url="https://stock.pstatic.net/stock-research/market/ops-ro.pdf",
+        pdf_sha256="ops-ro",
+        pdf_archived_path=".runtime/naver_reports/pdfs/ops-ro.pdf",
+        title="코스피 시황",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2025-01-11",
+        crawled_at="2026-01-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="코스피 수급 흐름",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+    repo._ops_status_cache = None
+
+    def fail_write_connection():
+        raise AssertionError("ops status should not reset WAL through _connect")
+
+    monkeypatch.setattr(repo, "_connect", fail_write_connection)
+
+    payload = repo.ops_status()
+
+    assert payload["status"] == "ok"
+    assert payload["total_reports"] == 1
+
+
+def test_naver_report_ops_status_hydrates_disk_cache_after_restart(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "reports.db"
+    repo = NaverReportRepository(str(db_path))
+    repo.upsert_report(
+        category="market_info",
+        source_url="https://finance.naver.com/research/market_info_list.naver",
+        detail_url="https://finance.naver.com/research/market_info_read.naver?nid=ops-cache",
+        pdf_url="https://stock.pstatic.net/stock-research/market/ops-cache.pdf",
+        pdf_sha256="ops-cache",
+        pdf_archived_path=".runtime/naver_reports/pdfs/ops-cache.pdf",
+        title="코스피 시황",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2025-01-12",
+        crawled_at="2026-01-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="코스피 수급 흐름",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+    first = repo.ops_status()
+
+    restarted = NaverReportRepository(str(db_path))
+
+    def fail_compute_ops_status() -> dict:
+        raise AssertionError("restart should hydrate lightweight ops status cache")
+
+    monkeypatch.setattr(restarted, "_compute_ops_status", fail_compute_ops_status)
+
+    payload = restarted.ops_status()
+
+    assert payload["total_reports"] == first["total_reports"] == 1
+    assert payload["quality_mode"] == "lightweight"
+
+
+def test_report_upsert_rejects_semantically_invalid_published_date(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+
+    assert _parse_date("발간일 2026.50.20") == ""
+
+    report_id = repo.upsert_report(
+        category="market_info",
+        source_url="https://finance.naver.com/research/market_info_list.naver",
+        detail_url="https://finance.naver.com/research/market_info_read.naver?nid=11",
+        pdf_url="https://stock.pstatic.net/stock-research/market/bad-date.pdf",
+        pdf_sha256="bad-date",
+        pdf_archived_path="",
+        title="날짜 오류 리포트",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-50-20",
+        crawled_at="2026-06-04T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="날짜 오류를 포함한 리포트",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    detail = repo.get_report(report_id)
+    assert detail is not None
+    assert detail["published_at"] == ""
+    assert repo.status()["quality"]["invalid_published_at_count"] == 0
+
+
 def test_clean_company_name_rejects_naver_quote_boilerplate() -> None:
     assert _clean_company_name("코스콤 국내 시세 정보") == ""
     assert _clean_company_name("테마 정보 네이버에 콘텐츠 제공 코스콤 국내 시세 정보") == ""
@@ -124,58 +884,74 @@ def test_resolve_symbol_names_ignores_boilerplate_directory_values(tmp_path: Pat
     assert repo.resolve_symbol_names(["178920", "009150"]) == {"009150": "삼성전기"}
 
 
-def test_refresh_symbol_directory_uses_existing_symbol_fallback(
+def test_refresh_symbol_directory_uses_krx_direct_endpoint(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     repo = NaverReportRepository(str(tmp_path / "reports.db"))
-    repo.upsert_report(
-        category="company_analysis",
-        source_url="https://finance.naver.com/research/company_list.naver",
-        detail_url="https://finance.naver.com/research/company_read.naver?nid=1",
-        pdf_url="https://stock.pstatic.net/stock-research/company/1.pdf",
-        pdf_sha256="abc123",
-        pdf_archived_path=".runtime/naver_reports/pdfs/ab/c1/abc123.pdf",
-        title="(100120,KQ) 뷰웍스 1Q26P Review",
-        company_name="",
-        broker="테스트증권",
-        analyst="홍길동",
-        symbol="100120",
-        published_at="2026-05-06",
-        crawled_at="2026-05-06T00:00:00+00:00",
-        content_source="pdf_extract",
-        content="뷰웍스 실적 개선 전망",
-        chunk_size=200,
-        max_chunks_per_report=10,
-    )
 
-    class _FakeStock:
-        @staticmethod
-        def get_market_ticker_list(as_of: str, market: str = "") -> list[str]:
-            _ = (as_of, market)
-            return []
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
 
-        @staticmethod
-        def get_etf_ticker_list(as_of: str) -> list[str]:
-            _ = as_of
-            return []
+        def raise_for_status(self) -> None:
+            return None
 
-        @staticmethod
-        def get_etn_ticker_list(as_of: str) -> list[str]:
-            _ = as_of
-            return []
+        def json(self) -> dict[str, object]:
+            return self._payload
 
-        @staticmethod
-        def get_market_ticker_name(code: str) -> str:
-            return {"100120": "뷰웍스"}.get(code, "")
+    class _FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self.calls: list[dict[str, str]] = []
 
-    monkeypatch.setitem(sys.modules, "pykrx", types.SimpleNamespace(stock=_FakeStock))
+        def __enter__(self) -> "_FakeClient":
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def post(self, url: str, *, headers: dict[str, str], data: dict[str, str]):
+            _ = (url, headers)
+            self.calls.append(data)
+            if data["bld"] == "dbms/comm/finder/finder_stkisu":
+                return _FakeResponse(
+                    {
+                        "block1": [
+                            {
+                                "short_code": "100120",
+                                "codeName": "뷰웍스",
+                                "marketCode": "KSQ",
+                            },
+                            {
+                                "short_code": "005930",
+                                "codeName": "삼성전자",
+                                "marketCode": "STK",
+                            },
+                        ]
+                    }
+                )
+            return _FakeResponse(
+                {
+                    "block1": [
+                        {
+                            "short_code": "069500",
+                            "codeName": "KODEX 200",
+                        }
+                    ]
+                }
+            )
+
+    monkeypatch.setattr(naver_reports.httpx, "Client", _FakeClient)
 
     result = repo.refresh_symbol_directory_from_krx(as_of="2026-05-06")
 
     assert result["ok"] is True
-    assert result["updated"] == 1
-    assert repo.resolve_symbol_names(["100120"]) == {"100120": "뷰웍스"}
+    assert result["updated"] == 3
+    assert repo.resolve_symbol_names(["100120", "005930", "069500"]) == {
+        "100120": "뷰웍스",
+        "005930": "삼성전자",
+        "069500": "KODEX 200",
+    }
 
 
 def test_is_research_detail_url_accepts_read_pages_only() -> None:
@@ -595,7 +1371,6 @@ def test_llm_fact_refine_is_skipped_when_disabled(tmp_path: Path) -> None:
     crawler = NaverSecuritiesCrawler(
         config=NaverReportCrawlerConfig(
             db_path=str(tmp_path / "reports.db"),
-            llm_bridge_url="https://example.com/v1/chat",
             llm_facts_enabled=False,
         ),
         repository=repo,
@@ -607,15 +1382,108 @@ def test_llm_fact_refine_is_skipped_when_disabled(tmp_path: Path) -> None:
         called = True
         return {"ok": True, "content": "{}"}
 
-    crawler._llm_bridge.complete = fake_complete
+    crawler._codex_runtime.complete = fake_complete
     facts = {"rating": "UNKNOWN", "target_price": {"value": 0}}
 
     result = asyncio.run(
-        crawler._refine_structured_facts_via_bridge(facts=facts, text="본문")
+        crawler._refine_structured_facts_via_native(facts=facts, text="본문")
     )
 
     assert result == facts
     assert called is False
+
+
+def test_crawler_prioritizes_company_reports_before_macro_seeds(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    crawler = NaverSecuritiesCrawler(
+        config=NaverReportCrawlerConfig(
+            db_path=str(tmp_path / "reports.db"),
+            seed_urls=[
+                "https://finance.naver.com/research/market_info_list.naver",
+                "https://finance.naver.com/research/invest_list.naver",
+                "https://finance.naver.com/research/company_list.naver",
+                "https://finance.naver.com/research/industry_list.naver",
+            ],
+        ),
+        repository=repo,
+    )
+
+    seeds = crawler._seed_urls()
+
+    assert seeds[0] == "https://finance.naver.com/research/company_list.naver"
+    assert seeds[1] == "https://finance.naver.com/research/industry_list.naver"
+    assert seeds[-1] == "https://finance.naver.com/research/market_info_list.naver"
+
+
+def test_crawler_skips_pdf_already_present_in_repository(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    pdf_url = "https://stock.pstatic.net/stock-research/company/existing.pdf"
+    repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=1",
+        pdf_url=pdf_url,
+        pdf_sha256="sha-existing",
+        pdf_archived_path=str(tmp_path / "existing.pdf"),
+        title="삼성전자",
+        company_name="삼성전자",
+        broker="테스트증권",
+        analyst="테스터",
+        symbol="005930",
+        published_at="2026-06-29",
+        crawled_at="2026-06-29T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="기존 리포트 본문",
+        chunk_size=1200,
+        max_chunks_per_report=2,
+    )
+    crawler = NaverSecuritiesCrawler(
+        config=NaverReportCrawlerConfig(
+            db_path=str(tmp_path / "reports.db"),
+            seed_urls=["https://finance.naver.com/research/company_list.naver"],
+            max_pages=1,
+            request_delay_sec=0,
+            max_pdfs_per_cycle=10,
+        ),
+        repository=repo,
+    )
+    fetch_bytes_calls = 0
+    detail_fetch_calls = 0
+
+    async def fake_fetch_text(_client, url: str) -> str:
+        nonlocal detail_fetch_calls
+        if "company_list" in url:
+            return (
+                '<a href="/research/company_read.naver?nid=1">'
+                "삼성전자 리포트"
+                "</a>"
+            )
+        if "company_read" in url:
+            detail_fetch_calls += 1
+            return (
+                "<html><title>삼성전자 리포트</title>"
+                f'<a href="{pdf_url}">PDF</a>'
+                "</html>"
+            )
+        return ""
+
+    async def fake_fetch_bytes(_client, _url: str) -> bytes:
+        nonlocal fetch_bytes_calls
+        fetch_bytes_calls += 1
+        return b"%PDF-new"
+
+    crawler._fetch_text = fake_fetch_text  # type: ignore[method-assign]
+    crawler._fetch_bytes = fake_fetch_bytes  # type: ignore[method-assign]
+
+    result = asyncio.run(crawler.crawl_once())
+
+    assert result["discovered"] == 0
+    assert result["skipped"] == 1
+    assert result["inserted"] == 0
+    assert result["errors"] == 0
+    assert detail_fetch_calls == 0
+    assert fetch_bytes_calls == 0
+    assert repo.status()["total_reports"] == 1
 
 
 def test_llm_fact_refine_updates_when_enabled(tmp_path: Path) -> None:
@@ -623,7 +1491,6 @@ def test_llm_fact_refine_updates_when_enabled(tmp_path: Path) -> None:
     crawler = NaverSecuritiesCrawler(
         config=NaverReportCrawlerConfig(
             db_path=str(tmp_path / "reports.db"),
-            llm_bridge_url="https://example.com/v1/chat",
             llm_facts_enabled=True,
         ),
         repository=repo,
@@ -638,15 +1505,55 @@ def test_llm_fact_refine_updates_when_enabled(tmp_path: Path) -> None:
             ),
         }
 
-    crawler._llm_bridge.complete = fake_complete
+    crawler._codex_runtime.complete = fake_complete
     facts = {"rating": "UNKNOWN", "target_price": {"value": 0}}
 
     result = asyncio.run(
-        crawler._refine_structured_facts_via_bridge(facts=facts, text="본문")
+        crawler._refine_structured_facts_via_native(facts=facts, text="본문")
     )
 
     assert result["rating"] == "BUY"
     assert result["target_price"]["value"] == 88000
+
+
+def test_llm_fact_refine_uses_ephemeral_native_thread(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    crawler = NaverSecuritiesCrawler(
+        config=NaverReportCrawlerConfig(
+            db_path=str(tmp_path / "reports.db"),
+            llm_facts_enabled=True,
+        ),
+        repository=repo,
+    )
+    seen_payload: dict = {}
+
+    async def fake_complete(payload, **_kwargs):
+        seen_payload.update(payload)
+        return {
+            "ok": True,
+            "content": (
+                '{"rating":"HOLD","target_price":{"value":0,'
+                '"currency":"KRW","changed":"UNKNOWN"}}'
+            ),
+        }
+
+    crawler._codex_runtime.complete = fake_complete
+
+    asyncio.run(
+        crawler._refine_structured_facts_via_native(
+            facts={"rating": "UNKNOWN", "target_price": {"value": 0}},
+            text="본문",
+        )
+    )
+
+    assert seen_payload["native_thread_mode"] == "ephemeral"
+    assert seen_payload["telemetry"] == {
+        "component": "research_reports",
+        "operation": "report_fact_extraction",
+    }
+    assert seen_payload["jue_workflow"] == {
+        "workflow_id": "report_fact_extraction",
+    }
 
 
 def test_symbol_directory_upsert_and_resolve(tmp_path: Path) -> None:
@@ -662,6 +1569,631 @@ def test_symbol_directory_upsert_and_resolve(tmp_path: Path) -> None:
     assert repo.get_symbol_name("005930") == "삼성전자"
     out = repo.resolve_symbol_names(["005930", "000660"])
     assert out == {"005930": "삼성전자"}
+
+
+def test_resolve_symbol_from_query_text_uses_name_or_code(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.upsert_symbol_directory(
+        symbol="000660",
+        company_name="SK하이닉스",
+        market="KOSPI",
+        source="test",
+        confidence=0.95,
+    )
+
+    by_name = repo.resolve_symbol_from_text("SK 하이닉스 HBM 리포트")
+    by_code = repo.resolve_symbol_from_text("000660 HBM 리포트")
+
+    assert by_name is not None
+    assert by_name["symbol"] == "000660"
+    assert by_name["company_name"] == "SK하이닉스"
+    assert by_name["match_type"] == "company_name"
+    assert by_code is not None
+    assert by_code["symbol"] == "000660"
+    assert by_code["match_type"] == "symbol"
+
+
+def test_report_symbol_links_store_etf_mentions(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    report_id = repo.upsert_report(
+        category="invest_info",
+        source_url="https://finance.naver.com/research/invest_read.naver?nid=1",
+        detail_url="https://finance.naver.com/research/invest_read.naver?nid=1",
+        pdf_url="https://example.com/etf.pdf",
+        pdf_sha256="etfhash",
+        pdf_archived_path="",
+        title="ETF 전략: KODEX 200과 TIGER 200 점검",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-05-18",
+        crawled_at="2026-05-18T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="KODEX 200(069500), TIGER 200(102110)을 중심으로 코어 ETF 비중을 점검한다.",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    repo.upsert_report_symbol_links(
+        report_id,
+        [
+            {
+                "symbol": "069500",
+                "name": "KODEX 200",
+                "asset_class": "etf",
+                "link_type": "mention",
+                "source": "text_extract",
+                "confidence": 0.95,
+                "evidence": "KODEX 200(069500)",
+            },
+            {
+                "symbol": "102110",
+                "name": "TIGER 200",
+                "asset_class": "etf",
+                "link_type": "mention",
+                "source": "text_extract",
+                "confidence": 0.95,
+                "evidence": "TIGER 200(102110)",
+            },
+        ],
+    )
+
+    links = repo.list_report_symbol_links(report_id)
+    assert [item["symbol"] for item in links] == ["069500", "102110"]
+    assert repo.search(query="", symbol="069500", limit=5)[0]["report_id"] == report_id
+
+
+def test_report_symbol_links_reject_stock_name_code_mismatch(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.upsert_symbol_directory(
+        symbol="005930",
+        company_name="삼성전자",
+        market="KOSPI",
+        source="pykrx",
+        confidence=1.0,
+    )
+    report_id = repo.upsert_report(
+        category="market_info",
+        source_url="https://finance.naver.com/research/market_info_list.naver",
+        detail_url="https://finance.naver.com/research/market_info_read.naver?nid=12",
+        pdf_url="https://stock.pstatic.net/stock-research/market/mismatch.pdf",
+        pdf_sha256="mismatch",
+        pdf_archived_path="",
+        title="오염 링크 점검",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-05-18",
+        crawled_at="2026-05-18T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="오염 링크 점검",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    written = repo.upsert_report_symbol_links(
+        report_id,
+        [
+            {
+                "symbol": "005930",
+                "name": "솔루엠",
+                "asset_class": "stock",
+                "link_type": "mention",
+                "source": "text_extract",
+                "confidence": 0.85,
+                "evidence": "솔루엠 (005930)",
+            }
+        ],
+    )
+
+    assert written == 0
+    assert repo.list_report_symbol_links(report_id) == []
+
+
+def test_extract_report_symbol_links_skips_conflicting_name_near_code() -> None:
+    links = _extract_report_symbol_links(
+        "이번 자료는 솔루엠 (005930) 실적을 점검한다.",
+        symbol_names={"005930": "삼성전자"},
+        asset_class_by_symbol={"005930": "stock"},
+        published_at="2026-05-18",
+    )
+
+    assert links == []
+
+
+def test_extract_report_symbol_links_accepts_short_alias_before_code() -> None:
+    links = _extract_report_symbol_links(
+        "Top picks KB금융(105560)ⅠBUYⅠTP 200,000원 하나금융(086790)ⅠBUYⅠTP 157,000원",
+        symbol_names={
+            "105560": "KB금융",
+            "086790": "하나금융지주",
+        },
+        asset_class_by_symbol={
+            "105560": "stock",
+            "086790": "stock",
+        },
+        published_at="2026-05-19",
+    )
+
+    by_symbol = {row["symbol"]: row for row in links}
+    assert by_symbol["105560"]["name"] == "KB금융"
+    assert by_symbol["086790"]["name"] == "하나금융지주"
+
+
+def test_seed_etf_universe_into_symbol_directory(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+
+    updated = repo.seed_symbol_directory(
+        [
+            {
+                "symbol": "069500",
+                "name": "KODEX 200",
+                "market": "ETF",
+                "source": "configured_etf",
+            },
+            {
+                "symbol": "102110",
+                "name": "TIGER 200",
+                "market": "ETF",
+                "source": "configured_etf",
+            },
+        ]
+    )
+
+    assert updated == 2
+    assert repo.resolve_symbol_names(["069500", "102110"]) == {
+        "069500": "KODEX 200",
+        "102110": "TIGER 200",
+    }
+
+
+def test_extract_report_symbol_links_for_etfs() -> None:
+    symbol_names = {
+        "069500": "KODEX 200",
+        "102110": "TIGER 200",
+        "091160": "KODEX 반도체",
+    }
+
+    links = _extract_report_symbol_links(
+        "ETF 전략: KODEX 200(069500), TIGER 200 ETF. 단순 ETF 단어는 코드가 아니다.",
+        symbol_names=symbol_names,
+        asset_class_by_symbol={code: "etf" for code in symbol_names},
+        published_at="2026-05-18",
+    )
+
+    assert [item["symbol"] for item in links] == ["069500", "102110"]
+    assert links[0]["confidence"] >= 0.9
+    assert all(item["asset_class"] == "etf" for item in links)
+
+    compact_links = _extract_report_symbol_links(
+        "KODEX200 비중 확대를 검토한다.",
+        symbol_names=symbol_names,
+        asset_class_by_symbol={code: "etf" for code in symbol_names},
+    )
+    assert [item["symbol"] for item in compact_links] == ["069500"]
+
+
+def test_extract_report_symbol_links_prefers_longer_etf_names() -> None:
+    symbol_names = {
+        "069500": "KODEX 200",
+        "252670": "KODEX 200선물인버스2X",
+    }
+
+    links = _extract_report_symbol_links(
+        "KODEX 200선물인버스2X 변동성을 점검한다.",
+        symbol_names=symbol_names,
+        asset_class_by_symbol={code: "etf" for code in symbol_names},
+    )
+
+    assert [item["symbol"] for item in links] == ["252670"]
+
+
+def test_extract_report_symbol_links_avoids_short_stock_name_noise() -> None:
+    symbol_names = {
+        "000660": "SK하이닉스",
+        "034730": "SK",
+        "452400": "이닉스",
+        "037370": "EG",
+        "001680": "대상",
+        "003550": "LG",
+    }
+
+    links = _extract_report_symbol_links(
+        "SK하이닉스 (000660)는 HBM 중심으로 실적 회복이 진행 중이다.",
+        symbol_names=symbol_names,
+        published_at="2026-06-02",
+    )
+
+    assert [item["symbol"] for item in links] == ["000660"]
+
+    coded_short_name_links = _extract_report_symbol_links(
+        "LG(003550)는 지주회사 할인율을 점검한다.",
+        symbol_names=symbol_names,
+        published_at="2026-06-02",
+    )
+
+    assert [item["symbol"] for item in coded_short_name_links] == ["003550"]
+
+
+def test_upsert_report_auto_links_etf_mentions(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.seed_symbol_directory(
+        [
+            {
+                "symbol": "069500",
+                "name": "KODEX 200",
+                "market": "ETF",
+                "source": "configured_etf",
+            }
+        ]
+    )
+
+    report_id = repo.upsert_report(
+        category="invest_info",
+        source_url="https://finance.naver.com/research/invest_read.naver?nid=10",
+        detail_url="https://finance.naver.com/research/invest_read.naver?nid=10",
+        pdf_url="https://example.com/kodex200.pdf",
+        pdf_sha256="kodexhash",
+        pdf_archived_path="",
+        title="ETF 전략",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-05-18",
+        crawled_at="2026-05-18T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="KODEX 200(069500) 비중을 점검한다.",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    links = repo.list_report_symbol_links(report_id)
+    assert links[0]["symbol"] == "069500"
+    assert repo.search(query="", symbol="069500", limit=5)[0]["report_id"] == report_id
+
+
+def test_list_chunks_for_rag_includes_linked_etf_metadata(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.seed_symbol_directory(
+        [
+            {
+                "symbol": "069500",
+                "name": "KODEX 200",
+                "market": "ETF",
+                "source": "configured_etf",
+            }
+        ]
+    )
+
+    report_id = repo.upsert_report(
+        category="invest_info",
+        source_url="https://finance.naver.com/research/invest_read.naver?nid=13",
+        detail_url="https://finance.naver.com/research/invest_read.naver?nid=13",
+        pdf_url="https://example.com/kodex200-rag.pdf",
+        pdf_sha256="kodexraghash",
+        pdf_archived_path="",
+        title="ETF 전략",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-05-18",
+        crawled_at="2026-05-18T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="KODEX 200(069500) 비중을 점검한다.",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    chunks = repo.list_chunks_for_rag(limit=10)
+    chunk = next(row for row in chunks if row["report_id"] == report_id)
+
+    assert chunk["symbol"] == ""
+    assert chunk["linked_symbols"] == "069500"
+    assert chunk["linked_names"] == "KODEX 200"
+    assert chunk["linked_asset_classes"] == "etf"
+
+
+def test_list_chunks_for_rag_filters_by_report_updated_since(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+
+    old_report_id = repo.upsert_report(
+        category="market_info",
+        source_url="https://finance.naver.com/research/market_info_list.naver",
+        detail_url="https://finance.naver.com/research/market_info_read.naver?nid=old",
+        pdf_url="https://example.com/old.pdf",
+        pdf_sha256="oldhash",
+        pdf_archived_path="",
+        title="오래된 시황",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-06-01",
+        crawled_at="2026-06-01T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="오래된 청크",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+    new_report_id = repo.upsert_report(
+        category="market_info",
+        source_url="https://finance.naver.com/research/market_info_list.naver",
+        detail_url="https://finance.naver.com/research/market_info_read.naver?nid=new",
+        pdf_url="https://example.com/new.pdf",
+        pdf_sha256="newhash",
+        pdf_archived_path="",
+        title="새로운 시황",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-06-30",
+        crawled_at="2026-06-30T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="새로운 청크",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    with repo._connect() as conn:  # noqa: SLF001 - repository timestamp fixture
+        conn.execute(
+            "UPDATE reports SET updated_at = ? WHERE report_id = ?",
+            ("2026-06-01T00:00:00+00:00", old_report_id),
+        )
+        conn.execute(
+            "UPDATE reports SET updated_at = ? WHERE report_id = ?",
+            ("2026-06-30T10:00:00+00:00", new_report_id),
+        )
+
+    chunks = repo.list_chunks_for_rag(
+        limit=10,
+        updated_since="2026-06-30T09:00:00+00:00",
+    )
+
+    assert [row["report_id"] for row in chunks] == [new_report_id]
+
+
+def test_search_symbol_matches_primary_and_linked_reports(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.seed_symbol_directory(
+        [
+            {
+                "symbol": "069500",
+                "name": "KODEX 200",
+                "market": "ETF",
+                "source": "configured_etf",
+            }
+        ]
+    )
+    primary_id = repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_read.naver?nid=20",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=20",
+        pdf_url="https://example.com/kodex-primary.pdf",
+        pdf_sha256="kodexprimaryhash",
+        pdf_archived_path="",
+        title="KODEX 200 리포트",
+        company_name="KODEX 200",
+        broker="테스트증권",
+        analyst="",
+        symbol="069500",
+        published_at="2026-05-19",
+        crawled_at="2026-05-19T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="KODEX 200 직접 분석",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+    linked_id = repo.upsert_report(
+        category="invest_info",
+        source_url="https://finance.naver.com/research/invest_read.naver?nid=21",
+        detail_url="https://finance.naver.com/research/invest_read.naver?nid=21",
+        pdf_url="https://example.com/kodex-linked.pdf",
+        pdf_sha256="kodexlinkedhash",
+        pdf_archived_path="",
+        title="ETF 전략",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-05-18",
+        crawled_at="2026-05-18T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="KODEX 200(069500) 비중을 점검한다.",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    rows = repo.search(query="", symbol="069500", limit=10)
+
+    assert {row["report_id"] for row in rows} == {primary_id, linked_id}
+
+
+def test_upsert_report_replaces_stale_generated_symbol_links(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.seed_symbol_directory(
+        [
+            {
+                "symbol": "069500",
+                "name": "KODEX 200",
+                "market": "ETF",
+                "source": "configured_etf",
+            },
+            {
+                "symbol": "102110",
+                "name": "TIGER 200",
+                "market": "ETF",
+                "source": "configured_etf",
+            },
+            {
+                "symbol": "091160",
+                "name": "KODEX 반도체",
+                "market": "ETF",
+                "source": "configured_etf",
+            },
+        ]
+    )
+
+    report_id = repo.upsert_report(
+        category="invest_info",
+        source_url="https://finance.naver.com/research/invest_read.naver?nid=12",
+        detail_url="https://finance.naver.com/research/invest_read.naver?nid=12",
+        pdf_url="https://example.com/relinked-etf.pdf",
+        pdf_sha256="relinkedhash",
+        pdf_archived_path="",
+        title="ETF 전략",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-05-18",
+        crawled_at="2026-05-18T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="KODEX 200(069500) 비중을 점검한다.",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+    repo.upsert_report_symbol_links(
+        report_id,
+        [
+            {
+                "symbol": "091160",
+                "name": "KODEX 반도체",
+                "asset_class": "etf",
+                "link_type": "manual",
+                "source": "manual",
+                "confidence": 1.0,
+                "evidence": "사용자 지정",
+            }
+        ],
+    )
+
+    repo.upsert_report(
+        category="invest_info",
+        source_url="https://finance.naver.com/research/invest_read.naver?nid=12",
+        detail_url="https://finance.naver.com/research/invest_read.naver?nid=12",
+        pdf_url="https://example.com/relinked-etf.pdf",
+        pdf_sha256="relinkedhash",
+        pdf_archived_path="",
+        title="ETF 전략",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-05-18",
+        crawled_at="2026-05-18T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="TIGER 200(102110) 비중을 점검한다.",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    links = repo.list_report_symbol_links(report_id)
+
+    assert [item["symbol"] for item in links] == ["091160", "102110"]
+    assert {item["symbol"]: item["source"] for item in links} == {
+        "091160": "manual",
+        "102110": "text_extract",
+    }
+    assert repo.search(query="", symbol="069500", limit=5) == []
+    assert repo.search(query="", symbol="102110", limit=5)[0]["report_id"] == report_id
+
+
+def test_backfill_report_symbol_links_is_idempotent_for_existing_etf_report(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.seed_symbol_directory(
+        [
+            {
+                "symbol": "069500",
+                "name": "KODEX 200",
+                "market": "ETF",
+                "source": "configured_etf",
+            }
+        ]
+    )
+    report_id = repo.upsert_report(
+        category="invest_info",
+        source_url="https://finance.naver.com/research/invest_read.naver?nid=11",
+        detail_url="https://finance.naver.com/research/invest_read.naver?nid=11",
+        pdf_url="https://example.com/backfill-kodex200.pdf",
+        pdf_sha256="backfillkodexhash",
+        pdf_archived_path="",
+        title="ETF 전략",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-05-18",
+        crawled_at="2026-05-18T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="KODEX 200(069500) ETF 비중을 점검한다.",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    first = repo.backfill_report_symbol_links()
+    second = repo.backfill_report_symbol_links()
+    links = repo.list_report_symbol_links(report_id)
+
+    assert first["updated_reports"] == 1
+    assert second["updated_reports"] == 1
+    assert [item["symbol"] for item in links] == ["069500"]
+    assert repo.status()["etf_link_count"] == 1
+
+
+def test_backfill_report_symbol_links_supports_stock_industry_reports(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.seed_symbol_directory(
+        [
+            {
+                "symbol": "105560",
+                "name": "KB금융",
+                "market": "KOSPI",
+                "source": "krx",
+            },
+            {
+                "symbol": "086790",
+                "name": "하나금융지주",
+                "market": "KOSPI",
+                "source": "krx",
+            },
+        ]
+    )
+    report_id = repo.upsert_report(
+        category="industry_analysis",
+        source_url="https://finance.naver.com/research/industry_read.naver?nid=22",
+        detail_url="https://finance.naver.com/research/industry_read.naver?nid=22",
+        pdf_url="https://example.com/backfill-bank-top-picks.pdf",
+        pdf_sha256="backfillbanktoppickshash",
+        pdf_archived_path="",
+        title="Top picks KB금융(105560) 하나금융(086790) 은행 업종 전략",
+        company_name="",
+        broker="테스트증권",
+        analyst="",
+        symbol="",
+        published_at="2026-05-19",
+        crawled_at="2026-05-19T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="은행 업종 Top picks KB금융(105560)과 하나금융(086790)을 점검한다.",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+    with repo._connect() as conn:
+        conn.execute("DELETE FROM report_symbol_links WHERE report_id = ?", (report_id,))
+
+    backfill = repo.backfill_report_symbol_links(asset_class="stock")
+    links = repo.list_report_symbol_links(report_id)
+
+    assert backfill["updated_reports"] == 1
+    assert [item["symbol"] for item in links] == ["105560", "086790"]
 
 
 def test_upsert_report_backfills_symbol_directory(tmp_path: Path) -> None:
@@ -728,6 +2260,112 @@ def test_upsert_report_prefers_exact_title_identity_over_stale_directory(
     assert detail["symbol"] == "005930"
     assert detail["company_name"] == "삼성전자"
     assert repo.get_symbol_name("005930") == "삼성전자"
+
+
+def test_upsert_report_corrects_wrong_supplied_symbol_from_title_identity(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.upsert_symbol_directory(
+        symbol="005930",
+        company_name="삼성전자",
+        market="KOSPI",
+        source="pykrx",
+        confidence=1.0,
+    )
+    repo.upsert_symbol_directory(
+        symbol="020000",
+        company_name="한섬",
+        market="KOSPI",
+        source="pykrx",
+        confidence=1.0,
+    )
+
+    report_id = repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=121",
+        pdf_url="https://stock.pstatic.net/stock-research/company/121.pdf",
+        pdf_sha256="abc121",
+        pdf_archived_path=".runtime/naver_reports/pdfs/ab/c1/abc121.pdf",
+        title="한섬 (020000) 소비 회복을 기다리는 구간",
+        company_name="한섬",
+        broker="테스트증권",
+        analyst="홍길동",
+        symbol="005930",
+        published_at="2026-05-06",
+        crawled_at="2026-05-06T00:00:00+00:00",
+        content_source="pdf_extract",
+        content="한섬 (020000) 의류 업황 회복과 재고 정상화를 점검한다.",
+        chunk_size=200,
+        max_chunks_per_report=10,
+    )
+
+    detail = repo.get_report(report_id)
+
+    assert detail is not None
+    assert detail["symbol"] == "020000"
+    assert detail["company_name"] == "한섬"
+    assert repo.get_symbol_name("005930") == "삼성전자"
+    assert repo.get_symbol_name("020000") == "한섬"
+
+
+def test_symbol_directory_authoritative_source_repairs_polluted_verified_name(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.upsert_symbol_directory(
+        symbol="005930",
+        company_name="비나텍",
+        source="metadata_repair",
+        confidence=1.0,
+    )
+
+    repo.upsert_symbol_directory(
+        symbol="005930",
+        company_name="삼성전자",
+        market="KOSPI",
+        source="pykrx",
+        confidence=1.0,
+    )
+
+    assert repo.get_symbol_name("005930") == "삼성전자"
+
+
+def test_repair_metadata_quality_replaces_polluted_naver_directory_name_at_same_confidence(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.upsert_symbol_directory(
+        symbol="064350",
+        company_name="것들",
+        source="naver_reports",
+        confidence=1.0,
+    )
+
+    repo.upsert_report(
+        category="company_analysis",
+        source_url="https://finance.naver.com/research/company_list.naver",
+        detail_url="https://finance.naver.com/research/company_read.naver?nid=64350",
+        pdf_url="https://stock.pstatic.net/stock-research/company/64350.pdf",
+        pdf_sha256="abc64350",
+        pdf_archived_path=".runtime/naver_reports/pdfs/ab/c1/abc64350.pdf",
+        title="(064350) 현대로템 2026.06.01 창원 공장 투어에서 보고 온 것들",
+        company_name="것들",
+        broker="유진투자증권",
+        analyst="홍길동",
+        symbol="064350",
+        published_at="2026-06-01",
+        crawled_at="2026-06-03T00:05:05+00:00",
+        content_source="pdf_extract",
+        content="(064350) 현대로템 2026.06.01 창원 공장 투어에서 보고 온 것들 투자의견 BUY",
+        chunk_size=2000,
+        max_chunks_per_report=2,
+    )
+
+    repo.repair_metadata_quality()
+
+    assert repo.get_symbol_name("064350") == "현대로템"
 
 
 def test_upsert_report_keeps_authoritative_krx_directory_name(
@@ -979,6 +2617,15 @@ def test_repair_metadata_quality_backfills_company_identity_from_content(
         chunk_size=200,
         max_chunks_per_report=10,
     )
+    with repo._connect() as conn:
+        conn.execute(
+            """
+            UPDATE reports
+            SET symbol = '', company_name = '', analyst = ''
+            WHERE report_id = ?
+            """,
+            (report_id,),
+        )
 
     repair = repo.repair_metadata_quality()
     detail = repo.get_report(report_id)
@@ -1022,6 +2669,15 @@ def test_repair_metadata_quality_corrects_stale_company_identity(
         chunk_size=200,
         max_chunks_per_report=10,
     )
+    with repo._connect() as conn:
+        conn.execute(
+            """
+            UPDATE reports
+            SET symbol = ?, company_name = ?
+            WHERE report_id = ?
+            """,
+            ("005930", "삼성전자", report_id),
+        )
 
     repair = repo.repair_metadata_quality()
     detail = repo.get_report(report_id)
@@ -1113,6 +2769,15 @@ def test_repair_metadata_quality_backfills_broker_and_technical_report_analyst(
         chunk_size=200,
         max_chunks_per_report=10,
     )
+    with repo._connect() as conn:
+        conn.execute(
+            """
+            UPDATE reports
+            SET symbol = '', company_name = '', broker = '', analyst = ''
+            WHERE report_id = ?
+            """,
+            (report_id,),
+        )
 
     repair = repo.repair_metadata_quality()
     detail = repo.get_report(report_id)

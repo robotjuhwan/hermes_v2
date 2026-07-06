@@ -1,0 +1,23 @@
+{
+  "workflow_id": "block_reflection",
+  "version": 1,
+  "scope": "shared",
+  "model_policy": {
+    "default_model": "settings.llm_model",
+    "default_reasoning_effort": "settings.llm_reasoning_effort",
+    "expected_runtime_model": "gpt-5.5",
+    "expected_reasoning_effort": "xhigh"
+  },
+  "cadence": {"kind": "event_driven"},
+  "required_skills": ["execution_review", "thesis_tracker", "policy_revision"],
+  "required_context": ["block", "orders", "events", "quotes", "investment_memory", "performance"],
+  "output_contracts": ["reflection_contract", "policy_revision_contract"],
+  "authority": {
+    "can_read_untrusted_research": false,
+    "can_write_memory": true,
+    "can_create_blocks": false,
+    "can_submit_orders": false
+  },
+  "safety_gates": ["closed_or_stale_block", "memory_write_allowed", "reflection_contract", "no_order_submission", "no_block_creation"],
+  "prompt_budget": {"max_skill_chars": 5200, "max_workflow_chars": 1600, "max_contract_chars": 5200}
+}

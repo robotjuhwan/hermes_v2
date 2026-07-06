@@ -5,6 +5,12 @@ from fastapi.testclient import TestClient
 from tradecraft import main
 
 
+def _admin_headers(monkeypatch) -> dict[str, str]:
+    monkeypatch.setattr(main.settings, "admin_token", "test-admin")
+    monkeypatch.setattr(main.settings, "admin_tokens", "")
+    return {"Authorization": "Bearer test-admin"}
+
+
 def test_reports_status_endpoint(monkeypatch) -> None:
     monkeypatch.setattr(
         main.naver_report_repository,
@@ -76,7 +82,10 @@ def test_reports_crawl_once_endpoint(monkeypatch) -> None:
     monkeypatch.setattr(main.settings, "rag_enabled", False)
 
     with TestClient(main.app) as client:
-        response = client.post("/api/reports/crawl-once")
+        response = client.post(
+            "/api/reports/crawl-once",
+            headers=_admin_headers(monkeypatch),
+        )
 
     assert response.status_code == 200
     payload = response.json()
@@ -96,6 +105,7 @@ def test_reports_repair_metadata_endpoint(monkeypatch) -> None:
         response = client.post(
             "/api/reports/repair-metadata",
             params={"sync_rag_after": False},
+            headers=_admin_headers(monkeypatch),
         )
 
     assert response.status_code == 200
@@ -125,11 +135,13 @@ def test_rag_sync_endpoint(monkeypatch) -> None:
             docs: list[dict],
             *,
             force_update: bool = False,
+            prune_missing: bool = False,
         ) -> dict:
             return {
                 "status": "ok",
                 "synced": len(docs),
                 "force_update": force_update,
+                "prune_missing": prune_missing,
             }
 
     monkeypatch.setattr(main.settings, "rag_enabled", True)
@@ -145,7 +157,7 @@ def test_rag_sync_endpoint(monkeypatch) -> None:
     )
 
     with TestClient(main.app) as client:
-        response = client.post("/api/rag/sync")
+        response = client.post("/api/rag/sync", headers=_admin_headers(monkeypatch))
 
     assert response.status_code == 200
     payload = response.json()
@@ -154,6 +166,7 @@ def test_rag_sync_endpoint(monkeypatch) -> None:
     assert payload["result"]["status"] == "ok"
     assert payload["result"]["synced"] == 2
     assert payload["result"]["force_update"] is False
+    assert payload["result"]["prune_missing"] is False
 
 
 def test_rag_search_uses_default_top_k(monkeypatch) -> None:
@@ -191,6 +204,55 @@ def test_rag_search_uses_default_top_k(monkeypatch) -> None:
     assert called["limit"] == 13
 
 
+def test_rag_search_resolves_symbol_from_query_text(monkeypatch) -> None:
+    called: dict[str, str] = {"symbol": ""}
+
+    class _FakeRAGStore:
+        def query(
+            self,
+            query: str,
+            symbol: str = "",
+            limit: int = 8,
+            broker: str = "",
+            doc_id: str = "",
+            date_from: str = "",
+            date_to: str = "",
+        ) -> list[dict]:
+            _ = (query, limit, broker, doc_id, date_from, date_to)
+            called["symbol"] = symbol
+            return [
+                {
+                    "content": "SK하이닉스 HBM 리포트",
+                    "symbol": symbol,
+                    "report_id": 660,
+                    "chunk_index": 0,
+                }
+            ]
+
+    monkeypatch.setattr(main.settings, "rag_enabled", True)
+    monkeypatch.setattr(main, "rag_store", _FakeRAGStore())
+    monkeypatch.setattr(
+        main.naver_report_repository,
+        "resolve_symbol_from_text",
+        lambda text: {
+            "symbol": "000660",
+            "company_name": "SK하이닉스",
+            "confidence": 1.0,
+        },
+        raising=False,
+    )
+
+    with TestClient(main.app) as client:
+        response = client.get("/api/rag/search", params={"query": "SK하이닉스 HBM"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 1
+    assert called["symbol"] == "000660"
+    assert payload["auto_symbol"]["symbol"] == "000660"
+    assert payload["auto_symbol"]["company_name"] == "SK하이닉스"
+
+
 def test_research_ask_endpoint(monkeypatch) -> None:
     monkeypatch.setattr(
         main.naver_report_repository,
@@ -222,6 +284,21 @@ def test_research_ask_endpoint(monkeypatch) -> None:
         else None,
     )
 
+    class _FailingBridge:
+        ready = True
+        resolved_model = "gpt-5.5"
+
+        async def complete(
+            self,
+            payload: dict,
+            timeout_ms: int | None = None,
+        ) -> dict:
+            _ = (payload, timeout_ms)
+            return {"ok": False, "error": "codex_native_timeout"}
+
+    monkeypatch.setattr(main.settings, "rag_enabled", False)
+    monkeypatch.setattr(main, "helper_codex_runtime", _FailingBridge())
+
     with TestClient(main.app) as client:
         response = client.get(
             "/api/research/ask",
@@ -230,14 +307,21 @@ def test_research_ask_endpoint(monkeypatch) -> None:
                 "symbol": "005930",
                 "limit": 5,
             },
+            headers=_admin_headers(monkeypatch),
         )
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["count"] == 1
+    assert payload["mode"] == "llm_error_source_draft"
+    assert payload["source_draft"] is True
+    assert payload["llm_error"] is True
+    assert payload["llm_error_mode"] == "llm_error"
+    assert payload["llm_error_message"] == "codex_native_timeout"
     assert "요약(3줄)" in payload["answer"]
     assert "핵심 근거(인용 포함)" in payload["answer"]
+    assert "LLM 응답 실패: codex_native_timeout" in payload["limitations"]
     assert payload["citations"]
 
 
@@ -312,19 +396,20 @@ def test_helper_ask_endpoint_uses_llm_and_rag(monkeypatch) -> None:
                 "ok": True,
                 "content": (
                     '{"answer_md":"근거 기반 답변입니다.","confidence":"high",'
-                    '"followups":["리스크만 다시 보기"],"limitations":["정보 제공용"]}'
+                    '"followups":["리스크만 다시 보기"],"limitations":["실거래 판단용"]}'
                 ),
                 "usage": {"total_tokens": 42},
             }
 
     monkeypatch.setattr(main.settings, "rag_enabled", True)
     monkeypatch.setattr(main, "rag_store", _FakeRAG())
-    monkeypatch.setattr(main, "helper_llm_bridge", _FakeBridge())
+    monkeypatch.setattr(main, "helper_codex_runtime", _FakeBridge())
 
     with TestClient(main.app) as client:
         response = client.post(
             "/api/helper/ask",
             json={"query": "삼성전자 긍정 근거", "symbol": "005930", "limit": 5},
+            headers=_admin_headers(monkeypatch),
         )
 
     assert response.status_code == 200
@@ -336,6 +421,63 @@ def test_helper_ask_endpoint_uses_llm_and_rag(monkeypatch) -> None:
     assert payload["count"] == 1
     assert payload["rag_count"] == 1
     assert payload["followups"] == ["리스크만 다시 보기"]
+
+
+def test_helper_ask_endpoint_surfaces_llm_failure_without_deterministic_answer(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main.naver_report_repository,
+        "search",
+        lambda query, symbol, category, limit: [
+            {
+                "report_id": 31,
+                "title": "삼성전자 업황 점검",
+                "broker": "테스트증권",
+                "symbol": symbol or "005930",
+                "published_at": "2026-04-30",
+                "snippet": "메모리 가격 회복과 AI 서버 수요가 핵심 근거",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main.naver_report_repository,
+        "get_report_facts",
+        lambda report_id: {
+            "rating": "BUY",
+            "summary_bullets": ["AI 서버 수요와 메모리 가격 개선"],
+            "risks": ["환율과 재고 조정"],
+            "evidence_quotes": [{"page": 3, "tag": "summary", "text": "AI 서버 수요"}],
+        }
+        if int(report_id) == 31
+        else None,
+    )
+
+    class _FailingBridge:
+        ready = True
+        resolved_model = "gpt-5.5"
+
+        async def complete(
+            self,
+            payload: dict,
+            timeout_ms: int | None = None,
+        ) -> dict:
+            _ = (payload, timeout_ms)
+            return {"ok": False, "error": "codex_native_timeout"}
+
+    monkeypatch.setattr(main.settings, "rag_enabled", False)
+    monkeypatch.setattr(main, "helper_codex_runtime", _FailingBridge())
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/helper/ask",
+            json={"query": "삼성전자 긍정 근거", "symbol": "005930", "limit": 5},
+            headers=_admin_headers(monkeypatch),
+        )
+
+    assert response.status_code == 502
+    payload = response.json()
+    assert payload["detail"]["status"] == "error"
+    assert payload["detail"]["mode"] == "llm_error"
+    assert payload["detail"]["error_message"] == "codex_native_timeout"
 
 
 def test_portfolio_coach_review_queue_endpoints(monkeypatch) -> None:
@@ -378,13 +520,18 @@ def test_portfolio_coach_review_queue_endpoints(monkeypatch) -> None:
     monkeypatch.setattr(main.telegram, "send_message", _send_message)
 
     with TestClient(main.app) as client:
-        queue_res = client.get("/api/portfolio-coach/review-queue")
+        headers = _admin_headers(monkeypatch)
+        queue_res = client.get(
+            "/api/portfolio-coach/review-queue",
+            headers=headers,
+        )
         assert queue_res.status_code == 200
         assert queue_res.json()["count"] == 1
 
         approve_res = client.post(
             "/api/portfolio-coach/review-queue/101/approve",
             json={"review_note": "ok"},
+            headers=headers,
         )
         assert approve_res.status_code == 200
         assert approve_res.json()["sent"] is True
@@ -392,6 +539,7 @@ def test_portfolio_coach_review_queue_endpoints(monkeypatch) -> None:
         reject_res = client.post(
             "/api/portfolio-coach/review-queue/101/reject",
             json={"review_note": "hold"},
+            headers=headers,
         )
         assert reject_res.status_code == 200
         assert reject_res.json()["updated"] is True

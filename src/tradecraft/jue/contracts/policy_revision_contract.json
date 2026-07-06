@@ -1,0 +1,14 @@
+{
+  "contract_id": "policy_revision_contract",
+  "version": 1,
+  "required": ["policy_id", "scope", "action", "effect", "sample_count", "confidence", "reason_md"],
+  "allowed_actions": ["observe", "promote_caution", "promote_preference", "deprecate", "keep"],
+  "allowed_effect_keys": ["sizing", "confirmation", "target_stop", "min_reward_risk", "max_stop_risk_pct", "waiting_entry", "review_cadence", "lane_choice", "portfolio_balance"],
+  "reject_when": [
+    "missing_policy_id",
+    "hard_ban_policy",
+    "confidence_outside_0_1",
+    "sample_count_negative",
+    "missing_reason"
+  ]
+}

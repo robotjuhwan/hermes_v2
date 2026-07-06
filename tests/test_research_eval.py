@@ -8,6 +8,12 @@ from fastapi.testclient import TestClient
 from tradecraft import main
 
 
+def _admin_headers(monkeypatch) -> dict[str, str]:
+    monkeypatch.setattr(main.settings, "admin_token", "test-admin")
+    monkeypatch.setattr(main.settings, "admin_tokens", "")
+    return {"Authorization": "Bearer test-admin"}
+
+
 def test_research_citation_eval_cases(monkeypatch) -> None:
     monkeypatch.setattr(
         main.naver_report_repository,
@@ -56,6 +62,7 @@ def test_research_citation_eval_cases(monkeypatch) -> None:
                     "symbol": str(case.get("symbol") or ""),
                     "limit": 5,
                 },
+                headers=_admin_headers(monkeypatch),
             )
             assert response.status_code == 200
             payload = response.json()

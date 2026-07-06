@@ -19,15 +19,24 @@ def test_runtime_engine_builds_snapshot_with_runtime_metadata() -> None:
         },
     ]
 
-    engine = RuntimeEngine.from_session_rows(rows, base_interval_sec=5)
+    engine = RuntimeEngine.from_session_rows(
+        rows,
+        base_interval_sec=5,
+        session_source="safe_default_no_orders",
+    )
     snapshot = engine.build_snapshot(cycle=15)
 
     assert snapshot["runtime"]["status"] == "running"
     assert snapshot["runtime"]["engine"] == "session_heartbeat"
-    assert snapshot["runtime"]["execution_mode"] == "skeleton_noop"
+    assert snapshot["runtime"]["execution_mode"] == "state_writer_no_orders"
     assert snapshot["runtime"]["executes_orders"] is False
+    assert snapshot["runtime"]["session_source"] == "safe_default_no_orders"
+    assert "session_state_snapshot" in snapshot["runtime"]["managed_capabilities"]
+    assert "strategy_skeleton" not in snapshot["runtime"]["managed_capabilities"]
     assert snapshot["runtime"]["base_interval_sec"] == 5
     assert snapshot["runtime"]["sessions"] == 2
+    assert "kis_trading:kis_block_trader" in snapshot["runtime"]["externalized_capabilities"]
+    assert "kis_trading:kis_trader" not in snapshot["runtime"]["externalized_capabilities"]
     assert len(snapshot["sessions"]) == 2
     assert snapshot["sessions"][0]["status"] == "RUNNING"
     assert snapshot["sessions"][0]["strategy_name"] == "noop_short_term"

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import shlex
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,9 +13,12 @@ from typing import Any
 import httpx
 
 from tradecraft.runtime.state_store import RuntimeStateStore, utc_now_iso
-from tradecraft.services.llm_bridge import LLMBridge, LLMBridgeConfig
+from tradecraft.services.jue_language_policy import jue_language_policy
+from tradecraft.services.codex_native import CodexNativeConfig, CodexNativeRuntime
 from tradecraft.services.naver_reports import NaverReportRepository
 from tradecraft.services.rag_store import RAGStore, RAGStoreConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _strip_html(raw: str) -> str:
@@ -116,7 +121,7 @@ class ResearchPipelineConfig:
     codex_query: str
     codex_timeout_sec: int
     report_urls: list[str]
-    trader_state_path: str = ""
+    kis_block_db_path: str = ""
     report_db_path: str = ""
     report_db_top_k: int = 16
     rag_enabled: bool = False
@@ -125,12 +130,19 @@ class ResearchPipelineConfig:
     rag_query_top_k: int = 8
     max_items: int = 20
     knowledge_max_chars: int = 28000
-    llm_bridge_command: str = ""
-    llm_bridge_args: str = ""
-    llm_bridge_url: str = ""
-    llm_bridge_token: str = ""
-    llm_bridge_timeout_ms: int = 60000
+    codex_runtime_mode: str = "auto"
+    codex_runtime_sdk_codex_bin: str = ""
+    codex_runtime_timeout_ms: int = 60000
     llm_model: str = "gpt-5.5"
+    llm_reasoning_effort: str = "xhigh"
+    llm_usage_enabled: bool = True
+    llm_usage_db_path: str = ".runtime/llm_usage.db"
+    llm_usage_component: str = "research_pipeline"
+    codex_native_thread_mode: str = "daily"
+    codex_native_thread_db_path: str = ".runtime/codex_native_threads.db"
+    codex_native_compact_after_turns: int = 8
+    codex_native_read_turns: bool = False
+    codex_native_developer_instructions_enabled: bool = True
     market_intelligence_sources: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -138,8 +150,6 @@ class ResearchPipeline:
     def __init__(self, config: ResearchPipelineConfig) -> None:
         self.config = config
         self.store = RuntimeStateStore(config.state_path)
-        trader_state = str(config.trader_state_path or "").strip()
-        self.trader_store = RuntimeStateStore(trader_state) if trader_state else None
         db_path = str(config.report_db_path or "").strip()
         self.report_repo = NaverReportRepository(db_path) if db_path else None
         self.rag_store = (
@@ -153,25 +163,34 @@ class ResearchPipeline:
             if bool(config.rag_enabled)
             else None
         )
-        self.llm_bridge = LLMBridge(
-            LLMBridgeConfig(
-                command=config.llm_bridge_command,
-                args=config.llm_bridge_args,
-                url=config.llm_bridge_url,
-                token=config.llm_bridge_token,
-                timeout_ms=config.llm_bridge_timeout_ms,
+        self.codex_runtime = CodexNativeRuntime(
+            CodexNativeConfig(
+                mode=config.codex_runtime_mode,
+                sdk_codex_bin=config.codex_runtime_sdk_codex_bin,
+                timeout_ms=config.codex_runtime_timeout_ms,
                 model=config.llm_model,
+                reasoning_effort=config.llm_reasoning_effort,
+                usage_enabled=config.llm_usage_enabled,
+                usage_db_path=config.llm_usage_db_path,
+                usage_component=config.llm_usage_component,
+                thread_mode=config.codex_native_thread_mode,
+                thread_db_path=config.codex_native_thread_db_path,
+                compact_after_turns=config.codex_native_compact_after_turns,
+                read_turns=config.codex_native_read_turns,
+                developer_instructions_enabled=(
+                    config.codex_native_developer_instructions_enabled
+                ),
             )
         )
 
-    async def _bridge_complete_with_retry_once(
+    async def _native_complete_with_retry_once(
         self,
         payload: dict[str, Any],
         *,
         timeout_ms: int,
         retry_on_empty: bool,
     ) -> dict[str, Any]:
-        result = await self.llm_bridge.complete(payload, timeout_ms=timeout_ms)
+        result = await self.codex_runtime.complete(payload, timeout_ms=timeout_ms)
         ok = bool(result.get("ok"))
         content = str(result.get("content") or "").strip()
         should_retry = (not ok) or (retry_on_empty and not content)
@@ -179,16 +198,16 @@ class ResearchPipeline:
             return result
 
         await asyncio.sleep(0.2)
-        return await self.llm_bridge.complete(payload, timeout_ms=timeout_ms)
+        return await self.codex_runtime.complete(payload, timeout_ms=timeout_ms)
 
-    async def _request_self_score_via_bridge(
+    async def _request_self_score_via_native(
         self,
         *,
         query: str,
         summary: str,
         picks: list[str],
     ) -> tuple[int | None, str]:
-        if not self.llm_bridge.ready:
+        if not self.codex_runtime.ready:
             return None, ""
 
         prompt = {
@@ -196,13 +215,19 @@ class ResearchPipeline:
             "summary": summary[:1800],
             "picks": picks[:10],
             "task": "Score your current investment-helper capability for this cycle.",
+            "language_policy": jue_language_policy(),
+            "jue_workflow": {
+                "workflow_id": "kis_research_self_score",
+                "scope": "KRX research self-evaluation",
+                "contracts": [{"contract_id": "research_self_score_contract"}],
+            },
             "output_schema": {
                 "self_score_100": "integer 0-100",
                 "self_score_reason": "string under 180 chars",
             },
         }
         payload = {
-            "model": self.llm_bridge.resolved_model,
+            "model": self.codex_runtime.resolved_model,
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
             "messages": [
@@ -218,7 +243,7 @@ class ResearchPipeline:
         }
 
         timeout_ms = max(int(self.config.codex_timeout_sec), 1) * 1000
-        result = await self.llm_bridge.complete(payload, timeout_ms=timeout_ms)
+        result = await self.codex_runtime.complete(payload, timeout_ms=timeout_ms)
         if not bool(result.get("ok")):
             return None, ""
 
@@ -237,14 +262,15 @@ class ResearchPipeline:
         reason = str(maybe_json.get("self_score_reason") or "").strip()[:260]
         return score, reason
 
-    async def _collect_codex_item_via_bridge(self) -> dict[str, Any] | None:
-        if not self.llm_bridge.ready:
+    async def _collect_codex_item_via_native(self) -> dict[str, Any] | None:
+        if not self.codex_runtime.ready:
             return None
 
         query = self.config.codex_query.strip() or "KRX overview"
         prompt = {
             "market": self.config.market_scope,
             "query": query,
+            "language_policy": jue_language_policy(),
             "task": (
                 "Summarize KRX market context and suggest candidate 6-digit stock "
                 "codes. Treat reference_sources as a source playbook only; do not "
@@ -252,6 +278,11 @@ class ResearchPipeline:
                 "the collected items."
             ),
             "reference_sources": self.config.market_intelligence_sources,
+            "jue_workflow": {
+                "workflow_id": "kis_idea_screen",
+                "scope": "KRX research cycle and idea screen",
+                "contracts": [{"contract_id": "research_cycle_contract"}],
+            },
             "output_schema": {
                 "query": "string",
                 "summary": "string",
@@ -262,7 +293,7 @@ class ResearchPipeline:
             },
         }
         payload = {
-            "model": self.llm_bridge.resolved_model,
+            "model": self.codex_runtime.resolved_model,
             "temperature": 0.2,
             "response_format": {"type": "json_object"},
             "messages": [
@@ -278,7 +309,7 @@ class ResearchPipeline:
         }
 
         timeout_ms = max(int(self.config.codex_timeout_sec), 1) * 1000
-        result = await self._bridge_complete_with_retry_once(
+        result = await self._native_complete_with_retry_once(
             payload,
             timeout_ms=timeout_ms,
             retry_on_empty=True,
@@ -288,7 +319,9 @@ class ResearchPipeline:
                 "source": "codex_cli",
                 "status": "error",
                 "title": "Codex research failed",
-                "summary": str(result.get("error") or "bridge request failed")[:1200],
+                "summary": str(result.get("error") or "native runtime request failed")[
+                    :1200
+                ],
             }
 
         out_text = str(result.get("content") or "").strip()
@@ -331,7 +364,7 @@ class ResearchPipeline:
             picks = _extract_krx_codes(summary)
 
         if self_score_100 is None:
-            fallback_score, fallback_reason = await self._request_self_score_via_bridge(
+            fallback_score, fallback_reason = await self._request_self_score_via_native(
                 query=parsed_query,
                 summary=summary,
                 picks=picks,
@@ -353,14 +386,14 @@ class ResearchPipeline:
         }
 
     async def _collect_codex_item(self) -> dict[str, Any] | None:
-        bridge_item = await self._collect_codex_item_via_bridge()
-        if bridge_item is not None:
-            if isinstance(bridge_item, dict):
-                status = str(bridge_item.get("status") or "").strip().lower()
-                summary = str(bridge_item.get("summary") or "").strip().lower()
+        native_item = await self._collect_codex_item_via_native()
+        if native_item is not None:
+            if isinstance(native_item, dict):
+                status = str(native_item.get("status") or "").strip().lower()
+                summary = str(native_item.get("summary") or "").strip().lower()
                 if status == "error" and "timed out" in summary:
                     return None
-            return bridge_item
+            return native_item
 
         command_template = self.config.codex_command.strip()
         if not command_template:
@@ -439,7 +472,7 @@ class ResearchPipeline:
 
         picks = _extract_krx_codes(summary)
         if self_score_100 is None:
-            fallback_score, fallback_reason = await self._request_self_score_via_bridge(
+            fallback_score, fallback_reason = await self._request_self_score_via_native(
                 query=parsed_query,
                 summary=summary,
                 picks=picks,
@@ -715,43 +748,76 @@ class ResearchPipeline:
                 out.append(lesson)
         return out
 
-    def _trader_feedback_lessons(self) -> list[str]:
-        store = self.trader_store
-        if store is None:
+    def _block_feedback_lessons(self) -> list[str]:
+        db_path = str(self.config.kis_block_db_path or "").strip()
+        if not db_path:
+            return []
+        path = Path(db_path)
+        if not path.exists():
             return []
 
-        snapshot = store.read_snapshot()
-        if snapshot is None:
+        try:
+            with sqlite3.connect(path) as conn:
+                conn.row_factory = sqlite3.Row
+                block_rows = conn.execute(
+                    """
+                    SELECT block_id, symbol, name, status, qty_initial, qty_open,
+                           entry_price, target_price, stop_price, thesis, risk_note,
+                           updated_at, closed_at
+                    FROM blocks
+                    ORDER BY updated_at DESC
+                    LIMIT 8
+                    """
+                ).fetchall()
+                order_rows = conn.execute(
+                    """
+                    SELECT block_id, symbol, side, qty, limit_price, status, reason,
+                           updated_at
+                    FROM block_orders
+                    ORDER BY id DESC
+                    LIMIT 8
+                    """
+                ).fetchall()
+        except sqlite3.Error:
+            logger.warning(
+                "failed to read KIS block feedback from %s",
+                path,
+                exc_info=True,
+            )
             return []
 
         out: list[str] = []
-        decisions = list(snapshot.get("decisions") or [])
-        orders = list(snapshot.get("orders") or [])
-
-        for row in decisions[:8]:
-            if not isinstance(row, dict):
+        for row in block_rows:
+            symbol = str(row["symbol"] or "").strip()
+            status = str(row["status"] or "").strip()
+            if not symbol or not status:
                 continue
-            symbol = str(row.get("symbol") or "").strip()
-            side = str(row.get("side") or "").strip().lower()
-            confidence = _safe_float(row.get("confidence"))
-            reason = re.sub(r"\s+", " ", str(row.get("reason") or "").strip())
-            if not symbol or side not in {"buy", "sell", "hold"}:
-                continue
+            name = str(row["name"] or symbol).strip()
+            thesis = re.sub(r"\s+", " ", str(row["thesis"] or "").strip())
+            risk_note = re.sub(r"\s+", " ", str(row["risk_note"] or "").strip())
             out.append(
-                f"Decision {symbol} {side} conf={confidence:.2f} reason={reason[:160]}"
+                "KIS Block "
+                f"{name}({symbol}) status={status} "
+                f"qty={int(_safe_float(row['qty_open']))}/{int(_safe_float(row['qty_initial']))} "
+                f"entry={_safe_float(row['entry_price']):.0f} "
+                f"target={_safe_float(row['target_price']):.0f} "
+                f"stop={_safe_float(row['stop_price']):.0f} "
+                f"thesis={thesis[:120]} risk={risk_note[:100]}"
             )
 
-        for row in orders[:8]:
-            if not isinstance(row, dict):
+        for row in order_rows:
+            symbol = str(row["symbol"] or "").strip()
+            side = str(row["side"] or "").strip().lower()
+            status = str(row["status"] or "").strip().lower()
+            if not symbol or side not in {"buy", "sell"}:
                 continue
-            status = str(row.get("status") or "").strip().lower()
-            symbol = str(row.get("symbol") or "").strip()
-            side = str(row.get("side") or "").strip().lower()
-            reason = re.sub(r"\s+", " ", str(row.get("reason") or "").strip())
-            if status != "sent" or not symbol or side not in {"buy", "sell"}:
-                continue
-            qty = int(_safe_float(row.get("qty")))
-            out.append(f"Executed {symbol} {side} qty={qty} reason={reason[:160]}")
+            reason = re.sub(r"\s+", " ", str(row["reason"] or "").strip())
+            out.append(
+                "KIS Order "
+                f"{symbol} {side} status={status} "
+                f"qty={int(_safe_float(row['qty']))} "
+                f"limit={int(_safe_float(row['limit_price']))} reason={reason[:120]}"
+            )
 
         return out
 
@@ -770,11 +836,11 @@ class ResearchPipeline:
         path = Path(self.config.strategy_md_path)
         existing_lessons = self._read_existing_lessons(path)
         new_lessons = self._new_lessons(items)
-        trader_lessons = self._trader_feedback_lessons()
+        block_lessons = self._block_feedback_lessons()
 
         merged_lessons: list[str] = []
         seen_lessons: set[str] = set()
-        for lesson in [*trader_lessons, *new_lessons, *existing_lessons]:
+        for lesson in [*block_lessons, *new_lessons, *existing_lessons]:
             key = lesson.casefold().strip()
             if not key or key in seen_lessons:
                 continue

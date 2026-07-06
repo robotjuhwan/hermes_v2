@@ -85,8 +85,7 @@ class FxRateService:
         if bithumb > 0:
             return bithumb, "bithumb"
 
-        fallback = self._safe_positive(self.config.fallback_usdt_krw)
-        return fallback, "fallback"
+        raise RuntimeError("fx rate unavailable: USDT/KRW sources exhausted")
 
     async def _resolve_usd_krw(
         self,
@@ -102,14 +101,10 @@ class FxRateService:
         if er_api > 0:
             return er_api, "er_api"
 
-        fallback = self._safe_positive(self.config.fallback_usd_krw)
-        if usdt_source == "fallback" and fallback > 0:
-            return fallback, "fallback"
-
         if usdt_krw > 0:
             return usdt_krw, f"{usdt_source}_proxy"
 
-        return fallback, "fallback"
+        raise RuntimeError("fx rate unavailable: USD/KRW sources exhausted")
 
     async def _fetch_upbit_usdt_krw(self, client: httpx.AsyncClient) -> float:
         try:

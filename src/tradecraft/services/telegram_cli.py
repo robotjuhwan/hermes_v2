@@ -1,12 +1,67 @@
 from __future__ import annotations
 
 import html
+import re
 from datetime import datetime
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 
 DashboardProvider = Callable[[], dict[str, Any]]
+TRADING_FOOTER = "실거래 판단용입니다. 주문은 HERMES 안전 게이트와 블록 규칙을 통과한 경우에만 실행됩니다."
+VALIDATION_GATE_LABELS = {
+    "clear": "검증 통과",
+    "blocked_by_validation": "검증 차단",
+    "validation_error": "검증 오류",
+    "validation_incomplete": "19개 검증 미완성",
+    "validation_missing": "검증 결과 없음",
+    "validation_normal": "Normal 단계",
+    "validation_probe": "Probe 단계",
+    "validation_research_only": "Research 단계",
+    "validation_stale": "검증 오래됨",
+}
+VALIDATION_GATE_REASON_LABELS = {
+    "live_authority_error": "Live Authority 오류로 신규 리스크 중단",
+    "live_authority_budget_zero": "신규 리스크 예산 0",
+    "live_authority_risk_governor:halt_new_risk": "리스크 governor가 신규 진입 중단",
+    "no_trading_validation_readiness": "검증 readiness 없음",
+    "validation_readiness_normal_not_scale_ready": "Normal 단계라 스케일업 보류",
+    "validation_readiness_probe_not_scale_ready": "Probe 단계라 대기 진입 중심",
+    "validation_readiness_research_only": "Research 단계라 공격 확대 보류",
+}
+VALIDATION_READINESS_LABELS = {
+    "blocked_by_validation": "검증 차단",
+    "normal": "Normal 단계",
+    "probe": "Probe 단계",
+    "research_only": "Research 단계",
+    "scale_ready": "스케일 준비",
+}
+RISK_GOVERNOR_LABELS = {
+    "de_risk": "리스크 축소",
+    "halt_new_risk": "신규 리스크 중단",
+    "normal": "정상",
+    "risk_off": "리스크 오프",
+}
+RISK_GOVERNOR_SOURCE_LABELS = {
+    "kelly_sizing": "Kelly sizing",
+    "mdd_limit": "MDD",
+    "risk_of_ruin": "파산확률",
+    "ruin_profile": "파산확률",
+}
+LOSS_COOLDOWN_ACTION_LABELS = {
+    "deprioritize_until_revalidated": "재검증 전 우선순위 하향",
+    "do_not_scale_or_create_live_entry_without_new_evidence": "신규 확대 금지",
+}
+REPAIR_EXECUTION_STATUS_LABELS = {
+    "executed": "실행됨",
+    "observed_external_runner": "외부 러너 확인",
+    "queued": "대기",
+    "queued_external_runner": "외부 러너 대기",
+    "queued_validation_refresh": "검증 갱신 대기",
+    "running": "실행 중",
+    "error": "오류",
+    "failed": "실패",
+}
 
 
 def _fmt_krw(value: float | int | None) -> str:
@@ -33,6 +88,97 @@ def _fmt_signed_krw_won(value: float | int | None) -> str:
 
 def _fmt_pct(value: float | int | None, digits: int = 2) -> str:
     return f"{float(value or 0):.{digits}f}%"
+
+
+def _fmt_num(value: float | int | None) -> str:
+    return f"{int(float(value or 0)):,}"
+
+
+def _fmt_float(value: Any, digits: int = 1) -> str:
+    return f"{float(value or 0):.{digits}f}"
+
+
+def _fmt_multiplier(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    return str(value)
+
+
+def _validation_gate_label(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    if not key:
+        return "-"
+    return VALIDATION_GATE_LABELS.get(key, key.replace("_", " "))
+
+
+def _validation_gate_reason(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "-"
+    if raw in VALIDATION_GATE_REASON_LABELS:
+        return VALIDATION_GATE_REASON_LABELS[raw]
+    if raw.startswith("live_authority_risk_governor:"):
+        action = raw.split(":", 1)[1]
+        return f"리스크 governor: {_risk_governor_label(action)}"
+    incomplete = re.search(r"discipline_count=(\d+),\s*expected=(\d+)", raw)
+    if incomplete:
+        return f"검증 항목 수 부족: {incomplete.group(1)}/{incomplete.group(2)}"
+    fail_count = re.search(r"fail_count=(\d+)", raw)
+    if "blocked_by_validation" in raw and fail_count:
+        return f"실패 항목 {fail_count.group(1)}개"
+    return raw.replace("_", " ")
+
+
+def _validation_readiness_label(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    if not key:
+        return "-"
+    return VALIDATION_READINESS_LABELS.get(key, key.replace("_", " "))
+
+
+def _risk_governor_label(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    if not key:
+        return "-"
+    return RISK_GOVERNOR_LABELS.get(key, key.replace("_", " "))
+
+
+def _risk_governor_source_label(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    if not key:
+        return ""
+    return RISK_GOVERNOR_SOURCE_LABELS.get(key, key.replace("_", " "))
+
+
+def _loss_cooldown_action_label(value: Any) -> str:
+    key = str(value or "").strip()
+    if not key:
+        return "-"
+    return LOSS_COOLDOWN_ACTION_LABELS.get(key, key.replace("_", " "))
+
+
+def _repair_execution_status_label(value: Any) -> str:
+    key = str(value or "").strip()
+    if not key:
+        return "-"
+    return REPAIR_EXECUTION_STATUS_LABELS.get(key, key.replace("_", " "))
+
+
+def _fmt_weight_pct(value: Any) -> str:
+    numeric = float(value or 0)
+    if abs(numeric) <= 1:
+        numeric *= 100
+    return f"{numeric:.0f}%"
+
+
+def _horizon_label(value: Any) -> str:
+    return {
+        "cash": "현금",
+        "short": "단기",
+        "mid": "중기",
+        "long": "장기",
+        "core_etf": "ETF/Core",
+    }.get(str(value or ""), str(value or "-"))
 
 
 def _fmt_rate(value: float | int | None) -> str:
@@ -67,6 +213,33 @@ def _compact_number(value: float | int | None, digits: int = 1) -> str:
 def _strip_bot_suffix(command_token: str) -> str:
     core = command_token[1:] if command_token.startswith("/") else command_token
     return core.split("@", 1)[0].strip().lower()
+
+
+def _is_krx_symbol(value: Any) -> bool:
+    return bool(re.fullmatch(r"\d{6}", str(value or "").strip()))
+
+
+def _clean_symbol_name(value: Any, *, symbol: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    code = str(symbol or "").strip()
+    if not text or text == code or _is_krx_symbol(text):
+        return ""
+    if text in {"정보", "투자", "종목", "종목명", "코드", "리포트", "기업"}:
+        return ""
+    if "<" in text or ">" in text:
+        return ""
+    return text
+
+
+def _symbol_label(row: dict[str, Any], *, fallback_symbol: str = "") -> str:
+    symbol = str(row.get("symbol") or fallback_symbol or "").strip()
+    name = _clean_symbol_name(
+        row.get("name") or row.get("asset_name") or row.get("company_name"),
+        symbol=symbol,
+    )
+    if name and symbol:
+        return f"{name} ({symbol})"
+    return name or symbol or "-"
 
 
 def _strategy_horizon(row: dict[str, Any], key: str) -> dict[str, Any]:
@@ -163,7 +336,10 @@ def _truncate_display(text: str, width: int) -> str:
 
 
 class TelegramCLI:
-    def __init__(self, dashboard_provider: DashboardProvider) -> None:
+    def __init__(
+        self,
+        dashboard_provider: DashboardProvider,
+    ) -> None:
         self.dashboard_provider = dashboard_provider
 
     def parse(self, text: str) -> tuple[str, list[str]]:
@@ -185,6 +361,9 @@ class TelegramCLI:
             return True, self._help_text()
         dashboard = self.dashboard_provider()
         return self._execute_parsed(command, args, dashboard)
+
+    def handle_text(self, text: str) -> tuple[bool, str]:
+        return self.execute(text)
 
     def execute_with_dashboard(self, text: str, dashboard: dict[str, Any]) -> tuple[bool, str]:
         command, args = self.parse(text)
@@ -213,6 +392,12 @@ class TelegramCLI:
             return True, self._market_usage_text(args)
         if command in {"memory", "mindset", "journal", "reflect", "why-block"}:
             return True, self._memory_usage_text(args)
+        if command in {"llm-usage", "llm_usage"}:
+            payload = dashboard.get("llm_usage") if isinstance(dashboard.get("llm_usage"), dict) else {}
+            return True, self.llm_usage_text(payload)
+        if command in {"live", "authority"}:
+            payload = dashboard.get("live_authority") if isinstance(dashboard.get("live_authority"), dict) else {}
+            return True, self.live_authority_text(payload)
 
         return (
             True,
@@ -244,9 +429,333 @@ class TelegramCLI:
                 "/mindset - 오늘 장전 마음가짐",
                 "/journal - 오늘 메모리 저널",
                 "/reflect - 최근 블록 거래 반성 실행",
+                "/weekly-review - 주간 운용 반성 실행",
+                "/monthly-review - 월간 운용 반성 실행",
+                "/policy - 최근 정책 개정안",
                 "/why-block <block_id> - 블록별 기억/교훈",
+                "/llm-usage - 오늘 LLM 호출/토큰 사용량",
+                "/live - KIS/Binance 실전 권한 상태",
             ]
         )
+
+    def live_authority_text(self, payload: dict[str, Any]) -> str:
+        venues = payload.get("venues") if isinstance(payload.get("venues"), dict) else {}
+        lines = ["쥬 Live Authority"]
+        for venue in ("kis", "binance"):
+            row = venues.get(venue) if isinstance(venues.get(venue), dict) else {}
+            scorecards = row.get("scorecards") if isinstance(row.get("scorecards"), list) else []
+            validation_gate = (
+                row.get("validation_gate")
+                if isinstance(row.get("validation_gate"), dict)
+                else {}
+            )
+            trading_validation = (
+                row.get("trading_validation")
+                if isinstance(row.get("trading_validation"), dict)
+                else {}
+            )
+            validation_summary = (
+                trading_validation.get("summary")
+                if isinstance(trading_validation.get("summary"), dict)
+                else {}
+            )
+            validation_payload = (
+                trading_validation.get("payload")
+                if isinstance(trading_validation.get("payload"), dict)
+                else trading_validation
+            )
+            lines.append(
+                f"- {venue.upper()}: {row.get('live_grade') or row.get('status') or '-'} "
+                f"· 배수 {_fmt_multiplier(row.get('max_budget_multiplier'))}x "
+                f"· 스케일업 {'허용' if row.get('allow_scale_up') else '보류'} "
+                f"· 카드 {row.get('scorecard_count') or len(scorecards)}"
+            )
+            gate_status = str(validation_gate.get("status") or "").strip()
+            readiness = str(
+                validation_gate.get("readiness")
+                or validation_summary.get("readiness")
+                or ""
+            ).strip()
+            if gate_status or readiness or validation_summary:
+                reason = str(validation_gate.get("reason") or "").strip()
+                discipline_count = (
+                    validation_gate.get("discipline_count")
+                    or validation_payload.get("discipline_count")
+                )
+                expected_discipline_count = (
+                    validation_gate.get("expected_discipline_count")
+                    or validation_payload.get("expected_discipline_count")
+                    or 19
+                )
+                discipline_text = (
+                    f" · 검증수 {_fmt_num(discipline_count)}/{_fmt_num(expected_discipline_count)}"
+                    if discipline_count not in (None, "")
+                    else ""
+                )
+                validation_line = (
+                    f"  검증 {_validation_gate_label(gate_status)}"
+                    f" · readiness {_validation_readiness_label(readiness)}"
+                    f"{discipline_text}"
+                    f" · pass {_fmt_num(validation_summary.get('pass_count'))}"
+                    f" / warn {_fmt_num(validation_summary.get('warn_count'))}"
+                    f" / fail {_fmt_num(validation_gate.get('fail_count') or validation_summary.get('fail_count'))}"
+                    f" / missing {_fmt_num(validation_summary.get('missing_count'))}"
+                )
+                if reason:
+                    validation_line = f"{validation_line} · {_validation_gate_reason(reason)}"
+                lines.append(validation_line)
+                validation_passport = (
+                    validation_gate.get("validation_passport")
+                    if isinstance(validation_gate.get("validation_passport"), dict)
+                    else {}
+                )
+                if validation_passport:
+                    actual_count = validation_passport.get("actual_count")
+                    expected_count = validation_passport.get("expected_count") or 19
+                    row_detail_count = validation_passport.get("row_detail_count")
+                    row_detail_complete = bool(
+                        validation_passport.get("row_detail_complete")
+                    )
+                    score = validation_passport.get("score")
+                    failed_ids = (
+                        validation_passport.get("failed_ids")
+                        if isinstance(validation_passport.get("failed_ids"), list)
+                        else []
+                    )
+                    weak_ids = (
+                        validation_passport.get("weak_ids")
+                        if isinstance(validation_passport.get("weak_ids"), list)
+                        else []
+                    )
+                    passport_status = str(
+                        validation_passport.get("status")
+                        or validation_passport.get("readiness")
+                        or gate_status
+                    ).strip()
+                    passport_label = (
+                        "재검증"
+                        if validation_passport.get("requires_revalidation")
+                        else _validation_gate_label(passport_status)
+                    )
+                    failed_text = ", ".join(
+                        str(item).strip()
+                        for item in failed_ids[:3]
+                        if str(item).strip()
+                    )
+                    weak_text = ", ".join(
+                        str(item).strip()
+                        for item in weak_ids[:4]
+                        if str(item).strip()
+                    )
+                    detail_parts = [
+                        f"{_fmt_num(actual_count)}/{_fmt_num(expected_count)}",
+                        (
+                            f"row {_fmt_num(row_detail_count)}/{_fmt_num(expected_count)}"
+                            f"{'' if row_detail_complete else ' 부분'}"
+                            if row_detail_count not in (None, "")
+                            else ""
+                        ),
+                        f"{_fmt_float(score, 1)}점" if score not in (None, "") else "",
+                        f"실패 {failed_text}" if failed_text else "",
+                        f"취약 {weak_text}" if weak_text else "",
+                    ]
+                    risk_action = str(
+                        validation_passport.get("risk_governor_action") or ""
+                    ).strip()
+                    if risk_action:
+                        detail_parts.append(f"governor {_risk_governor_label(risk_action)}")
+                    lines.append(
+                        "  검증 여권 "
+                        f"{passport_label}"
+                        f" · {' · '.join(part for part in detail_parts if part)}"
+                    )
+                risk_governor = str(
+                    validation_gate.get("risk_governor_action") or ""
+                ).strip()
+                if risk_governor:
+                    risk_source = str(
+                        validation_gate.get("risk_governor_source") or ""
+                    ).strip()
+                    source_text = (
+                        f" · {_risk_governor_source_label(risk_source)}"
+                        if risk_source
+                        else ""
+                    )
+                    lines.append(
+                        f"  governor {_risk_governor_label(risk_governor)}{source_text}"
+                    )
+                failed_disciplines = (
+                    validation_gate.get("failed_disciplines")
+                    if isinstance(validation_gate.get("failed_disciplines"), list)
+                    else []
+                )
+                failed_labels = [
+                    str(row.get("label") or row.get("id") or "").strip()
+                    for row in failed_disciplines
+                    if isinstance(row, dict)
+                    and str(row.get("label") or row.get("id") or "").strip()
+                ]
+                if failed_labels:
+                    lines.append(f"  실패 {', '.join(failed_labels[:4])}")
+                capacity = (
+                    validation_gate.get("capacity_bottleneck")
+                    if isinstance(validation_gate.get("capacity_bottleneck"), dict)
+                    else {}
+                )
+                capacity_symbol = str(capacity.get("tightest_symbol") or "").strip()
+                if capacity_symbol:
+                    capacity_ratio = capacity.get("min_capacity_ratio")
+                    ratio_text = (
+                        f" · {float(capacity_ratio or 0):.1f}x"
+                        if capacity_ratio is not None
+                        else ""
+                    )
+                    method = str(capacity.get("capacity_method") or "").strip()
+                    method_text = f" · {method}" if method else ""
+                    lines.append(
+                        f"  용량 병목 {capacity_symbol}{ratio_text}{method_text}"
+                    )
+                attribution = (
+                    validation_gate.get("failure_attribution")
+                    if isinstance(validation_gate.get("failure_attribution"), dict)
+                    else {}
+                )
+                recovery_focus = (
+                    attribution.get("recovery_focus")
+                    if isinstance(attribution.get("recovery_focus"), list)
+                    else []
+                )
+                if recovery_focus:
+                    text = str(recovery_focus[0]).strip()
+                    if text:
+                        lines.append(f"  실패 귀속 {text}")
+                loss_cooldown = (
+                    validation_gate.get("loss_cooldown")
+                    if isinstance(validation_gate.get("loss_cooldown"), dict)
+                    else {}
+                )
+                cooldown_symbols = (
+                    loss_cooldown.get("symbols")
+                    if isinstance(loss_cooldown.get("symbols"), list)
+                    else []
+                )
+                cooldown_groups = (
+                    loss_cooldown.get("groups")
+                    if isinstance(loss_cooldown.get("groups"), list)
+                    else []
+                )
+                cooldown_lines: list[str] = []
+                for item in cooldown_symbols[:2]:
+                    if not isinstance(item, dict):
+                        continue
+                    symbol = str(item.get("symbol") or "").strip()
+                    if not symbol:
+                        continue
+                    parts = [
+                        _loss_cooldown_action_label(item.get("action")),
+                        f"net {float(item.get('total_net_pnl') or 0):.2f}"
+                        if item.get("total_net_pnl") is not None
+                        else "",
+                        f"PF {float(item.get('profit_factor') or 0):.2f}"
+                        if item.get("profit_factor") is not None
+                        else "",
+                    ]
+                    detail = " · ".join(part for part in parts if part)
+                    cooldown_lines.append(f"{symbol} {detail}".strip())
+                for item in cooldown_groups[:2]:
+                    if not isinstance(item, dict):
+                        continue
+                    group = str(item.get("group") or "").strip()
+                    if not group:
+                        continue
+                    label = str(item.get("group_type") or "group").strip()
+                    action = _loss_cooldown_action_label(item.get("action"))
+                    cooldown_lines.append(f"{label}={group} {action}".strip())
+                if cooldown_lines:
+                    lines.append(f"  손실 쿨다운 {', '.join(cooldown_lines[:3])}")
+                guidance = (
+                    validation_gate.get("operator_guidance")
+                    if isinstance(validation_gate.get("operator_guidance"), list)
+                    else []
+                )
+                for item in guidance[:2]:
+                    text = str(item).strip()
+                    if text:
+                        lines.append(f"  조치 {text}")
+            repair_execution = (
+                row.get("repair_execution")
+                if isinstance(row.get("repair_execution"), dict)
+                else {}
+            )
+            repair_actions = (
+                repair_execution.get("actions")
+                if isinstance(repair_execution.get("actions"), list)
+                else []
+            )
+            if repair_execution:
+                repair_status = _repair_execution_status_label(
+                    repair_execution.get("status")
+                )
+                repair_parts = [
+                    f"실행 {_fmt_num(repair_execution.get('executed_count'))}",
+                    f"대기 {_fmt_num(repair_execution.get('queued_count'))}",
+                    (
+                        f"오류 {_fmt_num(repair_execution.get('error_count'))}"
+                        if repair_execution.get("error_count") not in (None, "")
+                        else ""
+                    ),
+                    str(repair_execution.get("m1_execution_posture") or "").strip(),
+                ]
+                lines.append(
+                    f"  복구 실행 {repair_status} · "
+                    f"{' · '.join(part for part in repair_parts if part)}"
+                )
+                for action in repair_actions[:3]:
+                    if not isinstance(action, dict):
+                        continue
+                    discipline_id = str(action.get("discipline_id") or "-").strip()
+                    action_status = _repair_execution_status_label(action.get("status"))
+                    mode = str(
+                        action.get("validation_mode")
+                        or action.get("artifact")
+                        or ""
+                    ).strip()
+                    flags = [
+                        "scale-up 차단" if action.get("scale_up_blocked") else "",
+                        "live shadow 필요" if action.get("live_shadow_required") else "",
+                    ]
+                    detail = " · ".join(
+                        part for part in [action_status, mode, *flags] if part
+                    )
+                    lines.append(f"  복구 {discipline_id}: {detail}")
+            for card in scorecards[:3]:
+                lines.append(
+                    "  "
+                    f"{card.get('strategy_family') or '-'} / {card.get('evidence_key') or 'all'} "
+                    f"· {card.get('grade') or '-'} "
+                    f"· n={card.get('sample_count') or 0} "
+                    f"· win={_fmt_num(card.get('win_rate'))}%"
+                )
+        return self._html_pre("\n".join(lines))
+
+    def llm_usage_text(self, payload: dict[str, Any]) -> str:
+        total = payload.get("total") if isinstance(payload.get("total"), dict) else {}
+        rows = payload.get("by_component") if isinstance(payload.get("by_component"), list) else []
+        lines = [
+            f"LLM 사용량 · {payload.get('trading_day') or '-'}",
+            f"- 호출 {_fmt_num(total.get('call_count'))}회",
+            f"- 총 토큰 {_fmt_num(total.get('total_tokens'))}",
+            f"- 입력/출력 {_fmt_num(total.get('prompt_tokens'))} / {_fmt_num(total.get('completion_tokens'))}",
+            f"- 추정 집계 {_fmt_num(total.get('estimated_token_count'))}건 · 실패 {_fmt_num(total.get('error_count'))}건",
+        ]
+        for row in rows[:8]:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"- {row.get('component') or '-'}: "
+                f"{_fmt_num(row.get('call_count'))}회 · {_fmt_num(row.get('total_tokens'))} tokens"
+            )
+        return self._html_pre("\n".join(lines))
 
     def strategy_query_text(self, command: str, args: list[str]) -> str:
         text = " ".join(str(item) for item in args).strip()
@@ -275,7 +784,7 @@ class TelegramCLI:
             for row in candidates[:5]:
                 lines.append(
                     "- "
-                    f"{row.get('name') or row.get('symbol')}({row.get('symbol')}): "
+                    f"{_symbol_label(row)}: "
                     f"{_strategy_suitability_line(row)}"
                 )
         if sources:
@@ -288,7 +797,7 @@ class TelegramCLI:
         lines.extend(
             [
                 "",
-                "정보 제공용이며 매매 추천이 아닙니다.",
+                TRADING_FOOTER,
             ]
         )
         text = "\n".join(lines)
@@ -314,14 +823,14 @@ class TelegramCLI:
             warning = _strategy_warning_line(row)
             lines.extend(
                 [
-                    f"{idx}. {row.get('name') or row.get('symbol')}({row.get('symbol')})",
+                    f"{idx}. {_symbol_label(row)}",
                     f"   {_strategy_suitability_line(row)}",
                     *([f"   자료: {warning}"] if warning else []),
                     f"   근거: {reason}",
                     f"   체크: {check}",
                 ]
             )
-        lines.extend(["", "상세는 /why <종목코드> 로 확인하세요.", "정보 제공용이며 매매 추천이 아닙니다."])
+        lines.extend(["", "상세는 /why <종목코드> 로 확인하세요.", TRADING_FOOTER])
         text = "\n".join(lines)
         if len(text) > 3600:
             text = text[:3580].rstrip() + "\n..."
@@ -363,7 +872,7 @@ class TelegramCLI:
         warning = _strategy_warning_line(row)
         lines = [
             "HERMES 후보 상세",
-            f"{row.get('name') or target}({target})",
+            _symbol_label(row, fallback_symbol=target),
             (
                 f"균형 {balanced['grade']} {balanced['score']} · confidence {row.get('confidence')} · "
                 f"stance {row.get('stance')}"
@@ -407,7 +916,7 @@ class TelegramCLI:
         if citations:
             lines.extend(["근거 위치"])
             lines.extend(f"- {item}" for item in citations[:4])
-        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        lines.extend(["", TRADING_FOOTER])
         text = "\n".join(lines)
         if len(text) > 3600:
             text = text[:3580].rstrip() + "\n..."
@@ -433,6 +942,9 @@ class TelegramCLI:
             "/mindset\n"
             "/journal\n"
             "/reflect\n"
+            "/weekly-review\n"
+            "/monthly-review\n"
+            "/policy\n"
             "/why-block blk_005930_..."
         )
 
@@ -444,6 +956,9 @@ class TelegramCLI:
             "/mindset - 오늘 장전 마음가짐\n"
             "/journal - 오늘 메모리 저널\n"
             "/reflect - 최근 블록 거래 반성 실행\n"
+            "/weekly-review - 주간 운용 반성 실행\n"
+            "/monthly-review - 월간 운용 반성 실행\n"
+            "/policy - 최근 정책 개정안\n"
             "/why-block <block_id> - 블록별 기억/교훈"
         )
 
@@ -461,8 +976,31 @@ class TelegramCLI:
             ),
             f"최근 실행: {latest.get('slot') or latest.get('status') or '-'} · {latest.get('run_at') or '-'}",
             "",
-            "오늘 저널",
         ]
+        horizon_allocation = (
+            payload.get("horizon_allocation")
+            if isinstance(payload.get("horizon_allocation"), dict)
+            else {}
+        )
+        horizon_items = [
+            row
+            for row in list(horizon_allocation.get("items") or [])
+            if isinstance(row, dict)
+        ]
+        if horizon_items:
+            lines.append("Horizon 밸런스")
+            lines.extend(
+                [
+                    (
+                        f"- {_horizon_label(row.get('horizon'))} "
+                        f"{_fmt_weight_pct(row.get('current_weight'))}"
+                        f" / 목표 {_fmt_weight_pct(row.get('target_weight'))}"
+                    )
+                    for row in horizon_items[:6]
+                ]
+            )
+            lines.append("")
+        lines.append("오늘 저널")
         if journals:
             for row in journals[:4]:
                 lines.append(f"- {row.get('slot_label') or row.get('slot')}: {row.get('title') or '-'}")
@@ -477,7 +1015,7 @@ class TelegramCLI:
                 )
         else:
             lines.append("- 아직 활성화된 메모리 정책이 없습니다.")
-        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        lines.extend(["", TRADING_FOOTER])
         return self._html_pre("\n".join(lines)[:3600])
 
     def memory_journal_text(self, journal: dict[str, Any]) -> str:
@@ -519,7 +1057,7 @@ class TelegramCLI:
             lines.append("활성 운용 원칙")
             for row in policies[:5]:
                 lines.append(f"- {row.get('policy_id')}: {row.get('reason') or row.get('action')}")
-        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        lines.extend(["", TRADING_FOOTER])
         text = "\n".join(lines)
         if len(text) > 3600:
             text = text[:3580].rstrip() + "\n..."
@@ -543,11 +1081,45 @@ class TelegramCLI:
             lines.extend(f"- {row.get('summary_md')}" for row in insights[:5])
         else:
             lines.append("아직 이 블록에 쌓인 반성 메모리가 없습니다.")
-        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        lines.extend(["", TRADING_FOOTER])
         text = "\n".join(lines)
         if len(text) > 3600:
             text = text[:3580].rstrip() + "\n..."
         return self._html_pre(text)
+
+    def memory_period_review_text(self, payload: dict[str, Any]) -> str:
+        period_type = str(payload.get("period_type") or "-")
+        review = payload.get("review") if isinstance(payload.get("review"), dict) else {}
+        review_md = str(review.get("review_md") or "").strip()
+        lines = [
+            f"쥬 {period_type} 반성",
+            str(review.get("period_key") or payload.get("period_key") or "-"),
+            f"정책 개정안 {int(payload.get('revision_count') or 0)}개",
+            "",
+            review_md or "아직 표시할 반성 내용이 없습니다.",
+            "",
+            TRADING_FOOTER,
+        ]
+        text = "\n".join(lines)
+        if len(text) > 3600:
+            text = text[:3580].rstrip() + "\n..."
+        return self._html_pre(text)
+
+    def memory_policy_revisions_text(self, payload: dict[str, Any]) -> str:
+        rows = payload.get("items") if isinstance(payload.get("items"), list) else []
+        lines = ["쥬 정책 개정안"]
+        if rows:
+            for row in rows[:8]:
+                if not isinstance(row, dict):
+                    continue
+                lines.append(
+                    f"- {row.get('policy_id') or '-'} · "
+                    f"{row.get('status') or '-'} · {row.get('scope') or 'general'}"
+                )
+        else:
+            lines.append("- 최근 정책 개정안이 없습니다.")
+        lines.extend(["", TRADING_FOOTER])
+        return self._html_pre("\n".join(lines)[:3600])
 
     def market_judgment_text(self, payload: dict[str, Any]) -> str:
         run = payload.get("run") if isinstance(payload.get("run"), dict) else {}
@@ -582,7 +1154,7 @@ class TelegramCLI:
                 price_line = f" · {int(float(price)):,.0f}원 / {float(change_pct or 0):+.2f}%"
             lines.extend(
                 [
-                    f"- {row.get('name') or row.get('symbol')}({row.get('symbol')}){price_line}",
+                    f"- {_symbol_label(row)}{price_line}",
                     (
                         f"  {_market_action_label(row.get('account_action'))} · "
                         f"{row.get('stance') or '-'} · confidence {float(row.get('confidence') or 0):.2f}"
@@ -591,7 +1163,7 @@ class TelegramCLI:
                     f"  반론: {risks}",
                 ]
             )
-        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        lines.extend(["", TRADING_FOOTER])
         text = "\n".join(lines)
         if len(text) > 3600:
             text = text[:3580].rstrip() + "\n..."
@@ -623,7 +1195,7 @@ class TelegramCLI:
         strategy = row.get("strategy") if isinstance(row.get("strategy"), dict) else {}
         lines = [
             "HERMES 왜 지금?",
-            f"{row.get('name') or target}({target})",
+            _symbol_label(row, fallback_symbol=target),
             f"판단: {_market_action_label(row.get('account_action'))} · {row.get('stance')} · {row.get('horizon')}",
             f"confidence: {float(row.get('confidence') or 0):.2f}",
             "",
@@ -659,7 +1231,7 @@ class TelegramCLI:
         if gaps:
             lines.extend(["", "자료 공백"])
             lines.extend(f"- {item}" for item in gaps[:4])
-        lines.extend(["", "정보 제공용이며 매매 추천이 아닙니다."])
+        lines.extend(["", TRADING_FOOTER])
         text = "\n".join(lines)
         if len(text) > 3600:
             text = text[:3580].rstrip() + "\n..."

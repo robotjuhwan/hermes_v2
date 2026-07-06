@@ -84,6 +84,22 @@ h1 {
   align-content: flex-start;
 }
 
+.token-field {
+  display: grid;
+  gap: 4px;
+  min-width: 220px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.token-field input {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 10px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.88);
+}
+
 .chip {
   border: 1px solid var(--line);
   border-radius: 999px;

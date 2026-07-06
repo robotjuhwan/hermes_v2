@@ -1,0 +1,23 @@
+{
+  "workflow_id": "kis_symbol_deep_dive",
+  "version": 1,
+  "scope": "kis",
+  "model_policy": {
+    "default_model": "settings.llm_model",
+    "default_reasoning_effort": "settings.llm_reasoning_effort",
+    "expected_runtime_model": "gpt-5.5",
+    "expected_reasoning_effort": "xhigh"
+  },
+  "cadence": {"kind": "ad_hoc", "trigger": "symbol_deep_dive"},
+  "required_skills": ["thesis_tracker", "valuation_frame", "catalyst_calendar", "block_design", "evidence_audit"],
+  "required_context": ["symbol", "quotes", "reports", "catalysts", "blocks", "investment_memory", "account"],
+  "output_contracts": ["thesis_update_contract", "block_action_contract", "decision_lifecycle_contract"],
+  "authority": {
+    "can_read_untrusted_research": false,
+    "can_write_memory": true,
+    "can_create_blocks": true,
+    "can_submit_orders": false
+  },
+  "safety_gates": ["evidence_freshness", "cash_available", "concentration_limit", "no_order_submission"],
+  "prompt_budget": {"max_skill_chars": 8400, "max_workflow_chars": 1600, "max_contract_chars": 5600}
+}

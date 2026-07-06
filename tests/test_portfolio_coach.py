@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 from tradecraft.services.portfolio_coach import (
@@ -169,21 +170,47 @@ class _Kis:
         return mapping.get(symbol, {"name": symbol, "price": 0, "raw": {}})
 
 
+class _SeedEchoCodex:
+    ready = True
+    resolved_model = "gpt-test"
+
+    async def complete(self, payload: dict) -> dict:
+        user_message = next(
+            (
+                row
+                for row in payload.get("messages", [])
+                if isinstance(row, dict) and row.get("role") == "user"
+            ),
+            {},
+        )
+        body = json.loads(str(user_message.get("content") or "{}"))
+        return {
+            "ok": True,
+            "content": json.dumps(body.get("seed") or {}, ensure_ascii=False),
+        }
+
+
+def _with_seed_echo_codex(service: PortfolioCoachService) -> PortfolioCoachService:
+    service.codex_runtime = _SeedEchoCodex()  # type: ignore[assignment]
+    return service
+
+
 def _service(tmp_path: Path) -> PortfolioCoachService:
-    return PortfolioCoachService(
-        PortfolioCoachConfig(
-            state_db_path=str(tmp_path / "portfolio_coach.db"),
-            user_id="u1",
-            llm_bridge_command="",
-            top_n=5,
-            option_count=3,
-            trigger_count=3,
-            review_queue_enabled=True,
-        ),
-        holdings_provider=_HoldingsProvider(),
-        report_repo=_ReportRepo(),
-        rag_store=_RagStore(),
-        kis=_Kis(),
+    return _with_seed_echo_codex(
+        PortfolioCoachService(
+            PortfolioCoachConfig(
+                state_db_path=str(tmp_path / "portfolio_coach.db"),
+                user_id="u1",
+                top_n=5,
+                option_count=3,
+                trigger_count=3,
+                review_queue_enabled=True,
+            ),
+            holdings_provider=_HoldingsProvider(),
+            report_repo=_ReportRepo(),
+            rag_store=_RagStore(),
+            kis=_Kis(),
+        )
     )
 
 
@@ -219,6 +246,71 @@ def test_portfolio_coach_builds_actionable_pack_with_review_queue(
     history_rows = service.store.list_recent_rebalance_history(user_id="u1", limit=5)
     assert len(history_rows) == 1
     assert len(list(history_rows[0].get("targets") or [])) >= 1
+
+
+def test_portfolio_coach_surfaces_codex_runtime_unavailable_status(
+    tmp_path: Path,
+) -> None:
+    class _UnavailableCodex:
+        ready = False
+        resolved_model = "gpt-test"
+
+    service = _service(tmp_path)
+    service.codex_runtime = _UnavailableCodex()  # type: ignore[assignment]
+
+    payload = asyncio.run(service.build_advice())
+
+    assert payload["status"] == "error"
+    assert payload["reason"] == "codex_runtime_not_ready"
+    assert "Codex native runtime" in payload["message"]
+    llm_status = dict(payload.get("llm_status") or {})
+    assert llm_status["status"] == "skipped"
+    assert llm_status["reason"] == "codex_runtime_not_ready"
+    assert llm_status["model"] == "gpt-test"
+    pack = dict(payload.get("pack") or {})
+    assert dict(pack.get("llm_status") or {}) == llm_status
+    assert service.store.list_advice_messages(status="", limit=5) == []
+
+
+def test_portfolio_coach_surfaces_codex_runtime_error_status(
+    tmp_path: Path,
+) -> None:
+    class _FailingCodex:
+        ready = True
+        resolved_model = "gpt-test"
+
+        async def complete(self, payload: dict) -> dict:
+            _ = payload
+            return {"ok": False, "error": "quota exhausted"}
+
+    service = _service(tmp_path)
+    service.codex_runtime = _FailingCodex()  # type: ignore[assignment]
+
+    payload = asyncio.run(service.build_advice())
+
+    assert payload["status"] == "error"
+    assert payload["reason"] == "codex_runtime_error"
+    assert "quota exhausted" in payload["message"]
+    llm_status = dict(payload.get("llm_status") or {})
+    assert llm_status["status"] == "error"
+    assert llm_status["reason"] == "codex_runtime_error"
+    assert "quota exhausted" in llm_status["error_message"]
+    assert service.store.list_advice_messages(status="", limit=5) == []
+
+
+def test_portfolio_coach_requires_advice_seed_before_llm_polish(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+
+    llm_json, llm_status = asyncio.run(
+        service._render_with_llm_json(snapshot={}, pack={})  # noqa: SLF001
+    )
+
+    assert llm_json is None
+    assert llm_status["status"] == "error"
+    assert llm_status["reason"] == "advice_seed_missing"
+    assert "advice_seed_json" in llm_status["error_message"]
 
 
 def test_portfolio_coach_includes_rebalance_history_context(tmp_path: Path) -> None:
@@ -264,17 +356,18 @@ def test_portfolio_coach_fills_citation_gap_with_geungeo_bujok(tmp_path: Path) -
             _ = report_id
             return None
 
-    service = PortfolioCoachService(
-        PortfolioCoachConfig(
-            state_db_path=str(tmp_path / "portfolio_coach.db"),
-            user_id="u1",
-            llm_bridge_command="",
-            review_queue_enabled=True,
-        ),
-        holdings_provider=_HoldingsProvider(),
-        report_repo=_NoFactRepo(),
-        rag_store=_RagStore(),
-        kis=_Kis(),
+    service = _with_seed_echo_codex(
+        PortfolioCoachService(
+            PortfolioCoachConfig(
+                state_db_path=str(tmp_path / "portfolio_coach.db"),
+                user_id="u1",
+                review_queue_enabled=True,
+            ),
+            holdings_provider=_HoldingsProvider(),
+            report_repo=_NoFactRepo(),
+            rag_store=_RagStore(),
+            kis=_Kis(),
+        )
     )
     payload = asyncio.run(service.build_advice())
     message = str(payload["message"])
@@ -318,17 +411,18 @@ def test_portfolio_coach_single_holding_uses_scan_friendly_markdown(
         async def fetch_domestic_quote(self, symbol: str) -> dict:
             return {"name": "피노", "price": 5590, "raw": {"stck_prdy_ctrt": "-0.7"}}
 
-    service = PortfolioCoachService(
-        PortfolioCoachConfig(
-            state_db_path=str(tmp_path / "portfolio_coach.db"),
-            user_id="u1",
-            llm_bridge_command="",
-            review_queue_enabled=True,
-        ),
-        holdings_provider=_OneHoldingProvider(),
-        report_repo=_NoReportRepo(),
-        rag_store=_RagStore(),
-        kis=_OneKis(),
+    service = _with_seed_echo_codex(
+        PortfolioCoachService(
+            PortfolioCoachConfig(
+                state_db_path=str(tmp_path / "portfolio_coach.db"),
+                user_id="u1",
+                review_queue_enabled=True,
+            ),
+            holdings_provider=_OneHoldingProvider(),
+            report_repo=_NoReportRepo(),
+            rag_store=_RagStore(),
+            kis=_OneKis(),
+        )
     )
 
     payload = asyncio.run(service.build_advice())
@@ -400,17 +494,18 @@ def test_portfolio_coach_idea_section_keeps_minimum_rows_with_single_citation(
                 "raw": {"stck_prdy_ctrt": "0.3"},
             }
 
-    service = PortfolioCoachService(
-        PortfolioCoachConfig(
-            state_db_path=str(tmp_path / "portfolio_coach.db"),
-            user_id="u1",
-            llm_bridge_command="",
-            review_queue_enabled=True,
-        ),
-        holdings_provider=_HoldingsProvider(),
-        report_repo=_WideReportRepo(),
-        rag_store=_RagStore(),
-        kis=_WideKis(),
+    service = _with_seed_echo_codex(
+        PortfolioCoachService(
+            PortfolioCoachConfig(
+                state_db_path=str(tmp_path / "portfolio_coach.db"),
+                user_id="u1",
+                review_queue_enabled=True,
+            ),
+            holdings_provider=_HoldingsProvider(),
+            report_repo=_WideReportRepo(),
+            rag_store=_RagStore(),
+            kis=_WideKis(),
+        )
     )
 
     payload = asyncio.run(service.build_advice())
@@ -455,17 +550,18 @@ def test_portfolio_coach_name_format_uses_company_name_first_label(
                 "cash": 0,
             }
 
-    service = PortfolioCoachService(
-        PortfolioCoachConfig(
-            state_db_path=str(tmp_path / "portfolio_coach.db"),
-            user_id="u1",
-            llm_bridge_command="",
-            review_queue_enabled=True,
-        ),
-        holdings_provider=_OneHoldingProviderNoName(),
-        report_repo=_EmptyRepo(),
-        rag_store=_RagStore(),
-        kis=_NoNameKis(),
+    service = _with_seed_echo_codex(
+        PortfolioCoachService(
+            PortfolioCoachConfig(
+                state_db_path=str(tmp_path / "portfolio_coach.db"),
+                user_id="u1",
+                review_queue_enabled=True,
+            ),
+            holdings_provider=_OneHoldingProviderNoName(),
+            report_repo=_EmptyRepo(),
+            rag_store=_RagStore(),
+            kis=_NoNameKis(),
+        )
     )
 
     payload = asyncio.run(service.build_advice())

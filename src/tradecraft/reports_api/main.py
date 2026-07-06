@@ -49,7 +49,7 @@ app = FastAPI(title="TradeCraft Reports API", version=__version__)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -403,7 +403,10 @@ async def v1_rag_search(
     }
 
 
-ui_router = APIRouter(prefix="/ui-api", dependencies=[Depends(require_ui_access)])
+ui_router = APIRouter(
+    prefix="/ui-api",
+    dependencies=[Depends(require_ui_access), Depends(require_api_auth)],
+)
 
 
 @ui_router.get("/overview")

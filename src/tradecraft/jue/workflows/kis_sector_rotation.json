@@ -1,0 +1,23 @@
+{
+  "workflow_id": "kis_sector_rotation",
+  "version": 1,
+  "scope": "kis",
+  "model_policy": {
+    "default_model": "settings.llm_model",
+    "default_reasoning_effort": "settings.llm_reasoning_effort",
+    "expected_runtime_model": "gpt-5.5",
+    "expected_reasoning_effort": "xhigh"
+  },
+  "cadence": {"kind": "scheduled", "local_time": "16:20"},
+  "required_skills": ["sector_overview", "idea_generation", "portfolio_balance", "evidence_audit"],
+  "required_context": ["market_pulse", "sector_map", "quotes", "account", "positions", "reports", "investment_memory"],
+  "output_contracts": ["sector_rotation_contract", "decision_lifecycle_contract"],
+  "authority": {
+    "can_read_untrusted_research": false,
+    "can_write_memory": true,
+    "can_create_blocks": false,
+    "can_submit_orders": false
+  },
+  "safety_gates": ["evidence_freshness", "concentration_limit", "no_order_submission"],
+  "prompt_budget": {"max_skill_chars": 7600, "max_workflow_chars": 1600, "max_contract_chars": 5200}
+}

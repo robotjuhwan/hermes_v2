@@ -14,9 +14,11 @@ import httpx
 from tradecraft.config import AppSettings
 from tradecraft.runtime.process_status import write_current_runner_pid
 from tradecraft.runtime.state_store import RuntimeStateStore, utc_now_iso
+from tradecraft.services.codex_native import codex_native_service_config_kwargs
 from tradecraft.services.intelligence import (
     build_report_intelligence_stack,
     run_report_collection_cycle,
+    run_report_collection_cycle_with_timeout,
 )
 from tradecraft.services.kis import KISAdapter, KISConfig
 from tradecraft.services.portfolio_coach import (
@@ -41,6 +43,44 @@ ADVICE_SLOTS_KST: list[tuple[int, int, str]] = [
 ]
 
 
+def _service_reports_enabled(
+    service_name: str,
+    enabled: bool,
+    *,
+    research_runner_collect_reports: bool = False,
+) -> bool:
+    if not enabled:
+        return False
+    clean_service = str(service_name or "").strip()
+    if clean_service == "tradecraft-intelligence":
+        return False
+    if clean_service == "tradecraft-research" and not bool(
+        research_runner_collect_reports
+    ):
+        return False
+    return True
+
+
+def _write_research_disabled_snapshot(
+    *,
+    state_store: RuntimeStateStore,
+    service_name: str,
+    research_enabled: bool,
+    reports_enabled: bool,
+) -> dict[str, Any]:
+    snapshot = {
+        "updated_at": utc_now_iso(),
+        "source": "research_runner",
+        "service": service_name,
+        "status": "disabled",
+        "research_enabled": bool(research_enabled),
+        "reports_enabled": bool(reports_enabled),
+        "reason": "research_and_reports_disabled",
+    }
+    state_store.write_snapshot(snapshot)
+    return snapshot
+
+
 def _build_pipeline(settings: AppSettings) -> ResearchPipeline:
     config = ResearchPipelineConfig(
         state_path=settings.research_state_path,
@@ -50,7 +90,7 @@ def _build_pipeline(settings: AppSettings) -> ResearchPipeline:
         codex_query=settings.research_codex_query,
         codex_timeout_sec=settings.research_codex_timeout_sec,
         report_urls=settings.research_report_url_list,
-        trader_state_path=settings.kis_trader_state_path,
+        kis_block_db_path=settings.kis_block_trader_db_path,
         report_db_path=settings.naver_reports_db_path,
         report_db_top_k=settings.research_db_reference_top_k,
         rag_enabled=settings.rag_enabled,
@@ -59,12 +99,15 @@ def _build_pipeline(settings: AppSettings) -> ResearchPipeline:
         rag_query_top_k=settings.rag_query_top_k,
         max_items=settings.research_max_items,
         knowledge_max_chars=settings.research_knowledge_max_chars,
-        llm_bridge_command=settings.llm_bridge_command,
-        llm_bridge_args=settings.llm_bridge_args,
-        llm_bridge_url=settings.llm_bridge_url,
-        llm_bridge_token=settings.llm_bridge_token,
-        llm_bridge_timeout_ms=settings.llm_bridge_timeout_ms,
+        codex_runtime_mode=settings.codex_runtime_mode,
+        codex_runtime_sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
+        codex_runtime_timeout_ms=settings.codex_runtime_timeout_ms,
         llm_model=settings.llm_model,
+        llm_reasoning_effort=settings.llm_reasoning_effort,
+        llm_usage_enabled=settings.llm_usage_enabled,
+        llm_usage_db_path=settings.llm_usage_db_path,
+        llm_usage_component="research_pipeline",
+        **codex_native_service_config_kwargs(settings),
         market_intelligence_sources=settings.market_intelligence_source_list,
     )
     return ResearchPipeline(config)
@@ -80,6 +123,11 @@ def _build_primary_kis(settings: AppSettings) -> KISAdapter | None:
             account_no=settings.kis_primary_account_no,
             product_code=settings.kis_primary_product_code,
             base_url=settings.kis_base_url,
+            rate_limit_enabled=settings.kis_rate_limit_enabled,
+            rest_rate_limit_per_sec=settings.kis_rest_rate_limit_per_sec,
+            account_min_interval_sec=settings.kis_account_min_interval_sec,
+            token_min_interval_sec=settings.kis_token_min_interval_sec,
+            rate_limit_db_path=settings.kis_rate_limit_db_path,
         )
     )
 
@@ -140,18 +188,6 @@ def _safe_float(value: Any) -> float:
         return float(value)
     except Exception:
         return 0.0
-
-
-def _parse_krw_amount(value: Any) -> float:
-    if isinstance(value, (int, float)):
-        return max(float(value), 0.0)
-    text = str(value or "").strip()
-    if not text:
-        return 0.0
-    normalized = re.sub(r"[^0-9.\-]", "", text)
-    if not normalized:
-        return 0.0
-    return max(_safe_float(normalized), 0.0)
 
 
 def _extract_pick_codes(snapshot: dict, limit: int = 6) -> list[str]:
@@ -330,7 +366,12 @@ def _resolve_symbol_names_for_codes(
                     status="active",
                 )
             except Exception:
-                pass
+                logger.warning(
+                    "failed to upsert resolved symbol name code=%s name=%s",
+                    code,
+                    name,
+                    exc_info=True,
+                )
 
     return resolved
 
@@ -494,251 +535,53 @@ def _format_pair_with_name(pair: str, ticker_name_map: dict[str, str]) -> str:
     return f"종목미상({ticker})"
 
 
-def _sync_kis_trader_targets_from_morning_advice(
-    *,
-    snapshot: dict[str, Any],
-    label: str,
-    scheduled_at: datetime,
-    trader_state_path: str,
-    max_symbols: int,
-) -> list[str]:
-    if str(label).strip() != "장전":
-        return []
-    path = str(trader_state_path or "").strip()
-    if not path:
-        return []
-    picks = _extract_pick_codes(snapshot, limit=max_symbols)
-    if len(picks) < max_symbols:
-        for item in list(snapshot.get("items") or []):
-            if not isinstance(item, dict):
-                continue
-            summary = str(item.get("summary") or "")
-            for code in re.findall(r"(?<!\d)(\d{6})(?!\d)", summary):
-                if code in picks:
-                    continue
-                picks.append(code)
-                if len(picks) >= max_symbols:
-                    break
-            if len(picks) >= max_symbols:
-                break
-    if not picks:
-        return []
-
-    store = RuntimeStateStore(path)
-    payload = store.read_snapshot() or {}
-    if not isinstance(payload, dict):
-        payload = {}
-    payload["target_symbols"] = picks
-    payload["target_symbols_updated_at"] = utc_now_iso()
-    payload["target_symbols_source"] = "research_runner_morning_advice"
-    payload["target_symbols_as_of"] = scheduled_at.astimezone(KST).strftime(
-        "%Y-%m-%d %H:%M KST"
-    )
-    store.write_snapshot(payload)
-    return picks
-
-
-def _extract_rebalance_target_weights_from_payload(
-    payload: dict[str, Any] | None,
-    *,
-    max_symbols: int,
-) -> dict[str, float]:
-    if not isinstance(payload, dict):
-        return {}
-    pack = payload.get("pack")
-    if not isinstance(pack, dict):
-        return {}
-    seed = pack.get("advice_seed_json")
-    if not isinstance(seed, dict):
-        return {}
-
-    model = seed.get("model_portfolio")
-    rows = []
-    if isinstance(model, dict):
-        rows = [
-            item for item in list(model.get("targets") or []) if isinstance(item, dict)
-        ]
-
-    if not rows:
-        action_plan = seed.get("action_plan")
-        if isinstance(action_plan, dict):
-            rows = [
-                item
-                for item in list(action_plan.get("rebalance_table_rows") or [])
-                if isinstance(item, dict)
-            ]
-
-    out: dict[str, float] = {}
-    for row in rows:
-        ticker = str(row.get("ticker") or "").strip()
-        if not re.fullmatch(r"\d{6}", ticker):
-            continue
-        target = _safe_float(row.get("target_weight"))
-        if target <= 0:
-            continue
-        out[ticker] = max(min(target, 1.0), 0.0)
-        if len(out) >= max(max_symbols, 1):
-            break
-    return out
-
-
-def _extract_target_cash_weight_from_payload(
-    payload: dict[str, Any] | None,
-) -> float | None:
-    if not isinstance(payload, dict):
-        return None
-    pack = payload.get("pack")
-    if not isinstance(pack, dict):
-        return None
-    seed = pack.get("advice_seed_json")
-    if not isinstance(seed, dict):
-        return None
-
-    strategy_spec = seed.get("strategy_spec")
-    if isinstance(strategy_spec, dict):
-        weight = _safe_float(strategy_spec.get("target_cash_weight"))
-        if 0.0 <= weight < 1.0:
-            return round(weight, 6)
-
-    model = seed.get("model_portfolio")
-    if isinstance(model, dict):
-        weight = _safe_float(model.get("target_cash_weight"))
-        if 0.0 <= weight < 1.0:
-            return round(weight, 6)
-
-    return None
-
-
-def _extract_total_value_krw_from_payload(payload: dict[str, Any] | None) -> float:
-    if not isinstance(payload, dict):
-        return 0.0
-    pack = payload.get("pack")
-    if not isinstance(pack, dict):
-        return 0.0
-    seed = pack.get("advice_seed_json")
-    if not isinstance(seed, dict):
-        return 0.0
-    portfolio = seed.get("portfolio")
-    if not isinstance(portfolio, dict):
-        return 0.0
-
-    numeric = _safe_float(portfolio.get("total_value_krw"))
-    if numeric > 0:
-        return numeric
-
-    for key in ("total_krw", "total"):
-        parsed = _parse_krw_amount(portfolio.get(key))
-        if parsed > 0:
-            return parsed
-    return 0.0
-
-
-def _sync_kis_rebalance_targets_to_trader_state(
-    *,
-    payload: dict[str, Any] | None,
-    snapshot: dict[str, Any] | None = None,
-    trader_state_path: str,
-    max_symbols: int,
-) -> dict[str, float]:
-    targets = _extract_rebalance_target_weights_from_payload(
-        payload,
-        max_symbols=max_symbols,
-    )
-    target_cash_weight = _extract_target_cash_weight_from_payload(payload)
-    investable_ratio = 1.0
-    if target_cash_weight is not None:
-        investable_ratio = max(1.0 - target_cash_weight, 0.0)
-    portfolio_total_krw = _extract_total_value_krw_from_payload(payload)
-
-    pick_limit = max(max_symbols, 1)
-    if isinstance(snapshot, dict):
-        pick_codes = _extract_pick_codes(snapshot, limit=pick_limit)
-        if pick_codes:
-            missing = [code for code in pick_codes if code not in targets]
-            if missing:
-                if targets:
-                    base_weight = min(max(min(targets.values()) * 0.5, 0.03), 0.08)
-                    for code in missing:
-                        targets[code] = base_weight
-                else:
-                    equal_weight = investable_ratio / float(len(missing))
-                    for code in missing:
-                        targets[code] = equal_weight
-
-    path = str(trader_state_path or "").strip()
-    if not path:
-        return {}
-
-    store = RuntimeStateStore(path)
-    trader_payload = store.read_snapshot() or {}
-    if not isinstance(trader_payload, dict):
-        trader_payload = {}
-
-    if target_cash_weight is None:
-        existing = _safe_float(trader_payload.get("target_cash_weight"))
-        if 0.0 <= existing < 1.0:
-            target_cash_weight = round(existing, 6)
-            investable_ratio = max(1.0 - target_cash_weight, 0.0)
-
-    if not targets:
-        existing_weights = trader_payload.get("target_weights")
-        if isinstance(existing_weights, dict):
-            recovered: dict[str, float] = {}
-            for raw_ticker, raw_weight in existing_weights.items():
-                ticker = str(raw_ticker or "").strip()
-                if len(ticker) != 6 or not ticker.isdigit():
-                    continue
-                weight = _safe_float(raw_weight)
-                if weight <= 0:
-                    continue
-                recovered[ticker] = weight
-                if len(recovered) >= pick_limit:
-                    break
-            targets = recovered
-
-    if targets:
-        sorted_targets = sorted(targets.items(), key=lambda item: item[1], reverse=True)
-        targets = dict(sorted_targets[:pick_limit])
-        total_weight = sum(float(weight) for weight in targets.values())
-        if total_weight > investable_ratio and investable_ratio >= 0.0:
-            scale = (investable_ratio / total_weight) if total_weight > 0 else 0.0
-            targets = {
-                ticker: round(float(weight) * scale, 6)
-                for ticker, weight in targets.items()
-            }
-
-    if not targets:
-        return {}
-
-    trader_payload["target_weights"] = {
-        ticker: round(weight, 6) for ticker, weight in targets.items()
-    }
-    trader_payload["target_symbols"] = list(targets.keys())
-    if target_cash_weight is not None:
-        trader_payload["target_cash_weight"] = round(target_cash_weight, 6)
-    if portfolio_total_krw > 0:
-        trader_payload["portfolio_total_krw"] = round(portfolio_total_krw, 2)
-    now_iso = utc_now_iso()
-    trader_payload["target_weights_updated_at"] = now_iso
-    trader_payload["target_symbols_updated_at"] = now_iso
-    trader_payload["target_weights_source"] = "research_runner_portfolio_coach"
-    store.write_snapshot(trader_payload)
-    return targets
-
-
 def run(service_name: str = "tradecraft-research") -> None:
     runner_key = "intelligence" if service_name == "tradecraft-intelligence" else "research"
     write_current_runner_pid(runner_key)
     settings = AppSettings()
     update_interval = max(int(settings.research_run_interval_sec), 300)
     reports_interval = max(int(settings.naver_reports_interval_sec), 300)
+    reports_cycle_timeout_sec = max(
+        int(settings.naver_reports_cycle_timeout_sec),
+        0,
+    )
+    state_store = RuntimeStateStore(settings.research_state_path)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.ERROR)
+
+    research_enabled = bool(settings.research_enabled)
+    reports_enabled = _service_reports_enabled(
+        service_name,
+        bool(settings.naver_reports_enabled),
+        research_runner_collect_reports=bool(settings.research_runner_collect_reports),
+    )
+    if not research_enabled and not reports_enabled:
+        _write_research_disabled_snapshot(
+            state_store=state_store,
+            service_name=service_name,
+            research_enabled=research_enabled,
+            reports_enabled=reports_enabled,
+        )
+        logger.info(
+            "%s disabled: TRADECRAFT_RESEARCH_ENABLED=false and "
+            "TRADECRAFT_NAVER_REPORTS_ENABLED=false",
+            service_name,
+        )
+        return
+
     telegram = TelegramBridge(
         TelegramConfig(
             bot_token=settings.telegram_bot_token,
             chat_id=settings.telegram_chat_id,
         )
     )
-    llm_connected = settings.llm_bridge_ready or bool(
+    llm_connected = settings.codex_runtime_ready or bool(
         settings.research_codex_command.strip()
     )
     calendar = KRXHolidayCalendar()
@@ -767,37 +610,22 @@ def run(service_name: str = "tradecraft-research") -> None:
                 factor_weights_json=settings.portfolio_coach_factor_weights_json,
                 ticker_name_map_json=settings.portfolio_coach_ticker_name_map_json,
                 review_queue_enabled=settings.portfolio_coach_review_queue_enabled,
-                llm_bridge_command=settings.llm_bridge_command,
-                llm_bridge_args=settings.llm_bridge_args,
-                llm_bridge_url=settings.llm_bridge_url,
-                llm_bridge_token=settings.llm_bridge_token,
-                llm_bridge_timeout_ms=settings.llm_bridge_timeout_ms,
+                codex_runtime_mode=settings.codex_runtime_mode,
+                codex_runtime_sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
+                codex_runtime_timeout_ms=settings.codex_runtime_timeout_ms,
                 llm_model=settings.llm_model,
+                llm_reasoning_effort=settings.llm_reasoning_effort,
+                llm_usage_enabled=settings.llm_usage_enabled,
+                llm_usage_db_path=settings.llm_usage_db_path,
+                llm_usage_component="portfolio_coach",
+                **codex_native_service_config_kwargs(settings),
             ),
             holdings_provider=KISHoldingsProvider(kis),
             report_repo=report_repository,
             rag_store=rag_store,
             kis=kis,
         )
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.ERROR)
-
-    research_enabled = bool(settings.research_enabled)
-    reports_enabled = bool(settings.naver_reports_enabled)
     once_mode = bool(getattr(settings, "intelligence_once", False))
-    if not research_enabled and not reports_enabled:
-        logger.info(
-            "%s disabled: TRADECRAFT_RESEARCH_ENABLED=false and "
-            "TRADECRAFT_NAVER_REPORTS_ENABLED=false",
-            service_name,
-        )
-        return
 
     pipeline = _build_pipeline(settings) if research_enabled else None
     logger.info(
@@ -871,15 +699,60 @@ def run(service_name: str = "tradecraft-research") -> None:
         if next_report_at is not None and now >= next_report_at:
             report_cycle += 1
             try:
+                logger.info(
+                    "report collection starting: cycle=%s timeout=%ss",
+                    report_cycle,
+                    reports_cycle_timeout_sec,
+                )
+                state_store.write_snapshot(
+                    {
+                        "updated_at": utc_now_iso(),
+                        "source": "research_runner",
+                        "service": service_name,
+                        "status": "report_collection_running",
+                        "reports_enabled": reports_enabled,
+                        "research_enabled": research_enabled,
+                        "report_cycle": report_cycle,
+                        "reports_interval_sec": reports_interval,
+                        "reports_cycle_timeout_sec": reports_cycle_timeout_sec,
+                    }
+                )
                 report_result = asyncio.run(
-                    run_report_collection_cycle(
-                        crawler=report_stack.crawler,
-                        repository=report_repository,
-                        rag_store=rag_store,
-                        rag_enabled=settings.rag_enabled,
-                        rag_sync_chunk_limit=settings.rag_sync_chunk_limit,
+                    run_report_collection_cycle_with_timeout(
+                        run_report_collection_cycle(
+                            crawler=report_stack.crawler,
+                            repository=report_repository,
+                            rag_store=rag_store,
+                            rag_enabled=settings.rag_enabled,
+                            rag_sync_chunk_limit=settings.rag_sync_chunk_limit,
+                        ),
+                        timeout_sec=reports_cycle_timeout_sec,
                     )
                 )
+                if report_result.get("status") == "timeout":
+                    logger.warning(
+                        "report collection timeout: cycle=%s timeout=%ss",
+                        report_cycle,
+                        reports_cycle_timeout_sec,
+                    )
+                    state_store.write_snapshot(
+                        {
+                            "updated_at": utc_now_iso(),
+                            "source": "research_runner",
+                            "service": service_name,
+                            "status": "report_collection_timeout",
+                            "reports_enabled": reports_enabled,
+                            "research_enabled": research_enabled,
+                            "report_cycle": report_cycle,
+                            "error_message": str(
+                                report_result.get("error_message") or ""
+                            ),
+                            "reports_interval_sec": reports_interval,
+                            "reports_cycle_timeout_sec": reports_cycle_timeout_sec,
+                        }
+                    )
+                    next_report_at = now + timedelta(seconds=reports_interval)
+                    continue
                 report_snapshot = report_result.get("snapshot") or {}
                 symbol_refresh = report_result.get("symbol_refresh") or {}
                 rag_sync = report_result.get("rag_sync") or {}
@@ -902,6 +775,22 @@ def run(service_name: str = "tradecraft-research") -> None:
                         or 0
                     ),
                 )
+                state_store.write_snapshot(
+                    {
+                        "updated_at": utc_now_iso(),
+                        "source": "research_runner",
+                        "service": service_name,
+                        "status": "report_collection_ok",
+                        "reports_enabled": reports_enabled,
+                        "research_enabled": research_enabled,
+                        "report_cycle": report_cycle,
+                        "snapshot": report_snapshot,
+                        "symbol_refresh": symbol_refresh,
+                        "rag_sync": rag_sync,
+                        "reports_interval_sec": reports_interval,
+                        "reports_cycle_timeout_sec": reports_cycle_timeout_sec,
+                    }
+                )
                 refreshed_db_updated_at = _report_db_last_updated_at(report_repository)
                 if (
                     pipeline is not None
@@ -915,6 +804,20 @@ def run(service_name: str = "tradecraft-research") -> None:
                     )
             except Exception as exc:
                 logger.warning("report collection failed: %s", exc)
+                state_store.write_snapshot(
+                    {
+                        "updated_at": utc_now_iso(),
+                        "source": "research_runner",
+                        "service": service_name,
+                        "status": "report_collection_error",
+                        "reports_enabled": reports_enabled,
+                        "research_enabled": research_enabled,
+                        "report_cycle": report_cycle,
+                        "error_message": str(exc),
+                        "reports_interval_sec": reports_interval,
+                        "reports_cycle_timeout_sec": reports_cycle_timeout_sec,
+                    }
+                )
             next_report_at = now + timedelta(seconds=reports_interval)
 
         if pipeline is not None and next_advice_at is not None and now >= next_advice_at:
@@ -953,14 +856,22 @@ def run(service_name: str = "tradecraft-research") -> None:
                         message = str(payload.get("message") or "").strip()
                         status = str(payload.get("status") or "unknown")
                         reason = str(payload.get("reason") or "").strip()
+                        llm_status = (
+                            payload.get("llm_status")
+                            if isinstance(payload.get("llm_status"), dict)
+                            else {}
+                        )
                         used = list(payload.get("used_candidates") or [])
                         message_id = int(payload.get("message_id") or 0)
                         logger.info(
-                            "portfolio coach status=%s message_id=%s candidates=%s reason=%s",
+                            "portfolio coach status=%s message_id=%s candidates=%s reason=%s llm_status=%s llm_reason=%s llm_model=%s",
                             status,
                             message_id,
                             len(used),
                             reason,
+                            str(llm_status.get("status") or ""),
+                            str(llm_status.get("reason") or ""),
+                            str(llm_status.get("model") or ""),
                         )
                         if status == "pending_review":
                             logger.info(
@@ -985,141 +896,10 @@ def run(service_name: str = "tradecraft-research") -> None:
                     if message:
                         sent = asyncio.run(telegram.send_message(message))
                         sent_ok = bool(sent.get("ok"))
-                        did_symbol_sync = False
-                        rebalance_targets: dict[str, float] = {}
-                        execution_result: dict[str, Any] = {}
                         if sent_ok:
-                            synced = _sync_kis_trader_targets_from_morning_advice(
-                                snapshot=snapshot,
-                                label=label,
-                                scheduled_at=next_advice_at,
-                                trader_state_path=settings.kis_trader_state_path,
-                                max_symbols=settings.kis_trader_max_candidate_codes,
-                            )
-                            if synced:
-                                did_symbol_sync = True
-                                logger.info(
-                                    "kis trader target symbols synced from morning advice: %s",
-                                    ",".join(synced),
-                                )
-                            rebalance_targets = (
-                                _sync_kis_rebalance_targets_to_trader_state(
-                                    payload=payload,
-                                    snapshot=snapshot,
-                                    trader_state_path=settings.kis_trader_state_path,
-                                    max_symbols=settings.kis_trader_max_candidate_codes,
-                                )
-                            )
-                            if rebalance_targets:
-                                logger.info(
-                                    "kis rebalance targets synced: %s",
-                                    ",".join(
-                                        f"{ticker}:{weight:.3f}"
-                                        for ticker, weight in rebalance_targets.items()
-                                    ),
-                                )
-                        if did_symbol_sync or rebalance_targets:
                             logger.info(
-                                "kis direct trader state updated after advice: symbols=%s weights=%s",
-                                did_symbol_sync,
-                                bool(rebalance_targets),
+                                "research advice sent; KIS block manager consumes research DB/wiki directly"
                             )
-                        if sent_ok and execution_result:
-                            try:
-                                executed_rows = list(
-                                    execution_result.get("executed") or []
-                                )
-                                failed_rows = list(execution_result.get("failed") or [])
-                                ticker_name_map = _extract_payload_ticker_name_map(
-                                    payload
-                                )
-                                pair_tickers = [
-                                    str(row.get("pair") or "").split("/")[0].strip()
-                                    for row in (executed_rows + failed_rows)
-                                ]
-                                resolved_map = _resolve_symbol_names_for_codes(
-                                    codes=pair_tickers,
-                                    report_repository=report_repository,
-                                    kis=kis,
-                                    initial_map=ticker_name_map,
-                                )
-                                ticker_name_map.update(resolved_map)
-                                notice_lines = [
-                                    f"[Portfolio Coach Execution] {label} {next_advice_at.strftime('%Y-%m-%d %H:%M')} (KST)",
-                                    f"- status: {execution_result.get('status')}",
-                                    f"- attempted: {execution_result.get('attempted')}",
-                                    f"- executed: {len(executed_rows)}",
-                                    f"- failed: {len(failed_rows)}",
-                                ]
-                                target_invested = _safe_float(
-                                    execution_result.get("target_invested_ratio")
-                                )
-                                target_cash = _safe_float(
-                                    execution_result.get("target_cash_weight")
-                                )
-                                notice_lines.append(
-                                    "- invested ratio target: "
-                                    f"{target_invested*100:.1f}% (cash {target_cash*100:.1f}%)"
-                                )
-                                actual_invested_raw = execution_result.get(
-                                    "actual_invested_ratio"
-                                )
-                                actual_cash_raw = execution_result.get(
-                                    "actual_cash_ratio"
-                                )
-                                if (
-                                    actual_invested_raw is not None
-                                    or actual_cash_raw is not None
-                                ):
-                                    actual_invested = (
-                                        _safe_float(actual_invested_raw)
-                                        if actual_invested_raw is not None
-                                        else max(
-                                            1.0 - _safe_float(actual_cash_raw), 0.0
-                                        )
-                                    )
-                                    actual_cash = (
-                                        _safe_float(actual_cash_raw)
-                                        if actual_cash_raw is not None
-                                        else max(1.0 - actual_invested, 0.0)
-                                    )
-                                    notice_lines.append(
-                                        "- invested ratio actual: "
-                                        f"{actual_invested*100:.1f}% (cash {actual_cash*100:.1f}%)"
-                                    )
-                                ratio_base_krw = _safe_float(
-                                    execution_result.get("allocation_ratio_base_krw")
-                                )
-                                open_stake_total_krw = _safe_float(
-                                    execution_result.get("open_stake_total_krw")
-                                )
-                                if ratio_base_krw > 0 and open_stake_total_krw >= 0:
-                                    notice_lines.append(
-                                        "- ratio basis: "
-                                        f"open_stake {int(open_stake_total_krw):,} / base {int(ratio_base_krw):,} KRW"
-                                    )
-                                for row in executed_rows[:3]:
-                                    pair = str(row.get("pair") or "")
-                                    display = _format_pair_with_name(
-                                        pair, ticker_name_map
-                                    )
-                                    notice_lines.append(
-                                        f"- filled: {display} / stake {int(_safe_float(row.get('stakeamount'))):,} KRW"
-                                    )
-                                if failed_rows:
-                                    first = failed_rows[0]
-                                    fail_pair = str(first.get("pair") or "")
-                                    fail_display = _format_pair_with_name(
-                                        fail_pair, ticker_name_map
-                                    )
-                                    notice_lines.append(
-                                        f"- fail_sample: {fail_display} / {str(first.get('reason') or '')[:120]}"
-                                    )
-                                asyncio.run(
-                                    telegram.send_message("\n".join(notice_lines))
-                                )
-                            except Exception:
-                                pass
                         if portfolio_coach is not None and payload is not None:
                             portfolio_coach.mark_sent(
                                 payload, status="sent" if sent_ok else "failed"

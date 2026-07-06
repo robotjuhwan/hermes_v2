@@ -1,0 +1,23 @@
+{
+  "workflow_id": "kis_post_close",
+  "version": 1,
+  "scope": "kis",
+  "model_policy": {
+    "default_model": "settings.llm_model",
+    "default_reasoning_effort": "settings.llm_reasoning_effort",
+    "expected_runtime_model": "gpt-5.5",
+    "expected_reasoning_effort": "xhigh"
+  },
+  "cadence": {"kind": "scheduled", "local_time": "15:45"},
+  "required_skills": ["execution_review", "thesis_tracker", "policy_revision", "portfolio_balance"],
+  "required_context": ["account", "blocks", "orders", "fills", "quotes", "investment_memory", "performance"],
+  "output_contracts": ["reflection_contract", "policy_revision_contract"],
+  "authority": {
+    "can_read_untrusted_research": false,
+    "can_write_memory": true,
+    "can_create_blocks": true,
+    "can_submit_orders": false
+  },
+  "safety_gates": ["kill_switch", "memory_write_allowed", "reflection_contract", "policy_sample_count", "no_order_submission"],
+  "prompt_budget": {"max_skill_chars": 6800, "max_workflow_chars": 1600, "max_contract_chars": 5200}
+}

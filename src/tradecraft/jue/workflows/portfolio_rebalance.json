@@ -1,0 +1,23 @@
+{
+  "workflow_id": "portfolio_rebalance",
+  "version": 1,
+  "scope": "shared",
+  "model_policy": {
+    "default_model": "settings.llm_model",
+    "default_reasoning_effort": "settings.llm_reasoning_effort",
+    "expected_runtime_model": "gpt-5.5",
+    "expected_reasoning_effort": "xhigh"
+  },
+  "cadence": {"kind": "scheduled", "local_time": "17:30"},
+  "required_skills": ["portfolio_balance", "risk_sizing", "valuation_frame", "policy_revision"],
+  "required_context": ["account", "positions", "cash", "blocks", "quotes", "policy", "investment_memory"],
+  "output_contracts": ["portfolio_rebalance_contract", "policy_revision_contract"],
+  "authority": {
+    "can_read_untrusted_research": false,
+    "can_write_memory": true,
+    "can_create_blocks": false,
+    "can_submit_orders": false
+  },
+  "safety_gates": ["kill_switch", "cash_available", "position_available", "concentration_limit", "no_order_submission"],
+  "prompt_budget": {"max_skill_chars": 7600, "max_workflow_chars": 1600, "max_contract_chars": 5200}
+}

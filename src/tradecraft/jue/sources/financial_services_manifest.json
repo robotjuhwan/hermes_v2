@@ -1,0 +1,53 @@
+{
+  "source_id": "financial_services",
+  "repository_url": "https://github.com/anthropics/financial-services",
+  "source_license_note": "Reference inspiration only; local skills are compact HERMES adaptations.",
+  "mappings": [
+    {
+      "source_vertical": "equity-research",
+      "source_skill": "idea-generation",
+      "source_url": "https://raw.githubusercontent.com/anthropics/financial-services/main/plugins/vertical-plugins/equity-research/skills/idea-generation/SKILL.md",
+      "local_skill_id": "idea_generation",
+      "adopted_principles": [
+        "systematic screens",
+        "style buckets",
+        "mispricing hypothesis",
+        "reject reasons"
+      ],
+      "excluded_principles": [
+        "US-only assumptions",
+        "long report format"
+      ]
+    },
+    {
+      "source_vertical": "equity-research",
+      "source_skill": "thesis-tracker",
+      "source_url": "https://raw.githubusercontent.com/anthropics/financial-services/main/plugins/vertical-plugins/equity-research/skills/thesis-tracker/SKILL.md",
+      "local_skill_id": "thesis_tracker",
+      "adopted_principles": [
+        "falsifiable thesis",
+        "pillar status",
+        "catalyst tracking",
+        "conviction delta"
+      ],
+      "excluded_principles": [
+        "quarterly-only cadence"
+      ]
+    },
+    {
+      "source_vertical": "wealth-management",
+      "source_skill": "portfolio-rebalance",
+      "source_url": "https://raw.githubusercontent.com/anthropics/financial-services/main/plugins/vertical-plugins/wealth-management/skills/portfolio-rebalance/SKILL.md",
+      "local_skill_id": "portfolio_balance",
+      "adopted_principles": [
+        "allocation drift",
+        "cash plan",
+        "rebalance action",
+        "position concentration"
+      ],
+      "excluded_principles": [
+        "US tax account assumptions"
+      ]
+    }
+  ]
+}

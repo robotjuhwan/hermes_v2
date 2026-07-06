@@ -1,0 +1,23 @@
+{
+  "workflow_id": "instant_symbol_analysis",
+  "version": 1,
+  "scope": "shared",
+  "model_policy": {
+    "default_model": "settings.llm_model",
+    "default_reasoning_effort": "settings.llm_reasoning_effort",
+    "expected_runtime_model": "gpt-5.5",
+    "expected_reasoning_effort": "xhigh"
+  },
+  "cadence": {"kind": "on_demand"},
+  "required_skills": ["thesis_tracker", "catalyst_calendar", "evidence_audit", "block_design"],
+  "required_context": ["symbol", "account", "quotes", "user_directive", "investment_memory", "evidence"],
+  "output_contracts": ["thesis_update_contract", "block_action_contract"],
+  "authority": {
+    "can_read_untrusted_research": false,
+    "can_write_memory": true,
+    "can_create_blocks": true,
+    "can_submit_orders": false
+  },
+  "safety_gates": ["user_directive", "evidence_freshness", "cash_available", "position_available", "executable_price_structure", "no_order_submission"],
+  "prompt_budget": {"max_skill_chars": 7200, "max_workflow_chars": 1600, "max_contract_chars": 5200}
+}

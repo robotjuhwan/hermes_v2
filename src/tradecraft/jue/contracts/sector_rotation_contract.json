@@ -1,0 +1,7 @@
+{
+  "contract_id": "sector_rotation_contract",
+  "version": 1,
+  "required": ["as_of", "sector_map", "leader_laggard_signal", "portfolio_exposure", "rotation_implication"],
+  "source_types": ["market_pulse", "quotes", "account", "reports", "memory", "calendar"],
+  "reject_when": ["missing_as_of", "empty_sector_map", "no_portfolio_exposure", "rotation_implication_missing", "stale_quotes_used"]
+}
