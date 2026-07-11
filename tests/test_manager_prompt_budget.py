@@ -70,7 +70,10 @@ def test_prompt_budget_error_and_alert_message_are_shared() -> None:
         prompt=prompt,
     )
 
-    assert error == "prompt_budget_exceeded: total_chars=190100 max_chars=190000"
+    assert error == (
+        "prompt_budget_contract_violation: prompt_budget_exceeded: "
+        "total_chars=190100 max_chars=190000"
+    )
     assert "[HERMES] Binance 쥬 판단 입력 상한 초과" in message
     assert "- run_id: 42" in message
     assert "- target/warn/max: 150,000 / 180,000 / 190,000" in message

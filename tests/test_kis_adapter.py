@@ -373,6 +373,73 @@ def test_kis_domestic_order_tr_ids_use_current_cash_order_family() -> None:
     assert config.tr_id_order_cancelable == "TTTC0084R"
 
 
+def test_kis_fetch_domestic_daily_prices_normalizes_chart_rows(monkeypatch) -> None:
+    adapter = KISAdapter(
+        KISConfig(
+            app_key="app",
+            app_secret="secret",
+            account_no="12345678",
+            product_code="01",
+            rate_limit_enabled=False,
+        )
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_get_access_token() -> str:
+        return "token"
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        captured.update({"method": method, "url": url, **kwargs})
+        return httpx.Response(200), {
+            "rt_cd": "0",
+            "output2": [
+                {
+                    "stck_bsop_date": "20260710",
+                    "stck_oprc": "61500",
+                    "stck_hgpr": "63000",
+                    "stck_lwpr": "61000",
+                    "stck_clpr": "62800",
+                    "acml_vol": "1200",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(adapter, "_get_access_token", fake_get_access_token)
+    monkeypatch.setattr(adapter, "_request_json", fake_request_json)
+
+    rows = asyncio.run(
+        adapter.fetch_domestic_daily_prices(
+            "005930",
+            start_date="20260601",
+            end_date="20260710",
+        )
+    )
+
+    assert str(captured["url"]).endswith(
+        "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    )
+    assert captured["method"] == "get"
+    assert captured["headers"]["tr_id"] == "FHKST03010100"
+    assert captured["params"] == {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": "005930",
+        "FID_INPUT_DATE_1": "20260601",
+        "FID_INPUT_DATE_2": "20260710",
+        "FID_PERIOD_DIV_CODE": "D",
+        "FID_ORG_ADJ_PRC": "0",
+    }
+    assert rows == [
+        {
+            "open_time": "2026-07-10",
+            "open": 61_500.0,
+            "high": 63_000.0,
+            "low": 61_000.0,
+            "close": 62_800.0,
+            "volume": 1_200.0,
+        }
+    ]
+
+
 def test_kis_balance_pages_use_account_rate_bucket(monkeypatch) -> None:
     adapter = KISAdapter(
         KISConfig(

@@ -73,6 +73,13 @@ _SECTION_KEYS = {
     "active_policy_rule_count",
     "validation_repair_backlog_status",
     "validation_repair_backlog_count",
+    "active_read_mode",
+    "active_read_mode_status",
+    "publication_age_sec",
+    "publication_status",
+    "configured_read_mode",
+    "stored_read_mode",
+    "read_mode_mismatch",
 }
 _STATUS_KEYS = {
     "status",
@@ -94,6 +101,13 @@ _STATUS_KEYS = {
     "enabled",
     "queued_count",
     "failed_count",
+    "active_read_mode",
+    "active_read_mode_status",
+    "publication_age_sec",
+    "publication_status",
+    "configured_read_mode",
+    "stored_read_mode",
+    "read_mode_mismatch",
 }
 _CONFIG_KEYS = {
     "quote_interval_sec",
@@ -202,6 +216,72 @@ _REMEDIATION_KEYS = {
     "endpoint",
     "method",
     "signals",
+    "requires_confirmation",
+}
+_FOLLOW_UP_ACTION_KEYS = {
+    "id",
+    "label",
+    "detail",
+    "severity",
+    "endpoint",
+    "method",
+    "requires_confirmation",
+}
+_ACTIVITY_PRESSURE_KEYS = {
+    "status",
+    "level",
+    "source",
+    "zero_action_streak",
+    "binance_zero_action_streak",
+    "activity_gap_status",
+    "entry_stale_hours",
+    "candidate_symbols",
+}
+_ENTRY_ACTIVITY_KEYS = {
+    "version",
+    "status",
+    "latest_binance_entry_at",
+    "latest_binance_entry_market",
+    "latest_upbit_entry_at",
+    "binance_entry_stale_hours",
+    "binance_entry_count",
+    "upbit_entry_count",
+}
+_CONTRACT_REPLAY_KEYS = {
+    "contract_replay_status",
+    "stored_error_message",
+    "current_contract_error",
+    "action_count",
+    "current_replay_action_count",
+    "current_replay_auto_action_count",
+    "current_replay_action_sections",
+    "current_replay_hold_summary",
+    "current_replay_watch_symbols",
+    "current_replay_next_triggers",
+    "current_replay_data_gaps",
+    "current_replay_auto_create_preview",
+}
+_CONTRACT_REPLAY_AUTO_CREATE_PREVIEW_TEXT_KEYS = {
+    "symbol",
+    "market",
+    "side",
+    "entry_style",
+    "entry_trigger_operator",
+    "auto_materialized_reason",
+}
+_CONTRACT_REPLAY_AUTO_CREATE_PREVIEW_NUMERIC_KEYS = {
+    "entry_trigger_price",
+    "entry_price",
+    "target_price",
+    "stop_price",
+    "qty",
+    "quote_budget_usdt",
+    "quote_budget_krw",
+    "min_executable_notional_usdt",
+    "min_executable_notional_krw",
+    "min_executable_qty",
+    "notional_estimate_usdt",
+    "notional_estimate_krw",
 }
 _SECTION_NAMES = {
     "memory",
@@ -234,6 +314,7 @@ class OpsRouteDeps:
     build_settings_catalog: Callable[[], dict[str, Any]]
     update_settings_env: Callable[..., dict[str, Any]]
     build_ops_restart_readiness: Callable[[], dict[str, Any]] | None = None
+    build_compact_ops_readiness: Callable[[], dict[str, Any]] | None = None
 
 
 def _restart_includes_kis_block_trader(keys: list[Any] | None) -> bool:
@@ -242,11 +323,25 @@ def _restart_includes_kis_block_trader(keys: list[Any] | None) -> bool:
     return any(str(key) == "kis_block_trader" for key in keys)
 
 
+def _restart_includes_binance_block_trader(keys: list[Any] | None) -> bool:
+    if keys is None:
+        return True
+    return any(str(key) == "binance_block_trader" for key in keys)
+
+
 def _safe_non_negative_int(value: Any) -> int:
     try:
         return max(int(float(value or 0)), 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _safe_positive_float(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if parsed > 0 else 0.0
 
 
 def _clean_text(value: Any, *, limit: int = _TEXT_LIMIT) -> str:
@@ -296,13 +391,18 @@ def _compact_ops_readiness(payload: dict[str, Any]) -> dict[str, Any]:
     trading_validation = payload.get("trading_validation")
     if isinstance(trading_validation, dict):
         compact["trading_validation"] = _compact_trading_validation(trading_validation)
-    remediation_actions = payload.get("remediation_actions")
-    if isinstance(remediation_actions, list):
-        compact["remediation_actions"] = [
-            _compact_remediation_action(row)
-            for row in remediation_actions[:8]
-            if isinstance(row, dict)
-        ]
+    for action_key in (
+        "remediation_actions",
+        "operational_remediation_actions",
+        "advisory_actions",
+    ):
+        actions = payload.get(action_key)
+        if isinstance(actions, list):
+            compact[action_key] = [
+                _compact_remediation_action(row)
+                for row in actions[:8]
+                if isinstance(row, dict)
+            ]
     return compact
 
 
@@ -345,6 +445,32 @@ def _compact_readiness_section(section: dict[str, Any]) -> dict[str, Any]:
             )
         if compact_status:
             compact["status"] = compact_status
+        v3 = status.get("v3")
+        if isinstance(v3, dict):
+            compact_status["v3"] = _compact_wiki_v3(v3)
+        for key in ("comparison_count_by_venue", "eligibility_by_venue"):
+            value = status.get(key)
+            if isinstance(value, dict):
+                compact_status[key] = _compact_wiki_venue_map(value)
+        scope_health = status.get("scope_health_by_venue")
+        if isinstance(scope_health, dict):
+            compact_status["scope_health_by_venue"] = _compact_wiki_v3(
+                {"by_scope": scope_health}
+            ).get("by_scope", {})
+        if compact_status:
+            compact["status"] = compact_status
+    section_v3 = section.get("v3")
+    if isinstance(section_v3, dict):
+        compact["v3"] = _compact_wiki_v3(section_v3)
+    for key in ("comparison_count_by_venue", "eligibility_by_venue"):
+        value = section.get(key)
+        if isinstance(value, dict):
+            compact[key] = _compact_wiki_venue_map(value)
+    scope_health = section.get("scope_health_by_venue")
+    if isinstance(scope_health, dict):
+        compact["scope_health_by_venue"] = _compact_wiki_v3(
+            {"by_scope": scope_health}
+        ).get("by_scope", {})
     schedule = section.get("schedule")
     if isinstance(schedule, dict):
         compact_schedule = _copy_present(schedule, _SCHEDULE_KEYS)
@@ -353,12 +479,247 @@ def _compact_readiness_section(section: dict[str, Any]) -> dict[str, Any]:
     runner = section.get("runner")
     if isinstance(runner, dict):
         compact["runner"] = _compact_process(runner)
+    warnings = section.get("warnings")
+    if isinstance(warnings, list):
+        compact["warnings"] = [str(item) for item in warnings[:8]]
+    activity_pressure = section.get("activity_pressure")
+    if isinstance(activity_pressure, dict):
+        compact_pressure = _copy_present(activity_pressure, _ACTIVITY_PRESSURE_KEYS)
+        if isinstance(compact_pressure.get("candidate_symbols"), list):
+            compact_pressure["candidate_symbols"] = [
+                str(symbol)
+                for symbol in compact_pressure["candidate_symbols"][:8]
+                if symbol not in (None, "")
+            ]
+        if compact_pressure:
+            compact["activity_pressure"] = compact_pressure
+    activity_repair_actions = section.get("activity_repair_actions")
+    if isinstance(activity_repair_actions, list):
+        compact_activity_repairs = [
+            _compact_remediation_action(action)
+            for action in activity_repair_actions[:6]
+            if isinstance(action, dict)
+        ]
+        if compact_activity_repairs:
+            compact["activity_repair_actions"] = compact_activity_repairs
+    entry_activity = section.get("entry_activity")
+    if isinstance(entry_activity, dict):
+        compact_entry_activity = _copy_present(entry_activity, _ENTRY_ACTIVITY_KEYS)
+        for key in (
+            "version",
+            "status",
+            "latest_binance_entry_at",
+            "latest_binance_entry_market",
+            "latest_upbit_entry_at",
+        ):
+            if key in compact_entry_activity:
+                compact_entry_activity[key] = _clean_text(
+                    compact_entry_activity[key],
+                    limit=120,
+                )
+        if compact_entry_activity:
+            compact["entry_activity"] = compact_entry_activity
+    contract_replay = section.get("manager_contract_replay")
+    if isinstance(contract_replay, dict):
+        compact_replay = _compact_contract_replay(contract_replay)
+        if compact_replay:
+            compact["manager_contract_replay"] = compact_replay
     config = section.get("config")
     if isinstance(config, dict):
         compact_config = _copy_present(config, _CONFIG_KEYS)
         if compact_config:
             compact["config"] = compact_config
     return compact
+
+
+def _compact_wiki_venue_map(value: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for venue in ("kis", "binance"):
+        row = value.get(venue)
+        if isinstance(row, dict):
+            compact[venue] = {
+                key: child
+                for key, child in row.items()
+                if key
+                in {
+                    "venue",
+                    "version",
+                    "required_eligible",
+                    "complete_sample_count",
+                    "reason",
+                    "evaluated_at",
+                    "evaluated_through",
+                }
+                and isinstance(child, (str, int, float, bool))
+            }
+            blockers = row.get("blockers")
+            if isinstance(blockers, list):
+                compact[venue]["blockers"] = [
+                    _clean_text(blocker, limit=120) for blocker in blockers[:8]
+                ]
+            for key in (
+                "venue",
+                "version",
+                "reason",
+                "evaluated_at",
+                "evaluated_through",
+            ):
+                if key in compact[venue]:
+                    compact[venue][key] = _clean_text(
+                        compact[venue][key],
+                        limit=120,
+                    )
+        elif isinstance(row, (int, float)) and not isinstance(row, bool):
+            compact[venue] = row
+    return compact
+
+
+def _compact_wiki_v3(v3: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        key: value
+        for key, value in v3.items()
+        if key
+        in {
+            "active_read_mode",
+            "stale_count",
+            "conflicted_count",
+            "orphan_page_count",
+            "repair_backlog_count",
+            "last_ingest_status",
+            "last_compile_status",
+            "last_lint_status",
+            "last_publish_status",
+            "last_projection_status",
+        }
+        and isinstance(value, (str, int, float, bool))
+    }
+    by_scope = v3.get("by_scope")
+    if isinstance(by_scope, dict):
+        compact["by_scope"] = {}
+        for venue in ("kis", "binance"):
+            row = by_scope.get(venue)
+            if not isinstance(row, dict):
+                continue
+            compact_row = {
+                key: child
+                for key, child in row.items()
+                if key
+                in {
+                    "snapshot_id",
+                    "snapshot_created_at",
+                    "snapshot_age_sec",
+                    "stale_count",
+                    "conflicted_count",
+                    "orphan_page_count",
+                    "repair_backlog_count",
+                    "last_ingest_status",
+                    "last_compile_status",
+                    "last_lint_status",
+                    "last_publish_status",
+                    "last_projection_status",
+                    "projection_warning_reason",
+                }
+                and isinstance(child, (str, int, float, bool))
+            }
+            index_rebuild = row.get("index_rebuild")
+            if isinstance(index_rebuild, dict):
+                compact_row["index_rebuild"] = _copy_present(
+                    index_rebuild,
+                    {"status", "scope", "updated_at"},
+                )
+            compact["by_scope"][venue] = compact_row
+    mode_eligibility = v3.get("mode_eligibility")
+    if isinstance(mode_eligibility, dict):
+        compact["mode_eligibility"] = _compact_wiki_venue_map(
+            mode_eligibility
+        )
+    return compact
+
+
+def _compact_contract_replay(replay: dict[str, Any]) -> dict[str, Any]:
+    compact = _copy_present(replay, _CONTRACT_REPLAY_KEYS)
+    for key in (
+        "stored_error_message",
+        "current_contract_error",
+        "current_replay_hold_summary",
+    ):
+        if key in compact:
+            compact[key] = _clean_text(compact[key])
+    sections = compact.get("current_replay_action_sections")
+    if isinstance(sections, dict):
+        compact_sections: dict[str, Any] = {}
+        for key, value in list(sections.items())[:8]:
+            if isinstance(value, (int, float, bool)) and value not in (None, ""):
+                compact_sections[str(key)] = value
+        if compact_sections:
+            compact["current_replay_action_sections"] = compact_sections
+        else:
+            compact.pop("current_replay_action_sections", None)
+    symbols = compact.get("current_replay_watch_symbols")
+    if isinstance(symbols, list):
+        compact["current_replay_watch_symbols"] = [
+            _clean_text(symbol, limit=120)
+            for symbol in symbols[:8]
+            if symbol not in (None, "")
+        ]
+    triggers = compact.get("current_replay_next_triggers")
+    if isinstance(triggers, list):
+        compact_triggers: list[dict[str, Any]] = []
+        for row in triggers[:8]:
+            if not isinstance(row, dict):
+                continue
+            trigger: dict[str, Any] = {}
+            for key in ("symbol", "market", "condition", "reason"):
+                value = row.get(key)
+                if value not in (None, "", [], {}):
+                    trigger[key] = _clean_text(value, limit=220 if key == "reason" else 120)
+            price = row.get("price")
+            if isinstance(price, (int, float)) and not isinstance(price, bool):
+                trigger["price"] = price
+            elif price not in (None, "", [], {}):
+                trigger["price"] = _clean_text(price, limit=120)
+            if trigger:
+                compact_triggers.append(trigger)
+        compact["current_replay_next_triggers"] = compact_triggers
+    gaps = compact.get("current_replay_data_gaps")
+    if isinstance(gaps, list):
+        compact["current_replay_data_gaps"] = [
+            _clean_text(gap, limit=120)
+            for gap in gaps[:8]
+            if gap not in (None, "")
+        ]
+    auto_create_preview = compact.get("current_replay_auto_create_preview")
+    if isinstance(auto_create_preview, list):
+        compact["current_replay_auto_create_preview"] = (
+            _compact_contract_replay_auto_create_preview(auto_create_preview)
+        )
+    return {
+        key: value
+        for key, value in compact.items()
+        if value not in (None, "", [], {})
+    }
+
+
+def _compact_contract_replay_auto_create_preview(
+    value: list[Any],
+) -> list[dict[str, Any]]:
+    previews: list[dict[str, Any]] = []
+    for row in value[:8]:
+        if not isinstance(row, dict):
+            continue
+        preview: dict[str, Any] = {}
+        for key in _CONTRACT_REPLAY_AUTO_CREATE_PREVIEW_TEXT_KEYS:
+            item = row.get(key)
+            if item not in (None, "", [], {}):
+                preview[key] = _clean_text(item, limit=160)
+        for key in _CONTRACT_REPLAY_AUTO_CREATE_PREVIEW_NUMERIC_KEYS:
+            item = row.get(key)
+            parsed = _safe_positive_float(item)
+            if parsed > 0:
+                preview[key] = parsed
+        if preview:
+            previews.append(preview)
+    return previews
 
 
 def _compact_advisory_detail(row: dict[str, Any]) -> dict[str, Any]:
@@ -421,6 +782,54 @@ def _compact_remediation_action(row: dict[str, Any]) -> dict[str, Any]:
         compact["signals"] = compact["signals"][:8]
     if "detail" in compact:
         compact["detail"] = _clean_text(compact["detail"])
+    request_payload = row.get("request_payload")
+    if isinstance(request_payload, dict):
+        compact_request = _compact_request_payload(request_payload)
+        if compact_request:
+            compact["request_payload"] = compact_request
+    follow_up_actions = row.get("follow_up_actions")
+    if isinstance(follow_up_actions, list):
+        compact_follow_ups = [
+            _compact_follow_up_action(action)
+            for action in follow_up_actions[:6]
+            if isinstance(action, dict)
+        ]
+        if compact_follow_ups:
+            compact["follow_up_actions"] = compact_follow_ups
+    return compact
+
+
+def _compact_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    compact_request = _copy_present(
+        payload,
+        {
+            "keys",
+            "symbols",
+            "targets",
+            "confirm_active_trading_restart",
+            "confirm_live_manager_run",
+            "confirm_live_executor_tick",
+        },
+    )
+    for key in ("keys", "symbols", "targets"):
+        if isinstance(compact_request.get(key), list):
+            compact_request[key] = [
+                str(item)
+                for item in compact_request[key][:8]
+                if item not in (None, "")
+            ]
+    return compact_request
+
+
+def _compact_follow_up_action(row: dict[str, Any]) -> dict[str, Any]:
+    compact = _copy_present(row, _FOLLOW_UP_ACTION_KEYS)
+    if "detail" in compact:
+        compact["detail"] = _clean_text(compact["detail"])
+    request_payload = row.get("request_payload")
+    if isinstance(request_payload, dict):
+        compact_request = _compact_request_payload(request_payload)
+        if compact_request:
+            compact["request_payload"] = compact_request
     return compact
 
 
@@ -483,6 +892,28 @@ def _kis_restart_needs_active_trading_confirmation(
     return active_count > 0
 
 
+def _binance_restart_needs_active_trading_confirmation(
+    readiness: dict[str, Any],
+    keys: list[Any] | None,
+) -> bool:
+    if not _restart_includes_binance_block_trader(keys):
+        return False
+    binance_payload = (
+        readiness.get("binance_block_trader")
+        if isinstance(readiness.get("binance_block_trader"), dict)
+        else {}
+    )
+    execution = (
+        binance_payload.get("execution")
+        if isinstance(binance_payload.get("execution"), dict)
+        else {}
+    )
+    return any(
+        str(execution.get(key) or "").strip().lower() == "live"
+        for key in ("spot_mode", "futures_mode", "upbit_spot_mode")
+    )
+
+
 def build_ops_router(deps: OpsRouteDeps) -> APIRouter:
     router = APIRouter()
 
@@ -500,6 +931,11 @@ def build_ops_router(deps: OpsRouteDeps) -> APIRouter:
         compact: bool = False,
         _: Any = Depends(deps.require_admin_auth),
     ) -> dict[str, Any]:
+        if compact and deps.build_compact_ops_readiness is not None:
+            payload = deps.build_compact_ops_readiness()
+            if bool(payload.get("compact")):
+                return payload
+            return _compact_ops_readiness(payload)
         payload = deps.build_ops_readiness()
         if compact:
             return _compact_ops_readiness(payload)
@@ -566,11 +1002,22 @@ def build_ops_router(deps: OpsRouteDeps) -> APIRouter:
                 status_code=409,
                 detail="kis restart requires confirmation during active market blocks",
             )
+        if (
+            not bool(body.get("confirm_active_trading_restart"))
+            and _binance_restart_needs_active_trading_confirmation(readiness, keys)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "binance restart requires confirmation while live crypto "
+                    "execution is enabled"
+                ),
+            )
         try:
             result = deps.restart_runner_processes(keys, delay_sec=0.5)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        result["message"] = "control/runner restart scheduled"
+        result["message"] = "verified rolling runner recovery scheduled"
         return result
 
     @router.get("/api/settings/catalog")

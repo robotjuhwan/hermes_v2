@@ -42,6 +42,7 @@ class KISConfig:
     tr_id_balance: str = "TTTC8434R"
     tr_id_us_present_balance: str = "CTRP6504R"
     tr_id_quote: str = "FHKST01010100"
+    tr_id_daily_chart: str = "FHKST03010100"
     tr_id_order_buy: str = "TTTC0012U"
     tr_id_order_sell: str = "TTTC0011U"
     tr_id_order_revise_cancel: str = "TTTC0013U"
@@ -339,6 +340,83 @@ class KISAdapter:
             "price": price,
             "raw": output,
         }
+
+    async def fetch_domestic_daily_prices(
+        self,
+        symbol: str,
+        *,
+        start_date: str,
+        end_date: str,
+        adjusted: bool = True,
+    ) -> list[dict[str, Any]]:
+        if not self.config.ready:
+            raise KISAPIError("kis config missing")
+
+        code = str(symbol or "").strip()
+        if len(code) != 6 or not code.isdigit():
+            raise KISAPIError("invalid domestic symbol")
+        start = str(start_date or "").strip()
+        end = str(end_date or "").strip()
+        if any(len(value) != 8 or not value.isdigit() for value in (start, end)):
+            raise KISAPIError("invalid domestic chart date")
+
+        token = await self._get_access_token()
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": code,
+            "FID_INPUT_DATE_1": start,
+            "FID_INPUT_DATE_2": end,
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "0" if adjusted else "1",
+        }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "appkey": self.config.app_key,
+            "appsecret": self.config.app_secret,
+            "tr_id": self.config.tr_id_daily_chart,
+            "custtype": self.config.cust_type,
+            "Accept": "application/json",
+        }
+        url = (
+            f"{self.config.base_url.rstrip('/')}"
+            "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        )
+        response, payload = await self._request_json(
+            "get",
+            url,
+            params=params,
+            headers=headers,
+            timeout=httpx.Timeout(10.0),
+        )
+        if response.status_code >= 400:
+            raise KISAPIError(f"kis daily chart request failed: {payload}")
+        if str(payload.get("rt_cd")) != "0":
+            message = str(payload.get("msg1") or payload.get("msg_cd") or payload)
+            raise KISAPIError(f"kis daily chart request rejected: {message}")
+
+        output = payload.get("output2")
+        if not isinstance(output, list):
+            raise KISAPIError("kis daily chart malformed response")
+        rows: list[dict[str, Any]] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            raw_date = str(item.get("stck_bsop_date") or "").strip()
+            if len(raw_date) != 8 or not raw_date.isdigit():
+                continue
+            rows.append(
+                {
+                    "open_time": (
+                        f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+                    ),
+                    "open": self._to_float(item.get("stck_oprc")),
+                    "high": self._to_float(item.get("stck_hgpr")),
+                    "low": self._to_float(item.get("stck_lwpr")),
+                    "close": self._to_float(item.get("stck_clpr")),
+                    "volume": self._to_float(item.get("acml_vol")),
+                }
+            )
+        return rows
 
     async def submit_domestic_order(
         self,

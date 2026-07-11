@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from tradecraft.services.db_retention import SQLiteRetentionPruner
@@ -112,9 +114,33 @@ from tradecraft.services.kis_manager_prompt import (
     validation_repair_note as build_validation_repair_note,
 )
 from tradecraft.services.manager_prompt_budget import attach_jue_wiki_budget_report
+from tradecraft.services.manager_prompt_contract import (
+    ManagerPromptContractViolation,
+    build_manager_prompt_bundle,
+)
+from tradecraft.services.manager_run_telemetry import (
+    ManagerRunTelemetryV1,
+    build_fill_provenance_summary,
+    manager_action_count,
+)
 from tradecraft.services.jue_wiki_application import (
     build_jue_wiki_quality_pressure_action_plan_for_prompt,
     summarize_jue_wiki_quality_pressure_for_prompt,
+)
+from tradecraft.services.jue_wiki_risk import (
+    apply_kis_wiki_decision_gate as shared_apply_kis_wiki_decision_gate,
+)
+from tradecraft.services.jue_wiki_shadow import (
+    WikiShadowRecordingV1,
+)
+from tradecraft.services.jue_wiki_prompt_policy import (
+    apply_jue_wiki_prompt_policy,
+    attach_jue_wiki_decision_gate as shared_attach_jue_wiki_decision_gate,
+    preserve_wiki_context_packet,
+)
+from tradecraft.services.jue_wiki_contract import (
+    WIKI_GATE_IDENTITY_MAX_CHARS,
+    WikiDecisionGateV1,
 )
 from tradecraft.services.jue_wiki import normalize_jue_wiki_quality_status
 from tradecraft.services.jue_wiki_prompt_quality import (
@@ -190,11 +216,16 @@ from tradecraft.services.kis_price import aggressive_limit_price
 from tradecraft.services.kis_reconciliation import (
     build_reconciliation_plan,
 )
+from tradecraft.services.kis_research_packet import (
+    build_kis_research_packets_for_symbols,
+)
+from tradecraft.services.kis_signal_context import collect_kis_signal_context
 from tradecraft.services.kis_snapshot import (
     compact_kis_manager_run as build_compact_kis_manager_run,
     history_kis_block_rows as build_history_kis_block_rows,
     visible_kis_block_rows as build_visible_kis_block_rows,
 )
+from tradecraft.services.kis_status_reader import read_kis_repository_status
 from tradecraft.services.jue_decision_packet import (
     build_decision_lifecycle_packet,
     build_decision_packet,
@@ -216,6 +247,9 @@ from tradecraft.services.market_judgment import (
     build_market_clock,
     normalize_account_assets,
 )
+from tradecraft.services.market_bars import MarketBarRepository
+
+logger = logging.getLogger(__name__)
 
 BLOCK_STATUSES = {
     "proposed",
@@ -227,6 +261,198 @@ BLOCK_STATUSES = {
     "error",
 }
 ACTIVE_BLOCK_STATUSES = {"entry_pending", "open", "exit_pending"}
+
+_WIKI_SIZE_FIELDS = (
+    "qty",
+    "quantity",
+    "qty_open",
+    "qty_initial",
+    "target_qty",
+    "target_quantity",
+    "new_qty",
+    "size",
+    "position_size",
+    "position_qty",
+)
+_WIKI_NOTIONAL_FIELDS = (
+    "notional",
+    "notional_krw",
+    "target_notional",
+    "target_notional_krw",
+    "quote_budget_krw",
+    "max_notional_krw",
+    "target_block_value_krw",
+)
+_WIKI_AUDIT_ID_MAX_CHARS = 120
+
+
+def _wiki_gate_payload(gate: WikiDecisionGateV1 | dict[str, Any]) -> dict[str, Any]:
+    return gate.to_dict() if isinstance(gate, WikiDecisionGateV1) else dict(gate)
+
+
+def _trusted_wiki_decision_gate(
+    gate: WikiDecisionGateV1 | dict[str, Any] | None,
+    *,
+    trusted_read_mode: str,
+) -> dict[str, Any]:
+    if trusted_read_mode != "required":
+        return {
+            "allow_new_risk": True,
+            "allow_exit_actions": True,
+            "reason": "wiki_context_advisory",
+            "read_mode": trusted_read_mode,
+            "snapshot_id": "",
+            "version": "wiki_decision_gate_v1",
+        }
+    if not isinstance(gate, (WikiDecisionGateV1, dict)):
+        payload: dict[str, Any] = {}
+    else:
+        payload = _wiki_gate_payload(gate)
+    if not payload:
+        invalid_reason = "wiki_required_gate_missing"
+    elif payload.get("version") != "wiki_decision_gate_v1":
+        invalid_reason = "wiki_required_gate_invalid:version"
+    elif payload.get("read_mode") != "required":
+        invalid_reason = "wiki_required_gate_invalid:read_mode"
+    elif type(payload.get("allow_new_risk")) is not bool:
+        invalid_reason = "wiki_required_gate_invalid:allow_new_risk"
+    elif payload.get("allow_exit_actions") is not True:
+        invalid_reason = "wiki_required_gate_invalid:allow_exit_actions"
+    elif not isinstance(payload.get("reason"), str) or not payload.get("reason"):
+        invalid_reason = "wiki_required_gate_invalid:reason"
+    elif len(payload["reason"]) > WIKI_GATE_IDENTITY_MAX_CHARS:
+        invalid_reason = "wiki_required_gate_invalid:reason"
+    elif not isinstance(payload.get("snapshot_id"), str):
+        invalid_reason = "wiki_required_gate_invalid:snapshot_id"
+    elif len(payload["snapshot_id"]) > WIKI_GATE_IDENTITY_MAX_CHARS:
+        invalid_reason = "wiki_required_gate_invalid:snapshot_id"
+    elif payload.get("allow_new_risk") is True and payload.get("reason") != "wiki_context_eligible":
+        invalid_reason = "wiki_required_gate_invalid:reason"
+    elif payload.get("allow_new_risk") is False and not str(payload.get("reason")).startswith(
+        "wiki_required_"
+    ):
+        invalid_reason = "wiki_required_gate_invalid:reason"
+    elif payload.get("allow_new_risk") is True and (
+        not isinstance(payload.get("snapshot_id"), str)
+        or not str(payload.get("snapshot_id")).strip()
+    ):
+        invalid_reason = "wiki_required_gate_invalid:snapshot_id"
+    else:
+        return {
+            "allow_new_risk": payload["allow_new_risk"],
+            "allow_exit_actions": True,
+            "reason": str(payload["reason"]),
+            "read_mode": "required",
+            "snapshot_id": str(payload.get("snapshot_id") or ""),
+            "version": "wiki_decision_gate_v1",
+        }
+    return {
+        "allow_new_risk": False,
+        "allow_exit_actions": True,
+        "reason": invalid_reason,
+        "read_mode": "required",
+        "snapshot_id": "",
+        "version": "wiki_decision_gate_v1",
+    }
+
+
+def _wiki_current_block_index(
+    current_blocks: dict[str, dict[str, Any]] | list[dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    if isinstance(current_blocks, dict):
+        return {
+            str(block_id): row
+            for block_id, row in current_blocks.items()
+            if isinstance(row, dict)
+        }
+    return {
+        str(row.get("block_id") or ""): row
+        for row in list(current_blocks or [])
+        if isinstance(row, dict) and str(row.get("block_id") or "")
+    }
+
+
+def _wiki_numeric_aliases(
+    row: dict[str, Any],
+    keys: tuple[str, ...],
+) -> tuple[bool, tuple[float, ...], bool]:
+    values: list[float] = []
+    invalid = False
+    for key in keys:
+        if key not in row:
+            continue
+        value = row.get(key)
+        if isinstance(value, bool):
+            invalid = True
+            continue
+        try:
+            parsed = float(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            invalid = True
+            continue
+        if not math.isfinite(parsed) or parsed < 0:
+            invalid = True
+            continue
+        values.append(parsed)
+    return bool(values) or invalid, tuple(values), invalid
+
+
+def _wiki_alias_update_increases(
+    row: dict[str, Any],
+    keys: tuple[str, ...],
+    *,
+    current_value: float,
+) -> bool:
+    present, values, invalid = _wiki_numeric_aliases(row, keys)
+    if not present:
+        return False
+    if invalid or not values:
+        return True
+    first = values[0]
+    if any(not math.isclose(value, first, rel_tol=1e-9, abs_tol=1e-12) for value in values[1:]):
+        return True
+    if current_value <= 0:
+        return first > 0
+    return any(value > current_value for value in values)
+
+
+def _kis_wiki_update_adds_new_risk(
+    row: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    current_size = next(
+        (
+            _safe_float(current.get(key))
+            for key in ("qty_open", "qty", "quantity", "qty_initial")
+            if current.get(key) not in (None, "")
+        ),
+        0.0,
+    )
+    current_notional = next(
+        (
+            _safe_float(current.get(key))
+            for key in (
+                "notional_krw",
+                "notional",
+                "target_notional_krw",
+                "target_block_value_krw",
+            )
+            if current.get(key) not in (None, "")
+        ),
+        current_size * _safe_float(current.get("entry_price")),
+    )
+    return _wiki_alias_update_increases(
+        row,
+        _WIKI_SIZE_FIELDS,
+        current_value=current_size,
+    ) or _wiki_alias_update_increases(
+        row,
+        _WIKI_NOTIONAL_FIELDS,
+        current_value=current_notional,
+    )
+
+
+apply_kis_wiki_decision_gate = shared_apply_kis_wiki_decision_gate
 VISIBLE_BLOCK_STATUSES = ACTIVE_BLOCK_STATUSES | {"proposed"}
 KST = ZoneInfo("Asia/Seoul")
 class StrategyEngine(Protocol):
@@ -1240,7 +1466,9 @@ class KISBlockTraderConfig:
     prompt_target_chars: int = 100_000
     prompt_warn_chars: int = 150_000
     prompt_max_chars: int = 190_000
+    jue_wiki_read_mode: str = "shadow"
     strategy_revision_id: str = "jue_edge_repair_v1"
+    market_bar_db_path: str = ""
 
 
 def _jue_wiki_prompt_mode(jue_wiki: dict[str, Any] | None) -> str:
@@ -3301,6 +3529,10 @@ def _attach_jue_wiki_prompt_context(
         }
     prompt["jue_wiki"] = payload
     prompt["jue_wiki_application"] = _jue_wiki_application_metadata(payload)
+    decision_inputs = list(prompt.get("decision_inputs") or [])
+    if "jue_wiki" not in decision_inputs:
+        decision_inputs.append("jue_wiki")
+    prompt["decision_inputs"] = decision_inputs
     _attach_jue_wiki_requested_symbol_coverage_input(prompt)
     _attach_jue_wiki_memory_card_quality_input(prompt)
     _attach_jue_wiki_validation_repair_effectiveness_input(prompt)
@@ -3315,6 +3547,47 @@ def _attach_jue_wiki_prompt_context(
         prompt,
         max_chars=int(report_max_chars if report_max_chars is not None else max_chars),
     )
+
+
+def _attach_jue_wiki_decision_gate(
+    prompt: dict[str, Any],
+    jue_wiki: dict[str, Any] | None,
+    *,
+    trusted_read_mode: str,
+) -> None:
+    shared_attach_jue_wiki_decision_gate(
+        prompt,
+        jue_wiki,
+        trusted_read_mode=trusted_read_mode,
+        venue="kis",
+    )
+
+
+def _apply_required_wiki_prompt_read_policy(
+    prompt: dict[str, Any],
+    *,
+    trusted_read_mode: str,
+) -> dict[str, Any]:
+    return apply_jue_wiki_prompt_policy(
+        prompt,
+        target_read_mode=trusted_read_mode,
+    )
+
+
+def _required_wiki_gate_prompt_error(
+    prompt: dict[str, Any],
+    *,
+    trusted_read_mode: str,
+) -> str:
+    if trusted_read_mode != "required":
+        return ""
+    gate = prompt.get("jue_wiki_decision_gate")
+    reason = str(gate.get("reason") or "") if isinstance(gate, dict) else ""
+    if reason == "wiki_required_gate_missing" or reason.startswith(
+        "wiki_required_gate_invalid:"
+    ):
+        return f"jue_wiki_gate_contract_error:{reason}"
+    return ""
 
 
 def _looks_like_signature_type_error(exc: TypeError) -> bool:
@@ -3863,11 +4136,24 @@ class KISBlockRepository:
                 if isinstance(diagnostics, dict) and diagnostics:
                     prompt["diagnostics"] = diagnostics
         provenance = build_manager_run_workflow_provenance(prompt)
-        stored_prompt = build_compact_manager_storage_payload(
-            prompt,
-            limit=MANAGER_PROMPT_STORAGE_LIMIT,
-            label="kis_manager_prompt",
-        )
+        try:
+            prompt_bundle = build_manager_prompt_bundle(
+                prompt,
+                audit_prompt_builder=lambda value: (
+                    build_compact_manager_storage_payload(
+                        value,
+                        limit=MANAGER_PROMPT_STORAGE_LIMIT,
+                        label="kis_manager_prompt",
+                    )
+                ),
+            )
+            stored_prompt = prompt_bundle.audit_prompt
+        except ManagerPromptContractViolation:
+            stored_prompt = build_compact_manager_storage_payload(
+                prompt,
+                limit=MANAGER_PROMPT_STORAGE_LIMIT,
+                label="kis_manager_prompt",
+            )
         stored_response = build_compact_manager_storage_payload(
             response,
             limit=MANAGER_RESPONSE_STORAGE_LIMIT,
@@ -3910,6 +4196,8 @@ class KISBlockRepository:
         self,
         manager_run_id: int,
         applied: dict[str, Any],
+        *,
+        telemetry: dict[str, Any] | None = None,
     ) -> None:
         with self._connect() as conn:
             row = conn.execute(
@@ -3922,6 +4210,8 @@ class KISBlockRepository:
             if not isinstance(actions_payload, dict):
                 actions_payload = {}
             actions_payload["_applied"] = applied if isinstance(applied, dict) else {}
+            if isinstance(telemetry, dict):
+                actions_payload["_manager_run_telemetry"] = telemetry
             stored_actions = build_compact_manager_storage_payload(
                 actions_payload,
                 limit=MANAGER_ACTIONS_STORAGE_LIMIT,
@@ -3930,6 +4220,64 @@ class KISBlockRepository:
             conn.execute(
                 "UPDATE manager_runs SET actions_json = ? WHERE id = ?",
                 (_json_dumps(stored_actions), int(manager_run_id)),
+            )
+
+    def update_manager_run_shadow_recording_id(
+        self,
+        manager_run_id: int,
+        recording_id: str,
+    ) -> None:
+        clean_recording_id = str(recording_id or "").strip()
+        if not clean_recording_id:
+            return
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT response_json, actions_json FROM manager_runs "
+                "WHERE id = ? LIMIT 1",
+                (int(manager_run_id),),
+            ).fetchone()
+            if row is None:
+                return
+            response = _json_loads(row["response_json"], {})
+            actions = _json_loads(row["actions_json"], {})
+            if not isinstance(response, dict):
+                response = {}
+            if not isinstance(actions, dict):
+                actions = {}
+            response_telemetry = response.get("manager_run_telemetry")
+            if not isinstance(response_telemetry, dict):
+                response_telemetry = {}
+            response["manager_run_telemetry"] = {
+                **response_telemetry,
+                "wiki_shadow_recording_id": clean_recording_id,
+            }
+            actions_telemetry = actions.get("_manager_run_telemetry")
+            if not isinstance(actions_telemetry, dict):
+                actions_telemetry = {}
+            actions["_manager_run_telemetry"] = {
+                **actions_telemetry,
+                "wiki_shadow_recording_id": clean_recording_id,
+            }
+            conn.execute(
+                "UPDATE manager_runs SET response_json = ?, actions_json = ? "
+                "WHERE id = ?",
+                (
+                    _json_dumps(
+                        build_compact_manager_storage_payload(
+                            response,
+                            limit=MANAGER_RESPONSE_STORAGE_LIMIT,
+                            label="kis_manager_response",
+                        )
+                    ),
+                    _json_dumps(
+                        build_compact_manager_storage_payload(
+                            actions,
+                            limit=MANAGER_ACTIONS_STORAGE_LIMIT,
+                            label="kis_manager_actions",
+                        )
+                    ),
+                    int(manager_run_id),
+                ),
             )
 
     def save_quotes(self, quotes: list[dict[str, Any]]) -> None:
@@ -4674,44 +5022,12 @@ class KISBlockRepository:
             )
 
     def status(self) -> dict[str, Any]:
-        with self._connect() as conn:
-            block_count = int(conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0])
-            open_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM blocks WHERE status IN ('entry_pending','open','exit_pending')"
-                ).fetchone()[0]
-            )
-            waiting_entry_count = int(
-                conn.execute("SELECT COUNT(*) FROM blocks WHERE status = 'proposed'").fetchone()[0]
-            )
-            order_count = int(conn.execute("SELECT COUNT(*) FROM block_orders").fetchone()[0])
-            pending_order_count = int(
-                conn.execute(
-                    """
-                    SELECT COUNT(*) FROM block_orders
-                    WHERE status IN ('sent','partially_filled','cancel_requested')
-                    """
-                ).fetchone()[0]
-            )
-            manager_count = int(conn.execute("SELECT COUNT(*) FROM manager_runs").fetchone()[0])
-            latest_run = conn.execute(
-                "SELECT run_at, status, mode FROM manager_runs ORDER BY run_at DESC, id DESC LIMIT 1"
-            ).fetchone()
         kill = self.get_state("kill_switch", {"enabled": False})
-        return {
-            "status": "ok",
-            "db_path": str(self.path),
-            "block_count": block_count,
-            "open_block_count": open_count,
-            "waiting_entry_block_count": waiting_entry_count,
-            "order_count": order_count,
-            "pending_order_count": pending_order_count,
-            "manager_run_count": manager_count,
-            "latest_manager_run_at": str(latest_run["run_at"]) if latest_run else "",
-            "latest_manager_status": str(latest_run["status"]) if latest_run else "missing",
-            "latest_manager_mode": str(latest_run["mode"]) if latest_run else "",
-            "kill_switch": kill if isinstance(kill, dict) else {"enabled": False},
-        }
+        return read_kis_repository_status(
+            connect=self._connect,
+            db_path=self.path,
+            kill_switch=kill,
+        )
 
     def _new_block_id(self, payload: dict[str, Any]) -> str:
         symbol = str(payload.get("symbol") or "000000")
@@ -4739,6 +5055,10 @@ class KISBlockTrader:
         symbol_analysis_runner: Callable[..., Awaitable[dict[str, Any]]] | None = None,
         calendar: KRXHolidayCalendar | None = None,
         telegram: TelegramSender | None = None,
+        wiki_shadow_recording_recorder: Callable[[WikiShadowRecordingV1], Any]
+        | None = None,
+        wiki_shadow_envelope_recorder: Callable[[WikiShadowRecordingV1], Any]
+        | None = None,
     ) -> None:
         self.config = config
         self.kis = kis
@@ -4759,11 +5079,19 @@ class KISBlockTrader:
         self.symbol_analysis_runner = symbol_analysis_runner
         self.calendar = calendar or KRXHolidayCalendar()
         self.telegram = telegram
+        self.wiki_shadow_recording_recorder = (
+            wiki_shadow_recording_recorder or wiki_shadow_envelope_recorder
+        )
+        self.wiki_shadow_envelope_recorder = self.wiki_shadow_recording_recorder
         self._status_cache_payload: dict[str, Any] | None = None
         self._status_cache_expires_at = 0.0
         self._last_live_authority_context: dict[str, Any] = {}
         self._last_live_authority_context_expires_at = 0.0
         self.repository = KISBlockRepository(config.db_path)
+        market_bar_path = config.market_bar_db_path or str(
+            Path(config.db_path).with_name("strategy_signals.db")
+        )
+        self.market_bar_repository = MarketBarRepository(market_bar_path)
         self.quote_service = MarketQuoteService(
             kis,
             use_naver_fallback=config.use_naver_fallback,
@@ -5349,6 +5677,135 @@ class KISBlockTrader:
             rejected["entry_quality_gate"] = gate
             adjusted["rejected_create_blocks"].append(rejected)
         adjusted["create_blocks"] = allowed_create_blocks
+        return adjusted
+
+    def _apply_kis_research_to_actions(
+        self,
+        actions: dict[str, Any],
+        *,
+        research_packets: dict[str, dict[str, Any]],
+        contract_active: bool,
+    ) -> dict[str, Any]:
+        adjusted = {
+            key: [dict(row) for row in list(actions.get(key) or []) if isinstance(row, dict)]
+            for key in (
+                "adopt_existing_blocks",
+                "create_blocks",
+                "update_blocks",
+                "close_blocks",
+                "pause_blocks",
+            )
+        }
+        adjusted["rejected_create_blocks"] = [
+            dict(row)
+            for row in list(actions.get("rejected_create_blocks") or [])
+            if isinstance(row, dict)
+        ]
+        if not contract_active:
+            return adjusted
+
+        allowed: list[dict[str, Any]] = []
+        for row in adjusted["create_blocks"]:
+            symbol = str(row.get("symbol") or "").strip()
+            packet = research_packets.get(symbol)
+            if isinstance(packet, dict) and str(
+                packet.get("asset_class") or ""
+            ).lower() == "etf":
+                allowed.append(row)
+                continue
+            status = str((packet or {}).get("status") or "missing")
+            entry_support = str(
+                (packet or {}).get("entry_support") or "ineligible"
+            )
+            addition_allowed = bool((packet or {}).get("addition_allowed"))
+            gate = {
+                "version": "kis_research_entry_gate_v1",
+                "status": status,
+                "entry_support": entry_support,
+                "addition_allowed": addition_allowed,
+                "conflict_status": str(
+                    (packet or {}).get("conflict_status") or "unknown"
+                ),
+                "evidence_ids": [
+                    f"naver_report:{int(item.get('report_id') or 0)}"
+                    for item in list((packet or {}).get("evidence") or [])[:6]
+                    if isinstance(item, dict) and int(item.get("report_id") or 0) > 0
+                ],
+            }
+            if (
+                status == "eligible"
+                and entry_support == "supported"
+                and addition_allowed
+            ):
+                row["kis_research_gate"] = gate
+                allowed.append(row)
+                continue
+            rejected = dict(row)
+            rejected["reason"] = "kis_research_entry_ineligible"
+            rejected["kis_research_gate"] = gate
+            adjusted["rejected_create_blocks"].append(rejected)
+        adjusted["create_blocks"] = allowed
+        return adjusted
+
+    def _apply_multi_horizon_signal_to_actions(
+        self,
+        actions: dict[str, Any],
+        *,
+        signals: dict[str, dict[str, Any]],
+        contract_active: bool,
+    ) -> dict[str, Any]:
+        adjusted = {
+            key: [dict(row) for row in list(actions.get(key) or []) if isinstance(row, dict)]
+            for key in (
+                "adopt_existing_blocks",
+                "create_blocks",
+                "update_blocks",
+                "close_blocks",
+                "pause_blocks",
+            )
+        }
+        adjusted["rejected_create_blocks"] = [
+            dict(row)
+            for row in list(actions.get("rejected_create_blocks") or [])
+            if isinstance(row, dict)
+        ]
+        if not contract_active:
+            return adjusted
+
+        allowed: list[dict[str, Any]] = []
+        for row in adjusted["create_blocks"]:
+            symbol = str(row.get("symbol") or "").strip()
+            signal = signals.get(symbol)
+            gate = {
+                "version": "multi_horizon_signal_entry_gate_v1",
+                "signal_version": str((signal or {}).get("version") or "missing"),
+                "agreement_count": max(
+                    _safe_int((signal or {}).get("agreement_count")),
+                    0,
+                ),
+                "agreed_direction": str(
+                    (signal or {}).get("agreed_direction") or "none"
+                ),
+                "entry_eligible": bool((signal or {}).get("entry_eligible")),
+                "max_risk_fraction": _safe_float(
+                    (signal or {}).get("max_risk_fraction")
+                ),
+                "blocking_reasons": list(
+                    (signal or {}).get("blocking_reasons") or []
+                )[:6],
+                "source_bar_ids": list((signal or {}).get("source_bar_ids") or [])[
+                    -20:
+                ],
+            }
+            if gate["entry_eligible"] and gate["agreement_count"] >= 2:
+                row["multi_horizon_signal_gate"] = gate
+                allowed.append(row)
+                continue
+            rejected = dict(row)
+            rejected["reason"] = "multi_horizon_signal_entry_ineligible"
+            rejected["multi_horizon_signal_gate"] = gate
+            adjusted["rejected_create_blocks"].append(rejected)
+        adjusted["create_blocks"] = allowed
         return adjusted
 
     def _create_row_cost_feasibility(
@@ -5992,6 +6449,7 @@ class KISBlockTrader:
         }
 
     async def run_manager_once(self) -> dict[str, Any]:
+        manager_started = time.perf_counter()
         run_at = utc_now_iso()
         clock = self.clock()
         account = await self.collect_account()
@@ -6012,6 +6470,22 @@ class KISBlockTrader:
             if _is_symbol(symbol) and symbol not in symbols:
                 symbols.append(symbol)
         symbols = symbols[: max(int(self.config.max_manager_symbols), 1)]
+        kis_research_packets = self._kis_research_packets(
+            symbols=symbols,
+            strategy_payload=strategy_payload,
+            now=run_at,
+        )
+        kis_research_contract_active = self._kis_research_contract_active()
+        multi_horizon_signal_contract_active = callable(
+            getattr(self.kis, "fetch_domestic_daily_prices", None)
+        )
+        signal_context = await collect_kis_signal_context(
+            price_source=self.kis,
+            repository=self.market_bar_repository,
+            symbols=symbols,
+            evaluated_at=run_at,
+            concurrency=min(max(int(self.config.quote_concurrency), 1), 2),
+        )
         quotes = await self.quote_service.collect_quotes(
             symbols,
             concurrency=self.config.quote_concurrency,
@@ -6078,6 +6552,7 @@ class KISBlockTrader:
             account=account,
             blocks=research_blocks,
             quotes=quotes,
+            kis_research_packets=kis_research_packets,
             max_packets=max(int(self.config.max_manager_symbols), 1),
         )
         preliminary_aggressive_opportunities = build_aggressive_opportunity_packet(
@@ -6120,6 +6595,7 @@ class KISBlockTrader:
             account=account,
             blocks=research_blocks,
             quotes=quotes,
+            kis_research_packets=kis_research_packets,
             max_packets=max(int(self.config.max_manager_symbols), 1),
         )
         if isinstance(research_spine.get("quality_summary"), dict):
@@ -6260,6 +6736,24 @@ class KISBlockTrader:
             untrusted_data_boundary=_untrusted_data_boundary(),
             decision_metadata_output_schema=DECISION_METADATA_OUTPUT_SCHEMA,
         )
+        prompt["multi_horizon_signals"] = dict(signal_context.get("signals") or {})
+        prompt["multi_horizon_signal_status"] = {
+            key: signal_context.get(key)
+            for key in (
+                "status",
+                "generated_at",
+                "requested_count",
+                "signal_count",
+                "error_count",
+                "errors",
+                "version",
+            )
+            if signal_context.get(key) not in (None, "", [], {})
+        }
+        decision_inputs = list(prompt.get("decision_inputs") or [])
+        if "multi_horizon_signals" not in decision_inputs:
+            decision_inputs.append("multi_horizon_signals")
+        prompt["decision_inputs"] = decision_inputs
         proactive_pressure = self._proactive_decision_pressure(
             previous_manager_runs=previous_manager_runs,
             aggressive_opportunities=aggressive_opportunities,
@@ -6270,23 +6764,67 @@ class KISBlockTrader:
             if "proactive_decision_pressure" not in decision_inputs:
                 decision_inputs.append("proactive_decision_pressure")
             prompt["decision_inputs"] = decision_inputs
+        legacy_manager_input = json.loads(_json_dumps(prompt))
         _attach_jue_wiki_prompt_context(
             prompt,
             jue_wiki,
             max_chars=_kis_jue_wiki_prompt_max_chars(self.config),
             report_max_chars=self.config.prompt_max_chars,
         )
+        raw_prompt_chars = len(_json_dumps(prompt))
         build_finalize_prompt_budget(
             prompt,
             target_chars=self.config.prompt_target_chars,
             warn_chars=self.config.prompt_warn_chars,
             max_chars=self.config.prompt_max_chars,
         )
-        budget_error = build_prompt_budget_error(prompt)
+        _attach_jue_wiki_decision_gate(
+            prompt,
+            jue_wiki,
+            trusted_read_mode=self.config.jue_wiki_read_mode,
+        )
+        prompt = _apply_required_wiki_prompt_read_policy(
+            prompt,
+            trusted_read_mode=self.config.jue_wiki_read_mode,
+        )
+        wiki_gate_error = _required_wiki_gate_prompt_error(
+            prompt,
+            trusted_read_mode=self.config.jue_wiki_read_mode,
+        )
+        try:
+            prompt = build_manager_prompt_bundle(
+                prompt,
+                audit_prompt_builder=lambda value: (
+                    build_compact_manager_storage_payload(
+                        value,
+                        limit=MANAGER_PROMPT_STORAGE_LIMIT,
+                        label="kis_manager_prompt",
+                    )
+                ),
+            ).runtime_prompt
+            preserve_wiki_context_packet(prompt, jue_wiki)
+            prompt = apply_jue_wiki_prompt_policy(
+                prompt,
+                target_read_mode=self.config.jue_wiki_read_mode,
+            )
+            contract_error_message = ""
+        except ManagerPromptContractViolation as exc:
+            contract_error_message = str(exc)
+        context_generation_ms = (time.perf_counter() - manager_started) * 1000.0
+        llm_latency_ms = 0.0
+        budget_error = (
+            contract_error_message
+            or wiki_gate_error
+            or build_prompt_budget_error(prompt)
+        )
         if budget_error:
             parsed, error_message = {}, budget_error
         else:
-            parsed, error_message = await self._complete_manager(prompt)
+            llm_started = time.perf_counter()
+            try:
+                parsed, error_message = await self._complete_manager(prompt)
+            finally:
+                llm_latency_ms = (time.perf_counter() - llm_started) * 1000.0
         if error_message:
             actions = {
                 "create_blocks": [],
@@ -6304,7 +6842,20 @@ class KISBlockTrader:
                     "model": str(getattr(self.codex_runtime, "resolved_model", "")),
                     "error_message": error_message,
                     "prompt": prompt,
-                    "response": {},
+                    "response": {
+                        "manager_run_telemetry": ManagerRunTelemetryV1(
+                            venue="kis",
+                            context_generation_ms=round(context_generation_ms, 3),
+                            prompt_chars=len(_json_dumps(prompt)),
+                            llm_latency_ms=round(llm_latency_ms, 3),
+                            raw_prompt_chars=raw_prompt_chars,
+                            action_count=manager_action_count(actions),
+                            result_status="error",
+                            fill_provenance=build_fill_provenance_summary(
+                                actions=actions
+                            ),
+                        ).to_dict()
+                    },
                 },
                 actions=actions,
             )
@@ -6348,6 +6899,16 @@ class KISBlockTrader:
         actions = self._apply_live_authority_to_actions(
             actions,
             live_authority=live_authority,
+        )
+        actions = self._apply_kis_research_to_actions(
+            actions,
+            research_packets=kis_research_packets,
+            contract_active=kis_research_contract_active,
+        )
+        actions = self._apply_multi_horizon_signal_to_actions(
+            actions,
+            signals=dict(signal_context.get("signals") or {}),
+            contract_active=multi_horizon_signal_contract_active,
         )
         actions = self._apply_entry_quality_to_actions(actions)
         action_count = sum(
@@ -6396,6 +6957,16 @@ class KISBlockTrader:
         )
         response_payload["final_action_count"] = final_action_count
         response_payload["no_action_watch"] = no_action_watch
+        response_payload["manager_run_telemetry"] = ManagerRunTelemetryV1(
+            venue="kis",
+            context_generation_ms=round(context_generation_ms, 3),
+            prompt_chars=len(_json_dumps(prompt)),
+            llm_latency_ms=round(llm_latency_ms, 3),
+            raw_prompt_chars=raw_prompt_chars,
+            action_count=manager_action_count(actions),
+            result_status="ok",
+            fill_provenance=build_fill_provenance_summary(actions=actions),
+        ).to_dict()
         contract_error = build_kis_manager_response_contract_error(
             prompt=prompt,
             response=response_payload,
@@ -6455,6 +7026,29 @@ class KISBlockTrader:
                 "quotes": quote_map,
                 "clock": clock,
             }
+        actions, wiki_suppression_audit = apply_kis_wiki_decision_gate(
+            actions,
+            prompt.get("jue_wiki_decision_gate", {}),
+            trusted_read_mode=self.config.jue_wiki_read_mode,
+            current_blocks=blocks,
+        )
+        response_payload["jue_wiki_suppression_audit"] = wiki_suppression_audit
+        final_action_count = _action_item_count(actions)
+        no_action_watch = self._no_action_watch(
+            previous_manager_runs=previous_manager_runs,
+            current_actions=actions,
+            aggressive_opportunities=aggressive_opportunities,
+            hold_decision=hold_decision,
+            clock=clock,
+        )
+        response_payload["final_action_count"] = final_action_count
+        response_payload["no_action_watch"] = no_action_watch
+        response_payload["manager_run_telemetry"]["action_count"] = manager_action_count(
+            actions
+        )
+        response_payload["manager_run_telemetry"]["fill_provenance"] = (
+            build_fill_provenance_summary(actions=actions)
+        )
         response_payload["latest_input_summary"] = self._latest_decision_input_summary(
             {
                 "id": 0,
@@ -6479,6 +7073,37 @@ class KISBlockTrader:
             },
             actions=actions,
         )
+        wiki_shadow_recording_id = ""
+        if (
+            self.wiki_shadow_recording_recorder is not None
+            and self.config.jue_wiki_read_mode in {"shadow", "prefer"}
+            and isinstance(prompt.get("jue_wiki"), dict)
+        ):
+            try:
+                shadow_recording = WikiShadowRecordingV1.from_run(
+                    venue="kis",
+                    run_id=f"kis:{uuid4().hex}:{manager_run_id}",
+                    manager_run_id=manager_run_id,
+                    legacy_manager_input=legacy_manager_input,
+                    source_runtime_prompt=prompt,
+                    final_actions=actions,
+                    wiki_suppression_count=int(
+                        wiki_suppression_audit.get("suppressed_new_risk_count") or 0
+                    ),
+                )
+                wiki_shadow_recording_id = str(
+                    self.wiki_shadow_recording_recorder(shadow_recording) or ""
+                )
+                response_payload["manager_run_telemetry"][
+                    "wiki_shadow_recording_id"
+                ] = wiki_shadow_recording_id
+            except Exception as exc:
+                logger.warning("KIS Wiki shadow recording failed: %s", exc)
+        if wiki_shadow_recording_id:
+            self.repository.update_manager_run_shadow_recording_id(
+                manager_run_id,
+                wiki_shadow_recording_id,
+            )
         applied = await self._apply_manager_actions(
             actions,
             manager_run_id=manager_run_id,
@@ -6487,7 +7112,16 @@ class KISBlockTrader:
             clock=clock,
             policy_rule_evaluation=policy_rule_evaluation,
         )
-        self.repository.update_manager_run_applied(manager_run_id, applied)
+        telemetry = dict(response_payload["manager_run_telemetry"])
+        telemetry["fill_provenance"] = build_fill_provenance_summary(
+            actions=actions,
+            applied=applied,
+        )
+        self.repository.update_manager_run_applied(
+            manager_run_id,
+            applied,
+            telemetry=telemetry,
+        )
         await self._notify_no_action_watch(
             run_id=manager_run_id,
             no_action_watch=no_action_watch,
@@ -6500,6 +7134,8 @@ class KISBlockTrader:
             "mode": mode,
             "error_message": error_message,
             "actions": actions,
+            "jue_wiki_suppression_audit": wiki_suppression_audit,
+            "wiki_shadow_recording_id": wiki_shadow_recording_id,
             "applied": applied,
             "hold_decision": hold_decision,
             "creative_hypotheses": creative_hypotheses,
@@ -6645,7 +7281,21 @@ class KISBlockTrader:
             warn_chars=self.config.prompt_warn_chars,
             max_chars=self.config.prompt_max_chars,
         )
-        budget_error = build_prompt_budget_error(prompt)
+        try:
+            prompt = build_manager_prompt_bundle(
+                prompt,
+                audit_prompt_builder=lambda value: (
+                    build_compact_manager_storage_payload(
+                        value,
+                        limit=MANAGER_PROMPT_STORAGE_LIMIT,
+                        label="kis_manager_prompt",
+                    )
+                ),
+            ).runtime_prompt
+            contract_error_message = ""
+        except ManagerPromptContractViolation as exc:
+            contract_error_message = str(exc)
+        budget_error = contract_error_message or build_prompt_budget_error(prompt)
         if budget_error:
             parsed, error_message = {}, budget_error
         else:
@@ -7104,7 +7754,7 @@ class KISBlockTrader:
         if not getattr(self.codex_runtime, "ready", False):
             return None, "codex_runtime_unavailable"
         payload = {
-            "model": getattr(self.codex_runtime, "resolved_model", "gpt-5.5"),
+            "model": getattr(self.codex_runtime, "resolved_model", "gpt-5.6-sol"),
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
             "native_output_schema": prompt.get("output_schema"),
@@ -10158,6 +10808,42 @@ class KISBlockTrader:
             )
         except Exception as exc:
             return {"status": "error", "error_message": str(exc), "candidates": []}
+
+    def _kis_research_packets(
+        self,
+        *,
+        symbols: list[str],
+        strategy_payload: dict[str, Any],
+        now: str,
+    ) -> dict[str, dict[str, Any]]:
+        repository = getattr(self.strategy_engine, "repository", None)
+        if not self._kis_research_contract_active():
+            return {}
+        asset_classes = {
+            str(row.get("symbol") or "").strip(): str(
+                row.get("asset_class") or "stock"
+            )
+            for row in _normalize_list(strategy_payload.get("candidates"))
+            if isinstance(row, dict) and _is_symbol(row.get("symbol"))
+        }
+        try:
+            return build_kis_research_packets_for_symbols(
+                repository=repository,
+                symbols=symbols,
+                asset_classes=asset_classes,
+                now=now,
+            )
+        except Exception as exc:
+            logger.warning("kis research packet build failed: %s", exc)
+            return {}
+
+    def _kis_research_contract_active(self) -> bool:
+        repository = getattr(self.strategy_engine, "repository", None)
+        return bool(
+            repository is not None
+            and callable(getattr(repository, "latest_symbol_linked_reports", None))
+            and callable(getattr(repository, "get_report_facts", None))
+        )
 
     def _prompt_strategy_payload(
         self,

@@ -63,6 +63,10 @@ def _thread_key_component(value: Any, *, default: str = "general") -> str:
     return (text or default)[:64]
 
 
+def _is_etf_analysis_trigger(value: Any) -> bool:
+    return "etf" in _thread_key_component(value)
+
+
 def _compact_prompt_value(
     value: Any,
     *,
@@ -328,7 +332,7 @@ class SymbolAnalysisService:
             "name": name,
             "trigger": trigger,
             "source": "instant",
-            "model": getattr(self.codex_runtime, "resolved_model", "gpt-5.5"),
+            "model": getattr(self.codex_runtime, "resolved_model", "gpt-5.6-terra"),
             "status": str(analysis.get("status") or "ok"),
             "snapshot": {
                 "quote": quote,
@@ -630,8 +634,60 @@ class SymbolAnalysisService:
         compact_context = _compact_analysis_context(context)
         symbol = _compact_evidence_text(compact_context.get("symbol"), limit=16)
         trigger_key = _thread_key_component(compact_context.get("trigger"))
+        analysis_guidance: dict[str, Any] = {}
+        if _is_etf_analysis_trigger(compact_context.get("trigger")):
+            analysis_guidance = {
+                "title": "ETF-specific checklist",
+                "asset_class": "etf",
+                "must_review": [
+                    "underlying index or exposure",
+                    "liquidity and turnover",
+                    "tracking error and premium/discount risk",
+                    "fee, tax, leverage, inverse, and currency exposure",
+                    "core_etf fit versus tactical block fit",
+                ],
+                "preferred_horizon": "core_etf|mid|short",
+            }
+        system_content = (
+            "You are HERMES investment partner 쥬. Perform real block "
+            "trading analysis for this symbol using price, fundamentals, "
+            "reports, RAG evidence, blocks, and recent memory. Separate "
+            "short, mid, and long views. Think and draft conclusions in "
+            "English, then translate operator-visible fields into Korean. "
+            "JSON-only output."
+        )
+        if analysis_guidance:
+            system_content += (
+                " For ETF discovery, apply the ETF-specific checklist and "
+                "judge whether the symbol belongs in core_etf, tactical mid, "
+                "or short-term block design."
+            )
+        user_payload = {
+            "task": "instant_symbol_analysis",
+            "language_policy": language_policy,
+            "context": compact_context,
+            "response_schema": {
+                "summary": "쥬의 한 줄 이상 종합 평가",
+                "stance": (
+                    "watch|confirm|hold|risk_check|avoid|"
+                    "block_candidate"
+                ),
+                "confidence": 0.0,
+                "short_view": "단기 평가",
+                "mid_view": "중기 평가",
+                "long_view": "장기 평가",
+                "reasons": ["근거"],
+                "risks": ["반론"],
+                "data_gaps": ["부족한 자료"],
+                "triggers": ["다음 확인 조건"],
+                "target_candidates": [0],
+                "stop_candidates": [0],
+            },
+        }
+        if analysis_guidance:
+            user_payload["analysis_guidance"] = analysis_guidance
         return {
-            "model": getattr(self.codex_runtime, "resolved_model", "gpt-5.5"),
+            "model": getattr(self.codex_runtime, "resolved_model", "gpt-5.6-terra"),
             "native_thread_key": (
                 f"symbol_analysis:{symbol or 'unknown'}:{trigger_key}:{{date}}"
             ),
@@ -640,45 +696,18 @@ class SymbolAnalysisService:
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are HERMES investment partner 쥬. Perform real block "
-                        "trading analysis for this symbol using price, fundamentals, "
-                        "reports, RAG evidence, blocks, and recent memory. Separate "
-                        "short, mid, and long views. Think and draft conclusions in "
-                        "English, then translate operator-visible fields into Korean. "
-                        "JSON-only output."
-                    ),
+                    "content": system_content,
                 },
                 {
                     "role": "user",
                     "content": json.dumps(
-                        {
-                            "task": "instant_symbol_analysis",
-                            "language_policy": language_policy,
-                            "context": compact_context,
-                            "response_schema": {
-                                "summary": "쥬의 한 줄 이상 종합 평가",
-                                "stance": (
-                                    "watch|confirm|hold|risk_check|avoid|"
-                                    "block_candidate"
-                                ),
-                                "confidence": 0.0,
-                                "short_view": "단기 평가",
-                                "mid_view": "중기 평가",
-                                "long_view": "장기 평가",
-                                "reasons": ["근거"],
-                                "risks": ["반론"],
-                                "data_gaps": ["부족한 자료"],
-                                "triggers": ["다음 확인 조건"],
-                                "target_candidates": [0],
-                                "stop_candidates": [0],
-                            },
-                        },
+                        user_payload,
                         ensure_ascii=False,
                     ),
                 },
             ],
             "context": compact_context,
+            "analysis_guidance": analysis_guidance,
             "response_schema": {
                 "summary": "쥬의 한 줄 이상 종합 평가",
                 "stance": "watch|confirm|hold|risk_check|avoid|block_candidate",

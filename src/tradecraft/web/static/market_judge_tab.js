@@ -290,7 +290,7 @@
         <div class="market-judge-kpis">
           <span><strong>${escapeHTML(status)}</strong>상태</span>
           <span><strong>${escapeHTML(run.mode || "-")}</strong>모드</span>
-          <span><strong>${escapeHTML(run.model || "gpt-5.5")}</strong>모델</span>
+          <span><strong>${escapeHTML(run.model || "gpt-5.6-sol")}</strong>모델</span>
           <span><strong>${escapeHTML(fmtKST(clock.now || run.run_at, true))}</strong>KST</span>
         </div>
       </section>
@@ -379,11 +379,11 @@
         <div class="market-judge-shell">
           <div class="strategy-intel-actions">
             <button class="btn primary" type="button" data-market-judge-action="refresh">최근 판단 보기</button>
-            <button class="btn" type="button" data-market-judge-action="run" ${disabled}>gpt-5.5 장중 판단</button>
+            <button class="btn" type="button" data-market-judge-action="run" ${disabled}>AI 장중 판단</button>
           </div>
           ${renderMarketPulseSummary(viewState, options)}
           ${loadingHtml}
-          ${errorHtml || '<div class="notice">아직 저장된 장중 판단이 없습니다. “gpt-5.5 장중 판단”으로 새 스냅샷을 만들 수 있습니다.</div>'}
+          ${errorHtml || '<div class="notice">아직 저장된 장중 판단이 없습니다. “AI 장중 판단”으로 새 스냅샷을 만들 수 있습니다.</div>'}
         </div>
       `;
     }
@@ -392,7 +392,7 @@
       <div class="market-judge-shell">
         <div class="strategy-intel-actions">
           <button class="btn primary" type="button" data-market-judge-action="refresh">최근 판단 보기</button>
-          <button class="btn" type="button" data-market-judge-action="run" ${disabled}>${marketJudge.running ? "판단 중" : "gpt-5.5 장중 판단"}</button>
+          <button class="btn" type="button" data-market-judge-action="run" ${disabled}>${marketJudge.running ? "판단 중" : "AI 장중 판단"}</button>
         </div>
         ${renderMarketPulseSummary(viewState, options)}
         ${loadingHtml}

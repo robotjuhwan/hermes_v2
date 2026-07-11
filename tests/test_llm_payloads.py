@@ -275,6 +275,37 @@ def test_llm_usage_semantic_check_treats_successful_under_cap_prompt_as_observat
     )
 
 
+def test_large_prompt_warning_requires_three_under_warn_successes_to_clear() -> None:
+    def payload(successes: int) -> dict:
+        return {
+            "today": {
+                "by_component": [
+                    {
+                        "component": "market_judge",
+                        "call_count": 5,
+                        "error_count": 0,
+                        "max_input_chars": 355_000,
+                        "avg_input_chars": 220_000,
+                        "latest_input_chars": 120_000,
+                        "latest_status": "ok",
+                        "latest_large_prompt_at": "2026-07-10T00:00:00+00:00",
+                        "ok_under_warn_after_large_count": successes,
+                    }
+                ]
+            }
+        }
+
+    module = importlib.import_module("tradecraft.api.llm_payloads")
+    warning = module.build_llm_usage_semantic_check(payload(2))
+    recovered = module.build_llm_usage_semantic_check(payload(3))
+
+    assert "llm_prompt_payload_large" in warning["warnings"]
+    assert "llm_prompt_payload_large" not in recovered["warnings"]
+    assert recovered["check"]["recovered_prompt_large_components"][0][
+        "ok_under_warn_after_large_count"
+    ] == 3
+
+
 def test_main_no_longer_owns_low_level_llm_usage_semantic_helpers() -> None:
     source = Path("src/tradecraft/main.py").read_text(encoding="utf-8")
 

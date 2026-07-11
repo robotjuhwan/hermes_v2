@@ -219,6 +219,30 @@
     const venue = String(block?.venue || block?.market || "spot").toLowerCase();
     const lane = blockLane(block);
     const metadata = block?.metadata && typeof block.metadata === "object" ? block.metadata : {};
+    const createdBy = String(block?.created_by || "").toLowerCase();
+    const fillProvenance = String(
+      metadata.fill_provenance
+      || metadata.fill_source
+      || block?.fill_provenance
+      || block?.fill_source
+      || block?.execution_source
+      || ""
+    ).toLowerCase();
+    const provenanceChips = [
+      createdBy === "wallet_adoption"
+        ? '<span class="strategy-data-chip warn">Wallet 채택 · 쥬 진입 성과 제외</span>'
+        : createdBy === "existing_position"
+          ? '<span class="strategy-data-chip warn">기존 포지션 채택 · 쥬 진입 성과 제외</span>'
+          : "",
+      fillProvenance.includes("exchange") || fillProvenance === "live_fill"
+        ? '<span class="strategy-data-chip good">거래소 체결</span>'
+        : fillProvenance.includes("paper")
+          ? '<span class="strategy-data-chip neutral">Paper 체결</span>'
+          : "",
+      ["failed", "failed_entry", "rejected", "error"].includes(status.toLowerCase())
+        ? '<span class="strategy-data-chip bad">진입 실패 · 체결 없음</span>'
+        : "",
+    ].join("");
     return `
     <article class="binance-block-card ${escapeHTML(venue)} ${escapeHTML(lane)}">
       <div class="block-card-head">
@@ -238,7 +262,7 @@
         <div><span>레버리지</span><strong>${escapeHTML(fmtNum(block?.leverage || 1, 1))}x</strong></div>
       </div>
       <p class="helper-text">${escapeHTML(block?.thesis || block?.llm_reason || block?.risk_note || "-")}</p>
-      <div class="strategy-chip-row">${renderBlockValidationChips(metadata)}${renderValidationPassportChips(metadata)}${renderBlockPolicyEffectChips(metadata)}</div>
+      <div class="strategy-chip-row">${provenanceChips}${renderBlockValidationChips(metadata)}${renderValidationPassportChips(metadata)}${renderBlockPolicyEffectChips(metadata)}</div>
     </article>
   `;
   }

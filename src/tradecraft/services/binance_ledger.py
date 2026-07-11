@@ -128,6 +128,97 @@ def _row_has(row: Mapping[str, Any] | Any, key: str) -> bool:
         return isinstance(row, Mapping) and key in row
 
 
+def _first_positive_float(row: Mapping[str, Any], keys: tuple[str, ...]) -> float:
+    for key in keys:
+        value = safe_float(row.get(key))
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _binance_order_fill_summary(
+    *,
+    status: Any,
+    qty: float,
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    raw = response.get("raw") if isinstance(response.get("raw"), dict) else {}
+    filled_qty = _first_positive_float(
+        response,
+        (
+            "executedQty",
+            "executed_qty",
+            "cumQty",
+            "cum_qty",
+            "filledQty",
+            "filled_qty",
+        ),
+    )
+    if filled_qty <= 0:
+        filled_qty = _first_positive_float(
+            raw,
+            (
+                "executedQty",
+                "executed_qty",
+                "cumQty",
+                "cum_qty",
+                "filledQty",
+                "filled_qty",
+            ),
+        )
+    filled_quote = _first_positive_float(
+        response,
+        (
+            "cum_quote",
+            "cummulativeQuoteQty",
+            "cumulative_quote",
+            "executed_quote",
+            "quoteQty",
+            "quote_qty",
+        ),
+    )
+    if filled_quote <= 0:
+        filled_quote = _first_positive_float(
+            raw,
+            (
+                "cum_quote",
+                "cummulativeQuoteQty",
+                "cumulative_quote",
+                "executed_quote",
+                "quoteQty",
+                "quote_qty",
+            ),
+        )
+    response_status = str(response.get("status") or raw.get("status") or "").strip().upper()
+    row_status = str(status or "").strip().lower()
+    execution_status = ""
+    if row_status == "paper":
+        execution_status = "paper"
+    elif response_status == "FILLED":
+        execution_status = "filled"
+    elif response_status == "PARTIALLY_FILLED":
+        execution_status = "partially_filled"
+    elif filled_qty > 0:
+        execution_status = (
+            "filled"
+            if qty > 0 and filled_qty >= max(qty - max(qty * 1e-6, 1e-12), 0.0)
+            else "partially_filled"
+        )
+    summary: dict[str, Any] = {}
+    if execution_status:
+        summary["execution_status"] = execution_status
+    if filled_qty > 0:
+        summary["filled_qty"] = filled_qty
+        summary["effective_fill"] = True
+    else:
+        summary["effective_fill"] = False
+    if filled_quote > 0:
+        summary["filled_quote"] = filled_quote
+    if filled_qty > 0 and filled_quote > 0:
+        summary["avg_fill_price"] = filled_quote / filled_qty
+    return summary
+
+
 def row_to_block(
     row: Mapping[str, Any] | Any,
     *,
@@ -189,16 +280,22 @@ def row_to_block(
 
 
 def row_order_payload(row: Mapping[str, Any] | Any) -> dict[str, Any]:
+    qty = float(_row_get(row, "qty") or 0.0)
+    status = _row_get(row, "status")
+    response = ledger_json_loads(_row_get(row, "response_json"), {})
+    if not isinstance(response, dict):
+        response = {}
     return {
         "block_id": _row_get(row, "block_id"),
         "symbol": _row_get(row, "symbol"),
         "market": _row_get(row, "market"),
         "side": _row_get(row, "side"),
-        "qty": float(_row_get(row, "qty") or 0.0),
+        "qty": qty,
         "order_type": _row_get(row, "order_type"),
-        "status": _row_get(row, "status"),
+        "status": status,
+        **_binance_order_fill_summary(status=status, qty=qty, response=response),
         "reason": _row_get(row, "reason"),
-        "response": ledger_json_loads(_row_get(row, "response_json"), {}),
+        "response": response,
         "created_at": _row_get(row, "created_at"),
         "updated_at": _row_get(row, "updated_at"),
     }

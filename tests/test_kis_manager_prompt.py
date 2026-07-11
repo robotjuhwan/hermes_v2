@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tradecraft.services import kis_block_trader as kis_block_trader_module
 from tradecraft.services import kis_manager_prompt as kis_manager_prompt_module
 from tradecraft.services.jue_decision_packet import DECISION_PACKET_REQUIRED_SECTIONS
@@ -48,6 +50,133 @@ from tradecraft.services.kis_manager_prompt import (
     validation_repair_discipline_tokens,
     validation_repair_note,
 )
+
+
+def _wiki_gate_storage_contracts() -> dict[str, object]:
+    return {
+        "jue_wiki_decision_gate": {
+            "allow_new_risk": False,
+            "allow_exit_actions": True,
+            "reason": "wiki_required_coverage_missing",
+            "read_mode": "required",
+            "snapshot_id": "snapshot:kis:storage",
+            "version": "wiki_decision_gate_v1",
+            "untrusted_noise": "x" * 20_000,
+        },
+        "jue_wiki_decision_gate_policy": {"instruction": "preserve exits"},
+        "jue_wiki_raw_rag_strip_audit": {
+            "read_mode": "required",
+            "snapshot_id": "snapshot:kis:storage",
+            "removed_path_count": 200,
+            "removed_paths": [f"raw_rag.items[{index}]" for index in range(200)],
+        },
+        "jue_wiki_suppression_audit": {
+            "venue": "kis",
+            "snapshot_id": "snapshot:kis:storage",
+            "read_mode": "required",
+            "reason": "wiki_required_coverage_missing",
+            "original_action_count": 200,
+            "filtered_action_count": 1,
+            "suppressed_new_risk_count": 199,
+            "suppressed_actions": [
+                {
+                    "venue": "kis",
+                    "action_kind": "create_blocks",
+                    "symbol": f"{index:06d}",
+                    "block_id": "",
+                    "snapshot_id": "snapshot:kis:storage",
+                    "read_mode": "required",
+                    "reason": "wiki_required_coverage_missing",
+                }
+                for index in range(200)
+            ],
+        },
+    }
+
+
+def test_kis_storage_compaction_preserves_wiki_gate_contracts_at_every_label() -> None:
+    source = {
+        **_wiki_gate_storage_contracts(),
+        "decision_inputs": ["jue_wiki_decision_gate", "jue_wiki_raw_rag_strip_audit"],
+        "create_blocks": [{"symbol": f"{index:06d}", "thesis": "x" * 500} for index in range(100)],
+        "noise": "x" * 80_000,
+    }
+
+    for label in (
+        "kis_manager_prompt",
+        "kis_manager_response",
+        "kis_manager_actions",
+    ):
+        compact = compact_manager_storage_payload(source, limit=1_500, label=label)
+
+        assert compact["jue_wiki_decision_gate"]["snapshot_id"] == (
+            "snapshot:kis:storage"
+        )
+        assert compact["jue_wiki_raw_rag_strip_audit"]["removed_path_count"] == 200
+        assert compact["jue_wiki_suppression_audit"][
+            "suppressed_new_risk_count"
+        ] == 199
+        assert compact["jue_wiki_decision_gate_policy"]["instruction"] == (
+            "preserve exits"
+        )
+        assert "untrusted_noise" not in compact["jue_wiki_decision_gate"]
+
+
+def test_kis_storage_compaction_bounds_adversarial_wiki_audit_strings() -> None:
+    huge = "x" * 100_000
+    source = _wiki_gate_storage_contracts()
+    source["jue_wiki_decision_gate"]["reason"] = huge  # type: ignore[index]
+    source["jue_wiki_decision_gate"]["snapshot_id"] = huge  # type: ignore[index]
+    source["jue_wiki_raw_rag_strip_audit"]["removed_paths"] = [huge] * 100  # type: ignore[index]
+    source["jue_wiki_suppression_audit"]["reason"] = huge  # type: ignore[index]
+
+    for label in ("kis_manager_prompt", "kis_manager_response"):
+        compact = compact_manager_storage_payload(source, limit=1_500, label=label)
+
+        assert len(json.dumps(compact, ensure_ascii=False)) <= 1_500
+        assert len(compact["jue_wiki_decision_gate"]["reason"]) <= 120
+        assert len(compact["jue_wiki_decision_gate"]["snapshot_id"]) <= 120
+        assert len(compact["jue_wiki_suppression_audit"]["reason"]) <= 120
+
+
+@pytest.mark.parametrize("label", ["kis_manager_prompt", "kis_manager_response"])
+@pytest.mark.parametrize("with_emergency_noise", [False, True])
+def test_kis_valid_gate_identity_round_trips_through_storage(
+    label: str,
+    with_emergency_noise: bool,
+) -> None:
+    reason_prefix = "wiki_required_  coverage  "
+    reason = reason_prefix + ("r" * (118 - len(reason_prefix))) + "  "
+    snapshot_prefix = "  snapshot  with  spaces  "
+    snapshot_id = snapshot_prefix + ("s" * (118 - len(snapshot_prefix))) + "  "
+    source = _wiki_gate_storage_contracts()
+    source["jue_wiki_decision_gate"]["reason"] = reason  # type: ignore[index]
+    source["jue_wiki_decision_gate"]["snapshot_id"] = snapshot_id  # type: ignore[index]
+    source["jue_wiki_raw_rag_strip_audit"]["snapshot_id"] = snapshot_id  # type: ignore[index]
+    source["jue_wiki_suppression_audit"]["reason"] = reason  # type: ignore[index]
+    source["jue_wiki_suppression_audit"]["snapshot_id"] = snapshot_id  # type: ignore[index]
+    if with_emergency_noise:
+        source["noise"] = "x" * 100_000
+    else:
+        source["jue_wiki_decision_gate"].pop("untrusted_noise")  # type: ignore[union-attr]
+        source["jue_wiki_raw_rag_strip_audit"]["removed_paths"] = []  # type: ignore[index]
+        source["jue_wiki_suppression_audit"]["suppressed_actions"] = []  # type: ignore[index]
+
+    compact = compact_manager_storage_payload(
+        source,
+        limit=1_500 if with_emergency_noise else 10_000,
+        label=label,
+    )
+
+    assert compact["jue_wiki_decision_gate"]["reason"] == reason
+    assert compact["jue_wiki_decision_gate"]["snapshot_id"] == snapshot_id
+    assert compact["jue_wiki_raw_rag_strip_audit"]["snapshot_id"] == snapshot_id
+    assert compact["jue_wiki_suppression_audit"]["reason"] == reason
+    assert compact["jue_wiki_suppression_audit"]["snapshot_id"] == snapshot_id
+    if with_emergency_noise:
+        assert compact["_storage_compaction"]["emergency"] is True
+    else:
+        assert "_storage_compaction" not in compact
 
 
 def test_kis_block_trader_does_not_reown_manager_prompt_sanitizers() -> None:
@@ -10355,6 +10484,47 @@ def test_finalize_prompt_budget_attaches_budget_and_prefers_warn_limit() -> None
     assert len(text) <= 70_000
     assert prompt["prompt_budget"]["version"] == "prompt_budget_v1"
     assert prompt["prompt_budget"]["over_warn"] is False
+
+
+def test_kis_warn_budget_preserves_core_types_under_large_optional_context() -> None:
+    prompt = {
+        "decision_inputs": ["account", "quotes", "risk"],
+        "candidates": [
+            {"symbol": f"{index:06d}", "evidence": "x" * 2_000}
+            for index in range(80)
+        ],
+        "blocks": [
+            {"block_id": f"block-{index}", "notes": "y" * 1_000}
+            for index in range(40)
+        ],
+        "decision_packet": {
+            "candidates": [{"detail": "d" * 2_000} for _ in range(80)]
+        },
+        "pre_adoption_symbol_analysis": {
+            "items": [{"detail": "a" * 2_000} for _ in range(80)]
+        },
+        "recent_events": [{"detail": "z" * 1_000} for _ in range(300)],
+        "research_spine": {
+            "items": [{"content": "r" * 2_000} for _ in range(100)]
+        },
+        "opportunity_research_brief": {
+            "items": [{"content": "o" * 2_000} for _ in range(100)]
+        },
+    }
+
+    finalize_prompt_budget(
+        prompt,
+        target_chars=120_000,
+        warn_chars=150_000,
+        max_chars=190_000,
+    )
+
+    assert isinstance(prompt["decision_inputs"], list)
+    assert isinstance(prompt["candidates"], list)
+    assert isinstance(prompt["blocks"], list)
+    assert prompt["prompt_budget"]["over_warn"] is False
+    assert prompt_budget_error(prompt) == ""
+    assert prompt["prompt_compaction"]["original_counts"]["recent_events"] == 300
     assert prompt["prompt_budget"]["over_max"] is False
     assert prompt_budget_error(prompt) == ""
     assert prompt["prompt_compaction"]["sections"]
@@ -11192,6 +11362,133 @@ def test_compact_manager_storage_payload_preserves_kis_diagnostics() -> None:
         "degraded_jue_wiki_effectiveness_resolution_status"
     ] == "unresolved"
     assert "raw_notes" not in compact["diagnostics"]
+
+
+def test_compact_manager_storage_payload_preserves_kis_rule_signal_review_pressure() -> None:
+    prompt = {
+        "decision_packet_v2": {
+            "version": "decision_packet_v2",
+            "blocks": [
+                {
+                    "block_id": "blk_010130_20260706055414397262",
+                    "symbol": "010130",
+                    "name": "고려아연",
+                    "status": "open",
+                    "horizon": "mid",
+                    "qty_open": 1,
+                    "entry_price": 1_080_000,
+                    "stop_price": 1_045_000,
+                    "technical": {"price": 1_003_000},
+                    "stop_policy": {
+                        "horizon": "mid",
+                        "stop_touched_now": True,
+                        "touch_action": "manager_review",
+                        "latest_signal": {
+                            "reason": "stop_reached",
+                            "price": 1_045_000,
+                            "created_at": "2026-07-08T04:04:08+00:00",
+                        },
+                    },
+                }
+            ],
+        },
+        "research_spine": {"packets": [{"symbol": "010130", "raw": "R" * 8_000}]},
+        "daily_discovery": {"block_candidates": [{"symbol": "010130", "raw": "D" * 8_000}]},
+        "jue_wiki": {"pages": [{"page_id": "kis.symbol.010130", "summary": "W" * 8_000}]},
+        "prompt_budget": {"version": "prompt_budget_v1", "total_chars": 80_000},
+    }
+
+    compact = compact_manager_storage_payload(
+        prompt,
+        limit=1_500,
+        label="kis_manager_prompt",
+    )
+
+    pressure = compact["manager_action_required"]
+    assert pressure["status"] == "action_required"
+    assert pressure["resolution_contract"] == "close_or_explicit_hold_review"
+    assert pressure["item_count"] == 1
+    assert pressure["items"] == [
+        {
+            "block_id": "blk_010130_20260706055414397262",
+            "symbol": "010130",
+            "name": "고려아연",
+            "horizon": "mid",
+            "reason": "stop_reached",
+            "signal_type": "stop_signal",
+            "policy_action": "manager_review",
+            "current_price": 1_003_000,
+            "signal_price": 1_045_000,
+            "signal_at": "2026-07-08T04:04:08+00:00",
+        }
+    ]
+
+
+def test_kis_manager_contract_requires_mid_stop_signal_resolution() -> None:
+    prompt = {
+        "manager_action_required": {
+            "status": "action_required",
+            "resolution_contract": "close_or_explicit_hold_review",
+            "items": [
+                {
+                    "block_id": "blk_010130_20260706055414397262",
+                    "symbol": "010130",
+                    "horizon": "mid",
+                    "reason": "stop_reached",
+                    "signal_type": "stop_signal",
+                    "policy_action": "manager_review",
+                }
+            ],
+        }
+    }
+
+    error = kis_manager_response_contract_error(
+        prompt=prompt,
+        response={"hold_decision": {"summary": "관망"}},
+        actions={"create_blocks": [], "update_blocks": [], "close_blocks": []},
+        hold_decision={"summary": "관망"},
+    )
+
+    assert error == "rule_signal_review_resolution_missing_from_model"
+
+
+def test_kis_manager_contract_accepts_explicit_mid_stop_hold_review() -> None:
+    prompt = {
+        "manager_action_required": {
+            "status": "action_required",
+            "resolution_contract": "close_or_explicit_hold_review",
+            "items": [
+                {
+                    "block_id": "blk_010130_20260706055414397262",
+                    "symbol": "010130",
+                    "horizon": "mid",
+                    "reason": "stop_reached",
+                    "signal_type": "stop_signal",
+                    "policy_action": "manager_review",
+                }
+            ],
+        }
+    }
+
+    error = kis_manager_response_contract_error(
+        prompt=prompt,
+        response={},
+        actions={"create_blocks": [], "update_blocks": [], "close_blocks": []},
+        hold_decision={
+            "summary": "고려아연 중기 손절 신호는 리서치 재확인 후 보류",
+            "watch_symbols": ["010130"],
+            "next_triggers": [
+                {
+                    "symbol": "010130",
+                    "condition": "1,000,000원 회복 실패 또는 추가 저점 이탈 시 청산",
+                    "horizon": "mid",
+                    "reason": "stop_reached manager_review explicit hold",
+                }
+            ],
+        },
+    )
+
+    assert error == ""
 
 
 def test_compact_manager_storage_payload_has_default_compaction_adapters() -> None:

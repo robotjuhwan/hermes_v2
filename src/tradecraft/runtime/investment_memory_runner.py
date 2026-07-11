@@ -28,6 +28,7 @@ from tradecraft.services.codex_native import (
     codex_native_thread_config_kwargs,
 )
 from tradecraft.services.llm_usage import KST, LLMUsageRepository
+from tradecraft.services.llm_model_policy import llm_model_config_kwargs
 from tradecraft.services.telegram import TelegramBridge, TelegramConfig
 
 logger = logging.getLogger(__name__)
@@ -300,8 +301,7 @@ def _build_memory_service(settings: AppSettings) -> InvestmentMemoryService:
             mode=settings.codex_runtime_mode,
             sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
             timeout_ms=settings.codex_runtime_timeout_ms,
-            model=settings.llm_model,
-            reasoning_effort=settings.llm_reasoning_effort,
+            **llm_model_config_kwargs(settings, component="investment_memory"),
             usage_enabled=settings.llm_usage_enabled,
             usage_db_path=settings.llm_usage_db_path,
             usage_component="investment_memory",
@@ -351,8 +351,7 @@ def _build_daily_discovery_service(settings: AppSettings) -> Any:
             mode=settings.codex_runtime_mode,
             sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
             timeout_ms=settings.codex_runtime_timeout_ms,
-            model=settings.llm_model,
-            reasoning_effort=settings.llm_reasoning_effort,
+            **llm_model_config_kwargs(settings, component="daily_discovery"),
             usage_enabled=settings.llm_usage_enabled,
             usage_db_path=settings.llm_usage_db_path,
             usage_component="daily_discovery",
@@ -384,6 +383,7 @@ def _build_daily_discovery_service(settings: AppSettings) -> Any:
             enabled=settings.daily_discovery_enabled,
             kospi_count=settings.daily_discovery_kospi_count,
             kosdaq_count=settings.daily_discovery_kosdaq_count,
+            etf_count=settings.daily_discovery_etf_count,
             exclude_recent_days=settings.daily_discovery_exclude_recent_days,
             candidate_limit_per_market=(
                 settings.daily_discovery_candidate_limit_per_market

@@ -133,7 +133,7 @@ class ResearchPipelineConfig:
     codex_runtime_mode: str = "auto"
     codex_runtime_sdk_codex_bin: str = ""
     codex_runtime_timeout_ms: int = 60000
-    llm_model: str = "gpt-5.5"
+    llm_model: str = "gpt-5.6-terra"
     llm_reasoning_effort: str = "xhigh"
     llm_usage_enabled: bool = True
     llm_usage_db_path: str = ".runtime/llm_usage.db"

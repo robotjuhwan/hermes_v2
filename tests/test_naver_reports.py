@@ -100,6 +100,60 @@ def test_naver_report_repository_upsert_and_search(tmp_path: Path) -> None:
     assert chunk_rows[0]["report_id"] == report_id
 
 
+def test_latest_symbol_linked_reports_uses_stable_tie_order_before_limit(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    now = "2026-07-11T00:00:00+00:00"
+    with repo._connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO reports (
+                report_id, source_url, detail_url, pdf_url, title, broker,
+                symbol, published_at, content, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    report_id,
+                    "https://example.invalid/list",
+                    f"https://example.invalid/{report_id}",
+                    f"https://example.invalid/{report_id}.pdf",
+                    f"Report {report_id}",
+                    "Example",
+                    "005930",
+                    now,
+                    "content",
+                    now,
+                    now,
+                )
+                for report_id in range(1, 61)
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO report_symbol_links (
+                report_id, symbol, link_type, confidence, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (report_id, "005930", link_type, 0.9, now, now)
+                for report_id in range(1, 61)
+                for link_type in ("primary", "mention")
+            ],
+        )
+
+    first = repo.latest_symbol_linked_reports("005930", limit=100)
+    replay = repo.latest_symbol_linked_reports("005930", limit=100)
+
+    assert replay == first
+    assert [(row["report_id"], row["link_type"]) for row in first] == [
+        (report_id, link_type)
+        for report_id in range(60, 10, -1)
+        for link_type in ("mention", "primary")
+    ]
+
+
 def test_naver_report_empty_query_search_does_not_require_chunk_table(
     tmp_path: Path,
 ) -> None:

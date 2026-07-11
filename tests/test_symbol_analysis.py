@@ -526,6 +526,42 @@ def test_symbol_analysis_native_thread_key_is_scoped_by_trigger(
     )
 
 
+def test_symbol_analysis_etf_trigger_adds_etf_specific_guidance(
+    tmp_path: Path,
+) -> None:
+    memory = InvestmentMemoryService(
+        config=InvestmentMemoryConfig(
+            root_path=str(tmp_path / "memory"),
+            db_path=str(tmp_path / "memory.db"),
+            strategy_md_path=str(tmp_path / "strategy.md"),
+        ),
+        codex_runtime=None,  # type: ignore[arg-type]
+    )
+    memory.initialize()
+    llm = _FakeLLM()
+    service = SymbolAnalysisService(
+        codex_runtime=llm,  # type: ignore[arg-type]
+        memory_service=memory,
+        fundamentals=_FakeFundamentals(),
+        quote_provider=_FakeQuoteProvider(),
+        report_repository=_FakeReports(),
+        rag_store=_FakeRAG(),
+        block_provider=_FakeBlocks(),
+    )
+
+    result = asyncio.run(service.run("069500", trigger="daily_etf_deep_research"))
+
+    assert result["status"] == "ok"
+    prompt = llm.calls[0]
+    prompt_text = json.dumps(prompt, ensure_ascii=False)
+    assert prompt["native_thread_key"] == (
+        "symbol_analysis:069500:daily_etf_deep_research:{date}"
+    )
+    assert "ETF-specific checklist" in prompt_text
+    assert "tracking error" in prompt_text
+    assert "core_etf" in prompt_text
+
+
 def test_symbol_analysis_retries_busy_native_thread_lease(tmp_path: Path) -> None:
     memory = InvestmentMemoryService(
         config=InvestmentMemoryConfig(

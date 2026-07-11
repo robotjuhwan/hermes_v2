@@ -7,6 +7,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
+from dataclasses import field
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,7 +22,7 @@ from tradecraft.services.llm_usage import (
     safe_json_dumps,
 )
 
-DEFAULT_LLM_MODEL = "gpt-5.5"
+DEFAULT_LLM_MODEL = "gpt-5.6-terra"
 DEFAULT_REASONING_EFFORT = "xhigh"
 SDK_MIN_TIMEOUT_SEC = 1.0
 NATIVE_SKILL_MAP = {
@@ -263,6 +264,9 @@ class CodexNativeConfig:
     developer_instructions_enabled: bool = True
     thread_lease_wait_sec: float = 120.0
     thread_lease_poll_sec: float = 5.0
+    operation_model_overrides: dict[str, tuple[str, str]] = field(
+        default_factory=dict
+    )
 
 
 class CodexNativeRuntime:
@@ -386,6 +390,22 @@ class CodexNativeRuntime:
         payload: dict[str, Any],
         timeout_ms: int | None = None,
     ) -> dict[str, Any]:
+        _, operation, _ = self._component_operation_workflow(payload)
+        override = self.config.operation_model_overrides.get(operation)
+        if override:
+            model, reasoning_effort = override
+            bridge = CodexNativeRuntime(
+                replace(
+                    self.config,
+                    model=str(model or self.config.model),
+                    reasoning_effort=str(
+                        reasoning_effort or self.config.reasoning_effort
+                    ),
+                    operation_model_overrides={},
+                )
+            )
+            return await bridge.complete(payload, timeout_ms=timeout_ms)
+
         started_at = datetime.now(timezone.utc)
         payload = self._payload_with_reasoning(payload)
         if not self.ready:

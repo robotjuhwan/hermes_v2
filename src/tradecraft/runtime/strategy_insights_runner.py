@@ -16,6 +16,7 @@ from tradecraft.services.codex_native import (
     CodexNativeRuntime,
     codex_native_thread_config_kwargs,
 )
+from tradecraft.services.llm_model_policy import llm_model_config_kwargs
 from tradecraft.services.strategy_intelligence import (
     StrategyIntelligenceConfig,
     StrategyIntelligenceEngine,
@@ -33,8 +34,7 @@ def _build_strategy_intelligence(settings: AppSettings) -> StrategyIntelligenceE
             mode=settings.codex_runtime_mode,
             sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
             timeout_ms=settings.codex_runtime_timeout_ms,
-            model=settings.llm_model,
-            reasoning_effort=settings.llm_reasoning_effort,
+            **llm_model_config_kwargs(settings, component="strategy_intelligence"),
             usage_enabled=settings.llm_usage_enabled,
             usage_db_path=settings.llm_usage_db_path,
             usage_component="strategy_intelligence",

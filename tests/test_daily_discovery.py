@@ -18,11 +18,30 @@ class _DirectorySource:
     def __init__(self, rows_per_market: int = 20) -> None:
         self.rows = {
             "KOSPI": [
-                {"symbol": f"10{idx:04d}", "name": f"피코스피{idx}", "market": "KOSPI"}
+                {
+                    "symbol": f"10{idx:04d}",
+                    "name": f"피코스피{idx}",
+                    "market": "KOSPI",
+                    "asset_class": "stock",
+                }
                 for idx in range(rows_per_market)
             ],
             "KOSDAQ": [
-                {"symbol": f"20{idx:04d}", "name": f"피코스닥{idx}", "market": "KOSDAQ"}
+                {
+                    "symbol": f"20{idx:04d}",
+                    "name": f"피코스닥{idx}",
+                    "market": "KOSDAQ",
+                    "asset_class": "stock",
+                }
+                for idx in range(rows_per_market)
+            ],
+            "ETF": [
+                {
+                    "symbol": f"36{idx:04d}",
+                    "name": f"피ETF{idx}",
+                    "market": "ETF",
+                    "asset_class": "etf",
+                }
                 for idx in range(rows_per_market)
             ],
         }
@@ -33,12 +52,14 @@ class _DirectorySource:
         market: str = "",
         limit: int = 100,
         exclude_symbols: set[str] | None = None,
+        asset_class: str = "stock",
     ) -> list[dict[str, Any]]:
         excluded = set(exclude_symbols or set())
         return [
             row
             for row in self.rows.get(str(market).upper(), [])
             if row["symbol"] not in excluded
+            and row.get("asset_class", "stock") == asset_class
         ][:limit]
 
 
@@ -136,6 +157,79 @@ def test_symbol_directory_listing_excludes_symbols_and_non_stock_assets(tmp_path
     assert [row["symbol"] for row in rows] == ["000660"]
 
 
+def test_symbol_directory_lists_etf_assets_when_requested(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.seed_symbol_directory(
+        [
+            {"symbol": "005930", "name": "삼성전자", "market": "KOSPI", "source": "test"},
+            {"symbol": "069500", "name": "KODEX 200", "market": "ETF", "source": "test"},
+            {"symbol": "102110", "name": "TIGER 200", "market": "ETF", "source": "test"},
+        ]
+    )
+
+    rows = repo.list_symbol_directory(market="ETF", limit=10, asset_class="etf")
+
+    assert [row["symbol"] for row in rows] == ["069500", "102110"]
+    assert all(row["asset_class"] == "etf" for row in rows)
+
+
+def test_symbol_directory_etf_request_excludes_etn_assets(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.seed_symbol_directory(
+        [
+            {"symbol": "530001", "name": "테스트 ETN", "market": "ETN", "source": "test"},
+        ]
+    )
+
+    rows = repo.list_symbol_directory(market="", limit=10, asset_class="etf")
+
+    assert rows == []
+
+
+def test_symbol_directory_blank_market_upsert_does_not_downgrade_etf_asset_class(
+    tmp_path: Path,
+) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.seed_symbol_directory(
+        [
+            {"symbol": "069500", "name": "KODEX 200", "market": "ETF", "source": "test"},
+        ]
+    )
+    repo.upsert_symbol_directory(
+        symbol="069500",
+        company_name="KODEX 200",
+        market="",
+        source="metadata_repair",
+        confidence=1.0,
+    )
+
+    rows = repo.list_symbol_directory(market="ETF", limit=10, asset_class="etf")
+
+    assert [row["symbol"] for row in rows] == ["069500"]
+    assert rows[0]["asset_class"] == "etf"
+
+
+def test_daily_discovery_does_not_relabel_etn_fallback_as_etf(tmp_path: Path) -> None:
+    repo = NaverReportRepository(str(tmp_path / "reports.db"))
+    repo.seed_symbol_directory(
+        [
+            {"symbol": "530001", "name": "테스트 ETN", "market": "ETN", "source": "test"},
+        ]
+    )
+    service = DailyDiscoveryService(
+        config=DailyDiscoveryConfig(
+            db_path=str(tmp_path / "discovery.db"),
+            kospi_count=0,
+            kosdaq_count=0,
+            etf_count=1,
+        ),
+        directory_source=repo,
+        symbol_analysis=None,
+    )
+
+    assert service.select_symbols(trading_day=date(2026, 5, 20)) == []
+
+
 def test_symbol_directory_listing_excludes_bad_status_when_column_exists(tmp_path: Path) -> None:
     repo = NaverReportRepository(str(tmp_path / "reports.db"))
     repo.seed_symbol_directory(
@@ -172,6 +266,27 @@ def test_daily_discovery_samples_five_kospi_and_five_kosdaq_deterministically(
     assert len([row for row in first if row["market"] == "KOSPI"]) == 5
     assert len([row for row in first if row["market"] == "KOSDAQ"]) == 5
     assert len({row["symbol"] for row in first}) == 10
+
+
+def test_daily_discovery_can_sample_etfs_without_changing_stock_counts(
+    tmp_path: Path,
+) -> None:
+    service = DailyDiscoveryService(
+        config=DailyDiscoveryConfig(
+            db_path=str(tmp_path / "discovery.db"),
+            etf_count=3,
+        ),
+        directory_source=_DirectorySource(),
+        symbol_analysis=None,
+    )
+
+    selected = service.select_symbols(trading_day=date(2026, 5, 20))
+
+    assert len([row for row in selected if row["market"] == "KOSPI"]) == 5
+    assert len([row for row in selected if row["market"] == "KOSDAQ"]) == 5
+    etfs = [row for row in selected if row["market"] == "ETF"]
+    assert len(etfs) == 3
+    assert all(row["asset_class"] == "etf" for row in etfs)
 
 
 def test_daily_discovery_falls_back_to_full_directory_when_market_labels_missing(
@@ -238,6 +353,35 @@ def test_daily_discovery_runs_deep_analysis_for_every_selected_symbol(tmp_path: 
     assert all(call[1] == "daily_random_deep_research" for call in analyzer.calls)
     assert all(call[2] is True for call in analyzer.calls)
     assert result["summary"]["block_candidate_count"] >= 1
+
+
+def test_daily_discovery_runs_etf_analysis_with_etf_trigger(tmp_path: Path) -> None:
+    analyzer = _SymbolAnalysis()
+    service = DailyDiscoveryService(
+        config=DailyDiscoveryConfig(
+            db_path=str(tmp_path / "discovery.db"),
+            etf_count=2,
+        ),
+        directory_source=_DirectorySource(),
+        symbol_analysis=analyzer,
+    )
+
+    result = asyncio.run(service.run_once(trading_day=date(2026, 5, 20), force=True))
+
+    etf_results = [row for row in result["results"] if row["market"] == "ETF"]
+    triggers_by_symbol = {symbol: trigger for symbol, trigger, _force in analyzer.calls}
+    assert len(etf_results) == 2
+    assert all(row["asset_class"] == "etf" for row in etf_results)
+    assert all(
+        triggers_by_symbol[row["symbol"]] == "daily_etf_deep_research"
+        for row in etf_results
+    )
+    assert all(
+        triggers_by_symbol[row["symbol"]] == "daily_random_deep_research"
+        for row in result["results"]
+        if row["market"] in {"KOSPI", "KOSDAQ"}
+    )
+    assert result["summary"]["etf_count"] == 2
 
 
 def test_daily_discovery_is_idempotent_for_same_trading_day(tmp_path: Path) -> None:

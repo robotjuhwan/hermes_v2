@@ -176,7 +176,8 @@ RUNNER_SPECS: dict[str, RunnerSpec] = {
         pid_file="tradecraft-naver-reports.pid",
         pattern=(
             r"tradecraft-naver-reports|tradecraft\.runtime\.naver_reports_runner|"
-            r"naver_reports_runner\.py"
+            r"naver_reports_runner\.py|tradecraft\.runtime\.naver_reports_worker|"
+            r"naver_reports_worker\.py"
         ),
         label="reports crawler",
         session_names=("tradecraft-naver-reports", "hermes-naver-reports"),

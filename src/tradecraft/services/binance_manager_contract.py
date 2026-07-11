@@ -42,6 +42,55 @@ def clean_string_list(value: Any, *, limit: int = 8) -> list[str]:
     return clean
 
 
+_TRIGGER_PRICE_NUMBER_RE = r"([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)"
+_NON_PRICE_TRIGGER_CONTEXT_RE = re.compile(
+    r"(?:신뢰도|confidence|rr|r/r|reward\s*/?\s*risk|stop\s*risk|"
+    r"손절\s*위험|위험|확률|승률)\s*(?:은|는|이|가|:|=)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _positive_price_from_text(value: Any) -> float:
+    price = safe_float(str(value or "").replace(",", ""))
+    return price if price > 0 else 0.0
+
+
+def _infer_trigger_price_from_condition(*, symbol: str, condition: str) -> float:
+    text = _clean_text(condition, limit=300)
+    if not text:
+        return 0.0
+    symbol_text = str(symbol or "").upper().strip()
+    if symbol_text:
+        symbol_pattern = re.compile(
+            rf"(?<![A-Z0-9-]){re.escape(symbol_text)}(?![A-Z0-9-])"
+            rf"\s*(?:[<>]=?|[≤≥]|이상|이하|above|below|near|at|@)\s*"
+            rf"{_TRIGGER_PRICE_NUMBER_RE}",
+            re.IGNORECASE,
+        )
+        match = symbol_pattern.search(text)
+        if match:
+            return _positive_price_from_text(match.group(1))
+    korean_price_pattern = re.compile(
+        rf"{_TRIGGER_PRICE_NUMBER_RE}(?!\s*%)\s*"
+        r"(?:이상|이하|부근|근처|돌파|반등|눌림|재진입|재확인)"
+    )
+    for match in korean_price_pattern.finditer(text):
+        left_context = text[max(0, match.start() - 32) : match.start()]
+        if _NON_PRICE_TRIGGER_CONTEXT_RE.search(left_context):
+            continue
+        return _positive_price_from_text(match.group(1))
+    price_word_pattern = re.compile(
+        rf"(?:가격|price|entry|trigger|진입|대기 가격)\s*"
+        rf"(?:[:=]|이|가|은|는|at|near|[<>]=?|[≤≥]|@)?\s*"
+        rf"{_TRIGGER_PRICE_NUMBER_RE}(?!\s*%)",
+        re.IGNORECASE,
+    )
+    match = price_word_pattern.search(text)
+    if match:
+        return _positive_price_from_text(match.group(1))
+    return 0.0
+
+
 def manager_action_count(
     actions: dict[str, list[dict[str, Any]]],
     *,
@@ -107,6 +156,7 @@ def _hold_decision_from_payload(
         payload.get("entry_price")
         or payload.get("entry_price_usdt")
         or payload.get("trigger_price")
+        or payload.get("entry_trigger_price")
     )
     entry_style = _clean_text(
         payload.get("entry_style")
@@ -114,6 +164,11 @@ def _hold_decision_from_payload(
         or payload.get("trigger_condition"),
         limit=180,
     )
+    if entry_price <= 0:
+        entry_price = _infer_trigger_price_from_condition(
+            symbol=symbol,
+            condition=entry_style,
+        )
     triggers: list[dict[str, Any]] = []
     if symbol and (entry_price > 0 or entry_style):
         triggers.append(
@@ -174,6 +229,7 @@ def _hold_decision_is_sparse(raw: dict[str, Any], *, action_count: int) -> bool:
         raw.get(key)
         for key in (
             "next_triggers",
+            "triggers",
             "planned_actions",
             "data_gaps",
             "risk_notes",
@@ -182,6 +238,153 @@ def _hold_decision_is_sparse(raw: dict[str, Any], *, action_count: int) -> bool:
     if summary in default_summaries and sparse_reasons and no_detail:
         return True
     return action_count == 0 and sparse_reasons and no_detail
+
+
+def _hold_decision_from_validation_repair_resolution(
+    *,
+    response: dict[str, Any],
+    action_count: int,
+) -> dict[str, Any]:
+    resolution = (
+        response.get("validation_repair_resolution")
+        if isinstance(response.get("validation_repair_resolution"), dict)
+        else {}
+    )
+    triggers: list[dict[str, Any]] = []
+    watch_symbols: list[str] = []
+    data_gaps: list[str] = []
+    reasons: list[str] = []
+    for row in resolution.get("resolved_candidates") or []:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or row.get("code") or "").upper().strip()
+        condition = _clean_text(
+            row.get("next_trigger")
+            or row.get("condition")
+            or row.get("trigger"),
+            limit=180,
+        )
+        evidence_gap = _clean_text(row.get("evidence_gap"), limit=240)
+        repair_resolution = _clean_text(row.get("resolution"), limit=120)
+        if symbol and symbol not in watch_symbols:
+            watch_symbols.append(symbol)
+        if evidence_gap and evidence_gap not in data_gaps:
+            data_gaps.append(evidence_gap)
+        reason = evidence_gap or repair_resolution
+        if reason and reason not in reasons:
+            reasons.append(reason)
+        if symbol and condition:
+            price = safe_float(
+                row.get("price")
+                or row.get("trigger_price")
+                or row.get("entry_trigger_price")
+                or row.get("entry_price")
+            )
+            if price <= 0:
+                price = _infer_trigger_price_from_condition(
+                    symbol=symbol,
+                    condition=condition,
+                )
+            triggers.append(
+                {
+                    "symbol": symbol,
+                    "market": normalize_market(row.get("market")),
+                    "condition": condition,
+                    "price": price,
+                    "reason": reason,
+                }
+            )
+        if len(triggers) >= 8:
+            break
+    if not any([watch_symbols, triggers, data_gaps, reasons]):
+        return {}
+    return {
+        "summary": (
+            "액션 실행: validation repair 근거를 반영한 블록 판단입니다."
+            if action_count
+            else "관망: validation repair 근거를 반영해 다음 조건을 감시합니다."
+        ),
+        "reasons": reasons[:8],
+        "watch_symbols": watch_symbols[:12],
+        "next_triggers": triggers,
+        "planned_actions": [],
+        "data_gaps": data_gaps[:8],
+        "risk_notes": [],
+    }
+
+
+def _merge_hold_decision_contexts(
+    *holds: dict[str, Any],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+
+    def extend_unique(key: str, values: Any) -> None:
+        if not isinstance(values, list):
+            return
+        bucket = result.setdefault(key, [])
+        for value in values:
+            if value in (None, "", [], {}):
+                continue
+            if value not in bucket:
+                bucket.append(value)
+
+    seen_triggers: set[tuple[str, str, str, str, str]] = set()
+    triggers: list[dict[str, Any]] = []
+    for hold in holds:
+        if not isinstance(hold, dict) or not hold:
+            continue
+        if not result.get("summary") and hold.get("summary"):
+            result["summary"] = hold.get("summary")
+        for key in ("reasons", "planned_actions", "data_gaps", "risk_notes"):
+            extend_unique(key, hold.get(key))
+        extend_unique("watch_symbols", hold.get("watch_symbols"))
+        for row in hold.get("next_triggers") or hold.get("triggers") or []:
+            if not isinstance(row, dict):
+                continue
+            trigger = {
+                "symbol": str(row.get("symbol") or "").upper().strip(),
+                "market": normalize_market(row.get("market")),
+                "condition": _clean_text(
+                    row.get("condition") or row.get("trigger"),
+                    limit=180,
+                ),
+                "price": safe_float(
+                    row.get("price")
+                    or row.get("trigger_price")
+                    or row.get("entry_trigger_price")
+                    or row.get("entry_price")
+                ),
+                "reason": _clean_text(row.get("reason"), limit=240),
+            }
+            if trigger["price"] <= 0:
+                trigger["price"] = _infer_trigger_price_from_condition(
+                    symbol=trigger["symbol"],
+                    condition=trigger["condition"],
+                )
+            identity = (
+                str(trigger.get("symbol") or ""),
+                str(trigger.get("market") or ""),
+                str(trigger.get("condition") or ""),
+                str(trigger.get("price") or ""),
+                str(trigger.get("reason") or ""),
+            )
+            if identity not in seen_triggers and any(
+                trigger.get(key) not in (None, "", [], {})
+                for key in ("symbol", "market", "condition", "reason")
+            ):
+                seen_triggers.add(identity)
+                triggers.append(trigger)
+    if triggers:
+        result["next_triggers"] = triggers[:8]
+    if result.get("watch_symbols"):
+        result["watch_symbols"] = parse_universe(
+            ",".join(str(symbol) for symbol in result["watch_symbols"])
+        )[:12]
+    return {
+        key: value
+        for key, value in result.items()
+        if value not in (None, "", [], {})
+    }
 
 
 def normalize_manager_hold_decision(
@@ -200,20 +403,20 @@ def normalize_manager_hold_decision(
         symbols=symbols,
         action_count=action_count,
     )
-    if payload_hold:
+    repair_hold = _hold_decision_from_validation_repair_resolution(
+        response=response,
+        action_count=action_count,
+    )
+    enriched_hold = _merge_hold_decision_contexts(payload_hold, repair_hold)
+    if enriched_hold:
         if _hold_decision_is_sparse(raw, action_count=action_count):
-            raw = {**payload_hold, "action_count": action_count}
+            raw = {**enriched_hold, "action_count": action_count}
         else:
+            merged_raw = _merge_hold_decision_contexts(raw, enriched_hold)
             raw = {
-                **payload_hold,
                 **raw,
-                "reasons": raw.get("reasons") or payload_hold.get("reasons"),
-                "next_triggers": raw.get("next_triggers")
-                or payload_hold.get("next_triggers"),
-                "data_gaps": raw.get("data_gaps") or payload_hold.get("data_gaps"),
-                "risk_notes": raw.get("risk_notes") or payload_hold.get("risk_notes"),
-                "planned_actions": raw.get("planned_actions")
-                or payload_hold.get("planned_actions"),
+                **merged_raw,
+                "summary": raw.get("summary") or merged_raw.get("summary"),
             }
     summary = _clean_text(
         raw.get("summary")
@@ -259,9 +462,19 @@ def normalize_manager_hold_decision(
                     item.get("condition") or item.get("operator") or item.get("trigger"),
                     limit=180,
                 ),
-                "price": safe_float(item.get("price") or item.get("trigger_price")),
+                "price": safe_float(
+                    item.get("price")
+                    or item.get("trigger_price")
+                    or item.get("entry_trigger_price")
+                    or item.get("entry_price")
+                ),
                 "reason": _clean_text(item.get("reason"), limit=240),
             }
+            if trigger["price"] <= 0:
+                trigger["price"] = _infer_trigger_price_from_condition(
+                    symbol=trigger["symbol"],
+                    condition=trigger["condition"],
+                )
             if trigger["symbol"] or trigger["condition"] or trigger["price"] > 0:
                 triggers.append(trigger)
             if len(triggers) >= 8:

@@ -10,7 +10,9 @@ from typing import Any, Protocol
 
 
 DISCOVERY_MARKETS = ("KOSPI", "KOSDAQ")
+ETF_DISCOVERY_MARKET = "ETF"
 DISCOVERY_TRIGGER = "daily_random_deep_research"
+ETF_DISCOVERY_TRIGGER = "daily_etf_deep_research"
 COMPLETED_DISCOVERY_STATUSES = {"ok", "partial", "empty", "completed", "success"}
 PRE_SURGE_SETUP_TOKENS = (
     "저평가",
@@ -54,6 +56,7 @@ class SymbolDirectorySource(Protocol):
         market: str = "",
         limit: int = 100,
         exclude_symbols: set[str] | None = None,
+        asset_class: str = "stock",
     ) -> list[dict[str, Any]]: ...
 
 
@@ -73,6 +76,7 @@ class DailyDiscoveryConfig:
     enabled: bool = True
     kospi_count: int = 5
     kosdaq_count: int = 5
+    etf_count: int = 0
     exclude_recent_days: int = 10
     candidate_limit_per_market: int = 300
     force_collect: bool = True
@@ -224,6 +228,7 @@ def _compact_discovery_result(row: dict[str, Any]) -> dict[str, Any]:
         "symbol": str(row.get("symbol") or ""),
         "name": str(row.get("name") or analysis.get("name") or ""),
         "market": str(row.get("market") or ""),
+        "asset_class": str(row.get("asset_class") or "stock"),
         "status": str(row.get("status") or ""),
         "score": row.get("score"),
         "error_message": str(row.get("error_message") or "")[:240],
@@ -245,6 +250,21 @@ def _trading_day_key(value: str | date) -> str:
     if isinstance(value, date):
         return value.isoformat()
     return str(value or "").strip()
+
+
+def _is_etf_discovery_row(row: dict[str, Any]) -> bool:
+    return (
+        str(row.get("asset_class") or "").strip().lower() == "etf"
+        or str(row.get("market") or "").strip().upper() == ETF_DISCOVERY_MARKET
+    )
+
+
+def _is_etf_directory_row(row: dict[str, Any]) -> bool:
+    market = str(row.get("market") or "").strip().upper()
+    asset_class = str(row.get("asset_class") or "").strip().lower()
+    return market != "ETN" and (
+        asset_class == "etf" or market == ETF_DISCOVERY_MARKET
+    )
 
 
 class DailyDiscoveryRepository:
@@ -498,7 +518,61 @@ class DailyDiscoveryService:
                 if symbol:
                     selected_symbols.add(symbol)
             selected.extend(sample)
+        etf_count = max(int(self.config.etf_count), 0)
+        if etf_count > 0:
+            market_excluded = set(excluded) | selected_symbols
+            rows = self._list_symbol_directory(
+                market=ETF_DISCOVERY_MARKET,
+                limit=self.config.candidate_limit_per_market,
+                exclude_symbols=market_excluded,
+                asset_class="etf",
+            )
+            rows = [row for row in rows if _is_etf_directory_row(row)]
+            used_market_fallback = False
+            if not rows:
+                rows = self._list_symbol_directory(
+                    market="",
+                    limit=max(int(self.config.candidate_limit_per_market), 3_000),
+                    exclude_symbols=market_excluded,
+                    asset_class="etf",
+                )
+                rows = [row for row in rows if _is_etf_directory_row(row)]
+                used_market_fallback = bool(rows)
+            sample = _stable_sample(
+                rows,
+                seed=f"{trading_day.isoformat()}:{ETF_DISCOVERY_MARKET}",
+                count=etf_count,
+            )
+            for row in sample:
+                original_market = str(row.get("market") or "")
+                row["market"] = ETF_DISCOVERY_MARKET
+                row["asset_class"] = "etf"
+                if used_market_fallback:
+                    row["source_market"] = original_market
+                    row["selection_market_fallback"] = True
+                symbol = str(row.get("symbol") or "").strip()
+                if symbol:
+                    selected_symbols.add(symbol)
+            selected.extend(sample)
         return selected
+
+    def _list_symbol_directory(
+        self,
+        *,
+        market: str,
+        limit: int,
+        exclude_symbols: set[str],
+        asset_class: str,
+    ) -> list[dict[str, Any]]:
+        try:
+            return self.directory_source.list_symbol_directory(
+                market=market,
+                limit=limit,
+                exclude_symbols=exclude_symbols,
+                asset_class=asset_class,
+            )
+        except TypeError:
+            return []
 
     def should_run_for_day(self, trading_day: str | date) -> bool:
         if not self.config.enabled:
@@ -540,6 +614,7 @@ class DailyDiscoveryService:
                 "error_count": 0,
                 "block_candidate_count": 0,
                 "pre_surge_candidate_count": 0,
+                "etf_count": 0,
                 "top_symbols": [],
             }
             run = self.repository.save_run(
@@ -565,10 +640,11 @@ class DailyDiscoveryService:
         errors: list[dict[str, str]] = []
         for row in selected:
             symbol = str(row.get("symbol") or "").strip()
+            trigger = ETF_DISCOVERY_TRIGGER if _is_etf_discovery_row(row) else DISCOVERY_TRIGGER
             try:
                 result = await self.symbol_analysis.run(
                     symbol,
-                    trigger=DISCOVERY_TRIGGER,
+                    trigger=trigger,
                     force_collect=self.config.force_collect,
                 )
             except Exception as exc:
@@ -599,6 +675,7 @@ class DailyDiscoveryService:
                     if (row.get("pre_surge") or {}).get("is_candidate")
                 ]
             ),
+            "etf_count": len([row for row in results if _is_etf_discovery_row(row)]),
             "top_symbols": [row.get("symbol") for row in results[:5]],
         }
         run = self.repository.save_run(
@@ -666,6 +743,7 @@ class DailyDiscoveryService:
             "symbol": symbol,
             "name": str(row.get("name") or analysis.get("name") or ""),
             "market": str(row.get("market") or ""),
+            "asset_class": str(row.get("asset_class") or "stock"),
             "status": str(result.get("status") or "ok"),
             "score": _score_analysis(analysis),
             "analysis": analysis,
@@ -677,6 +755,7 @@ class DailyDiscoveryService:
             "symbol": str(row.get("symbol") or ""),
             "name": str(row.get("name") or ""),
             "market": str(row.get("market") or ""),
+            "asset_class": str(row.get("asset_class") or "stock"),
             "status": "error",
             "error_message": error_message,
             "score": 0.0,

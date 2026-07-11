@@ -25,6 +25,7 @@ codex-sdk = [
 ]
 dev = [
   "pytest>=8.2.0",
+  "pytest-xdist>=3.6.0",
   "ruff>=0.5.0",
 ]
 
@@ -46,11 +47,26 @@ tradecraft = [
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
+markers = [
+  "unit: isolated deterministic behavior tests",
+  "contract: API, payload, configuration, and compatibility contract tests",
+  "integration: multi-component or external-adapter integration tests",
+  "slow: large or intentionally long-running regression tests",
+  "binance: Binance domain tests",
+  "kis: KIS domain tests",
+  "jue: Jue and Jue Wiki domain tests",
+  "readiness: operational readiness and status tests",
+  "memory: investment memory and performance learning tests",
+  "runtime: runner, watchdog, and runtime orchestration tests",
+  "reports: reports, research, and RAG tests",
+  "crypto: shared crypto, Binance, and Upbit tests",
+]
 
 [project.scripts]
 tradecraft-ui = "tradecraft.main:run"
 tradecraft-control = "tradecraft.main:run"
 tradecraft-runtime = "tradecraft.runtime.runner:run"
+tradecraft-runtime-archive = "tradecraft.runtime.runtime_archive_cli:run"
 tradecraft-intelligence = "tradecraft.runtime.intelligence_runner:run"
 tradecraft-strategy-insights = "tradecraft.runtime.strategy_insights_runner:run"
 tradecraft-market-judge = "tradecraft.runtime.market_judge_runner:run"

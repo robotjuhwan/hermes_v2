@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from tradecraft.services.live_authority import compact_live_authority_for_status
 
@@ -331,6 +331,11 @@ def _compact_order(row: dict[str, Any]) -> dict[str, Any]:
             "qty",
             "order_type",
             "status",
+            "execution_status",
+            "filled_qty",
+            "filled_quote",
+            "avg_fill_price",
+            "effective_fill",
             "reason",
             "created_at",
             "updated_at",
@@ -763,6 +768,20 @@ def _compact_repair_rows(rows: Any) -> list[dict[str, Any]]:
     return compact
 
 
+def _live_execution_enabled(readiness: dict[str, Any]) -> bool:
+    if not isinstance(readiness, dict):
+        return False
+    execution = (
+        readiness.get("execution")
+        if isinstance(readiness.get("execution"), dict)
+        else {}
+    )
+    return any(
+        str(execution.get(key) or "").strip().lower() == "live"
+        for key in ("spot_mode", "futures_mode", "upbit_spot_mode")
+    )
+
+
 def _compact_recovery_rows(rows: Any) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         return []
@@ -812,6 +831,13 @@ def build_binance_blocks_router(deps: BinanceBlockRouteDeps) -> APIRouter:
         if isinstance(runner, dict):
             payload["runner"] = _compact_runner_status(runner)
         payload["readiness"] = readiness
+        activity_pressure = readiness.get("activity_pressure")
+        if (
+            isinstance(activity_pressure, dict)
+            and activity_pressure
+            and not isinstance(payload.get("activity_pressure"), dict)
+        ):
+            payload["activity_pressure"] = activity_pressure
         if compact:
             payload = _trim_binance_status_payload(payload)
         return payload
@@ -847,8 +873,21 @@ def build_binance_blocks_router(deps: BinanceBlockRouteDeps) -> APIRouter:
 
     @router.post("/api/binance/blocks/manager/run-once")
     async def binance_blocks_manager_run_once(
+        payload: dict[str, Any] | None = None,
         _: Any = Depends(deps.require_admin_auth),
     ) -> dict[str, Any]:
+        body = payload or {}
+        if (
+            not bool(body.get("confirm_live_manager_run"))
+            and _live_execution_enabled(deps.build_readiness({}))
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "binance manager run requires confirmation while live crypto "
+                    "execution is enabled"
+                ),
+            )
         return await _maybe_await(deps.manager_run_once())
 
     @router.post("/api/binance/blocks/adopt-existing/run-once")
@@ -865,8 +904,21 @@ def build_binance_blocks_router(deps: BinanceBlockRouteDeps) -> APIRouter:
 
     @router.post("/api/binance/blocks/executor/tick")
     async def binance_blocks_executor_tick(
+        payload: dict[str, Any] | None = None,
         _: Any = Depends(deps.require_admin_auth),
     ) -> dict[str, Any]:
+        body = payload or {}
+        if (
+            not bool(body.get("confirm_live_executor_tick"))
+            and _live_execution_enabled(deps.build_readiness({}))
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "binance executor tick requires confirmation while live crypto "
+                    "execution is enabled"
+                ),
+            )
         return await _maybe_await(deps.executor_tick())
 
     @router.post("/api/binance/blocks/kill-switch")

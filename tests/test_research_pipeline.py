@@ -198,6 +198,11 @@ def test_research_pipeline_embeds_market_intelligence_playbook(tmp_path: Path) -
     )
     pipeline = ResearchPipeline(cfg)
 
+    async def no_codex_item() -> None:
+        return None
+
+    setattr(pipeline, "_collect_codex_item", no_codex_item)
+
     snapshot = asyncio.run(pipeline.run_once())
     content = md_path.read_text(encoding="utf-8")
 
@@ -303,6 +308,11 @@ def test_research_pipeline_uses_report_db_rows(tmp_path: Path) -> None:
 
     setattr(pipeline, "report_repo", _Repo())
 
+    async def no_codex_item() -> None:
+        return None
+
+    setattr(pipeline, "_collect_codex_item", no_codex_item)
+
     snapshot = asyncio.run(pipeline.run_once())
     assert snapshot["count"] >= 1
     assert any(
@@ -352,6 +362,11 @@ def test_research_pipeline_prefers_rag_rows_when_available(tmp_path: Path) -> No
 
     setattr(pipeline, "rag_store", _Rag())
     setattr(pipeline, "report_repo", _Repo())
+
+    async def no_codex_item() -> None:
+        return None
+
+    setattr(pipeline, "_collect_codex_item", no_codex_item)
 
     snapshot = asyncio.run(pipeline.run_once())
     assert snapshot["count"] >= 1

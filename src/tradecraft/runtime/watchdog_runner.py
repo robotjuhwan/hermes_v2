@@ -27,9 +27,11 @@ DEFAULT_WATCHDOG_RUNNER_KEYS: tuple[str, ...] = (
     "market_pulse",
     "investment_memory",
     "live_evaluator",
+    "naver_reports",
     "crypto_market_research",
     "crypto_pattern_lab",
     "crypto_alpha",
+    "watchdog",
 )
 
 ENABLED_CRITICAL_RUNNERS: tuple[tuple[str, str], ...] = (
@@ -40,6 +42,7 @@ ENABLED_CRITICAL_RUNNERS: tuple[tuple[str, str], ...] = (
     ("market_pulse", "market_pulse_enabled"),
     ("investment_memory", "investment_memory_enabled"),
     ("live_evaluator", "live_evaluator_enabled"),
+    ("naver_reports", "naver_reports_enabled"),
     ("crypto_market_research", "crypto_market_research_enabled"),
     ("crypto_pattern_lab", "crypto_pattern_lab_enabled"),
     ("crypto_alpha", "crypto_alpha_enabled"),
@@ -82,9 +85,13 @@ def _effective_runner_keys(settings: Any) -> list[str]:
     keys = _parse_runner_keys(getattr(settings, "watchdog_runner_keys", ""))
     if not _truthy(getattr(settings, "research_enabled", False)):
         keys = [key for key in keys if key != "research"]
+    if not _truthy(getattr(settings, "naver_reports_enabled", False)):
+        keys = [key for key in keys if key != "naver_reports"]
     for key, enabled_attr in ENABLED_CRITICAL_RUNNERS:
         if key not in keys and _truthy(getattr(settings, enabled_attr, False)):
             keys.append(key)
+    if "watchdog" not in keys and _truthy(getattr(settings, "watchdog_enabled", True)):
+        keys.append("watchdog")
     return keys
 
 
@@ -101,6 +108,42 @@ def _parse_iso_datetime(raw: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _binance_manager_run_row(
+    settings: Any,
+    *,
+    run_id: int,
+) -> dict[str, Any]:
+    db_path = str(getattr(settings, "binance_block_trader_db_path", "") or "").strip()
+    if not db_path:
+        return {}
+    path = Path(db_path)
+    if not path.exists():
+        return {}
+    query = (
+        """
+        SELECT id, run_at, status, error_message
+        FROM manager_runs
+        WHERE id = ?
+        LIMIT 1
+        """
+        if run_id > 0
+        else """
+        SELECT id, run_at, status, error_message
+        FROM manager_runs
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+    params: tuple[Any, ...] = (run_id,) if run_id > 0 else ()
+    try:
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(query, params).fetchone()
+    except sqlite3.Error:
+        return {}
+    return dict(row) if row else {}
+
+
 def _needs_restart(row: dict[str, Any]) -> bool:
     if bool(row.get("stale_process")):
         return True
@@ -115,6 +158,62 @@ def _needs_restart(row: dict[str, Any]) -> bool:
     return False
 
 
+def _watchdog_runner_code_paths(key: str) -> list[Path]:
+    base = Path(__file__).resolve().parents[1]
+    if key == "watchdog":
+        return [
+            base / "runtime" / "watchdog_runner.py",
+            base / "runtime" / "process_status.py",
+            base / "runtime" / "runner_manifest.py",
+        ]
+    if key == "binance_block_trader":
+        return [
+            base / "runtime" / "binance_block_trader_runner.py",
+            base / "services" / "binance_block_trader.py",
+            base / "services" / "binance_manager_prompt.py",
+            base / "services" / "binance_manager_contract.py",
+        ]
+    return []
+
+
+def _annotate_source_code_staleness(key: str, row: dict[str, Any]) -> dict[str, Any]:
+    paths = _watchdog_runner_code_paths(key)
+    if not paths:
+        return row
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        return row
+    latest_epoch = max(path.stat().st_mtime for path in existing)
+    started_epoch = row.get("started_at_epoch")
+    alive = bool(row.get("direct_alive") or row.get("alive"))
+    stale_paths: list[str] = []
+    stale = False
+    if alive and started_epoch is not None:
+        try:
+            start = float(started_epoch)
+        except (TypeError, ValueError):
+            start = 0.0
+        if start > 0:
+            stale_paths = [
+                str(path)
+                for path in existing
+                if path.stat().st_mtime > start + 1.0
+            ]
+            stale = bool(stale_paths)
+    row["code_mtime"] = datetime.fromtimestamp(
+        latest_epoch,
+        tz=timezone.utc,
+    ).isoformat()
+    row["code_mtime_epoch"] = latest_epoch
+    row["stale_source_paths"] = stale_paths[:8]
+    row["stale_code_process"] = stale
+    if stale:
+        row["stale_process"] = True
+    else:
+        row["stale_process"] = bool(row.get("stale_process"))
+    return row
+
+
 def _annotate_runtime_state_health(
     key: str,
     row: dict[str, Any],
@@ -122,24 +221,171 @@ def _annotate_runtime_state_health(
     *,
     now: datetime,
 ) -> dict[str, Any]:
-    if key != "research":
+    if key == "naver_reports":
+        state_path = str(
+            getattr(settings, "naver_reports_state_path", "") or ""
+        ).strip()
+        if not state_path:
+            return row
+        snapshot = RuntimeStateStore(state_path).read_snapshot() or {}
+        state_status = str(snapshot.get("status") or "").strip()
+        heartbeat_at = _parse_iso_datetime(snapshot.get("heartbeat_at"))
+        deadline_at = _parse_iso_datetime(snapshot.get("deadline_at"))
+        heartbeat_interval_sec = max(
+            float(getattr(settings, "naver_reports_heartbeat_interval_sec", 5.0)),
+            0.1,
+        )
+        heartbeat_age_sec = (
+            int((now - heartbeat_at).total_seconds()) if heartbeat_at else None
+        )
+        heartbeat_timeout_sec = max(int(heartbeat_interval_sec * 3), 15)
+        stale_running = False
+        stale_reason = ""
+        if state_status == "collecting":
+            if heartbeat_age_sec is None or heartbeat_age_sec > heartbeat_timeout_sec:
+                stale_running = True
+                stale_reason = "naver_reports_heartbeat_overdue"
+            elif deadline_at is not None and now > deadline_at:
+                stale_running = True
+                stale_reason = "naver_reports_deadline_overdue"
+        row.update(
+            {
+                "runtime_state_status": state_status,
+                "runtime_state_updated_at": str(snapshot.get("updated_at") or ""),
+                "runtime_state_age_sec": heartbeat_age_sec,
+                "runtime_state_timeout_sec": heartbeat_timeout_sec,
+                "runtime_state_heartbeat_at": (
+                    heartbeat_at.isoformat() if heartbeat_at else ""
+                ),
+                "runtime_state_deadline_at": (
+                    deadline_at.isoformat() if deadline_at else ""
+                ),
+                "stale_runtime_state": stale_running,
+            }
+        )
+        if stale_running:
+            row["stale_runtime_reason"] = stale_reason
+            row["stale_process"] = True
         return row
-    state_path = str(getattr(settings, "research_state_path", "") or "").strip()
+    if key == "research":
+        state_path = str(getattr(settings, "research_state_path", "") or "").strip()
+        timeout_sec = max(int(getattr(settings, "naver_reports_cycle_timeout_sec", 3600)), 1)
+        stale_statuses = ("_running",)
+        stale_reason = "stale_running_state"
+    elif key == "binance_block_trader":
+        state_path = str(
+            getattr(settings, "binance_block_trader_state_path", "") or ""
+        ).strip()
+        manager_timeout_sec = int(
+            max(
+                float(
+                    getattr(
+                        settings,
+                        "binance_block_trader_llm_timeout_ms",
+                        getattr(settings, "codex_runtime_timeout_ms", 0),
+                    )
+                    or 0
+                )
+                / 1000.0
+                + 30.0,
+                0.0,
+            )
+        )
+        timeout_sec = max(
+            int(getattr(settings, "binance_block_trader_manager_error_retry_sec", 300)),
+            manager_timeout_sec,
+            1,
+        )
+        stale_statuses = ("manager_error",)
+        stale_reason = "manager_error"
+    else:
+        return row
     if not state_path:
         return row
     snapshot = RuntimeStateStore(state_path).read_snapshot() or {}
     state_status = str(snapshot.get("status") or "").strip()
     updated_at = _parse_iso_datetime(snapshot.get("updated_at"))
-    timeout_sec = max(int(getattr(settings, "naver_reports_cycle_timeout_sec", 3600)), 1)
     age_sec = int((now - updated_at).total_seconds()) if updated_at else None
     stale_running = bool(
-        state_status.endswith("_running")
+        any(
+            state_status == token or state_status.endswith(token)
+            for token in stale_statuses
+        )
         and (age_sec is None or age_sec >= timeout_sec)
     )
+    manager_result = (
+        snapshot.get("manager_result")
+        if isinstance(snapshot.get("manager_result"), dict)
+        else {}
+    )
+    manager_started_at = _parse_iso_datetime(manager_result.get("started_at"))
+    manager_age_sec = (
+        int((now - manager_started_at).total_seconds())
+        if manager_started_at is not None
+        else None
+    )
+    last_manager = (
+        snapshot.get("last_manager_result")
+        if isinstance(snapshot.get("last_manager_result"), dict)
+        else {}
+    )
+    if key == "binance_block_trader":
+        current_manager_status = str(manager_result.get("status") or "").strip().lower()
+        last_manager_status = str(last_manager.get("status") or "").strip().lower()
+        manager_due_reason = str(snapshot.get("manager_due_reason") or "").strip()
+        retry_stalled = bool(
+            manager_due_reason == "retry_after_manager_error"
+            and current_manager_status == "running"
+            and last_manager_status == "error"
+            and manager_age_sec is not None
+            and manager_age_sec >= timeout_sec
+        )
+        if retry_stalled:
+            stale_running = True
+            stale_reason = "manager_error_retry_stalled"
+        if not stale_running and last_manager_status == "error":
+            try:
+                manager_run_id = int(
+                    last_manager.get("manager_run_id")
+                    or last_manager.get("run_id")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                manager_run_id = 0
+            manager_run = _binance_manager_run_row(settings, run_id=manager_run_id)
+            manager_run_status = str(manager_run.get("status") or "").strip().lower()
+            manager_run_at = _parse_iso_datetime(manager_run.get("run_at"))
+            manager_run_age_sec = (
+                int((now - manager_run_at).total_seconds())
+                if manager_run_at is not None
+                else None
+            )
+            if manager_run.get("id") is not None:
+                row["runtime_state_manager_run_id"] = int(manager_run["id"])
+            if manager_run_age_sec is not None:
+                row["runtime_state_manager_age_sec"] = manager_run_age_sec
+            manager_run_error = str(manager_run.get("error_message") or "").strip()
+            if manager_run_error:
+                row["runtime_state_error_message"] = manager_run_error[:240]
+            if (
+                manager_run_status == "error"
+                and manager_run_age_sec is not None
+                and manager_run_age_sec >= timeout_sec
+            ):
+                stale_running = True
+                stale_reason = "manager_error_db_stale"
     row["runtime_state_status"] = state_status
     row["runtime_state_updated_at"] = updated_at.isoformat() if updated_at else ""
     row["runtime_state_age_sec"] = age_sec
     row["runtime_state_timeout_sec"] = timeout_sec
+    if manager_age_sec is not None:
+        row["runtime_state_manager_age_sec"] = manager_age_sec
+    if stale_running:
+        row["stale_runtime_reason"] = stale_reason
+    if isinstance(last_manager, dict):
+        error = str(last_manager.get("error_message") or "").strip()
+        if error:
+            row["runtime_state_error_message"] = error[:240]
     row["stale_runtime_state"] = stale_running
     if stale_running:
         row["stale_process"] = True
@@ -164,7 +410,8 @@ def _runner_status_row(
             "pid_file_status": "unknown",
             "error_message": str(exc) or exc.__class__.__name__,
         }
-    return _annotate_runtime_state_health(key, row, settings, now=now)
+    row = _annotate_runtime_state_health(key, row, settings, now=now)
+    return _annotate_source_code_staleness(key, row)
 
 
 class WatchdogEventRepository:
@@ -309,8 +556,9 @@ def run_watchdog_once(
     restart_keys: list[str] = []
     cooldown_keys: list[str] = []
     flapping_keys: list[str] = []
+    deferred_restart_keys = restart_candidates[1:]
 
-    for key in restart_candidates:
+    for key in restart_candidates[:1]:
         latest = repository.latest_restart_at(runner_key=key)
         if latest is not None and checked_at - latest < timedelta(seconds=cooldown_sec):
             cooldown_keys.append(key)
@@ -384,6 +632,7 @@ def run_watchdog_once(
         "runner_keys": runner_keys,
         "restart_candidates": restart_candidates,
         "restart_keys": restart_keys,
+        "deferred_restart_keys": deferred_restart_keys,
         "cooldown_keys": cooldown_keys,
         "flapping_keys": flapping_keys,
         "restart_result": restart_result,
@@ -407,18 +656,39 @@ def _watchdog_snapshot_age_sec(
     return max((now - checked_at).total_seconds(), 0.0)
 
 
-def watchdog_status(settings: Any, *, now: datetime | None = None) -> dict[str, Any]:
+def watchdog_status(
+    settings: Any,
+    *,
+    now: datetime | None = None,
+    status_provider: StatusProvider = runner_process_status,
+) -> dict[str, Any]:
     snapshot = RuntimeStateStore(settings.watchdog_state_path).read_snapshot() or {}
     events = WatchdogEventRepository(settings.watchdog_db_path).status(limit=10)
     checked_at = _parse_iso_datetime(
         snapshot.get("checked_at") or snapshot.get("updated_at")
     )
+    checked_now = now or _utc_now()
     interval_sec = max(int(getattr(settings, "watchdog_interval_sec", 1800)), 0)
-    age_sec = _watchdog_snapshot_age_sec(snapshot, now=now or _utc_now())
+    age_sec = _watchdog_snapshot_age_sec(snapshot, now=checked_now)
     stale_after_sec = interval_sec * 1.5 if interval_sec else 0
     latest_stale = age_sec is None or (
         stale_after_sec > 0 and age_sec > stale_after_sec
     )
+    runner_keys = _effective_runner_keys(settings)
+    current_processes = {
+        key: _runner_status_row(
+            key,
+            settings,
+            status_provider=status_provider,
+            now=checked_now,
+        )
+        for key in runner_keys
+    }
+    current_restart_candidates = [
+        key
+        for key, row in current_processes.items()
+        if _needs_restart(dict(row or {}))
+    ]
     return {
         "status": snapshot.get("status") or "missing",
         "enabled": bool(getattr(settings, "watchdog_enabled", True)),
@@ -430,6 +700,9 @@ def watchdog_status(settings: Any, *, now: datetime | None = None) -> dict[str, 
         "latest_age_sec": age_sec,
         "latest_stale": latest_stale,
         "current_status_endpoint": "/api/ops/readiness",
+        "current_runner_keys": runner_keys,
+        "current_restart_candidates": current_restart_candidates,
+        "current_processes": current_processes,
         "latest": snapshot,
         "events": events,
     }

@@ -387,6 +387,7 @@ def test_runtime_storage_legacy_cleanup_get_is_dry_run_only() -> None:
 
 def test_runtime_storage_cleanup_attaches_after_report() -> None:
     cleanup_calls: list[tuple[Any, bool, bool]] = []
+    verification_calls = 0
 
     def _policy() -> dict[str, Any]:
         return {"runtime_dir": ".runtime"}
@@ -401,7 +402,20 @@ def test_runtime_storage_cleanup_attaches_after_report() -> None:
         compact_databases: bool = False,
     ) -> dict[str, Any]:
         cleanup_calls.append((policy, dry_run, compact_databases))
-        return {"status": "ok", "deleted": ["old.pdf"]}
+        return {
+            "status": "ok",
+            "deleted": ["old.pdf"],
+            "archived": [{"entry_id": "archive-1", "verified": True}],
+        }
+
+    def _refresh_cold_archive_status() -> dict[str, Any]:
+        nonlocal verification_calls
+        verification_calls += 1
+        return {
+            "status": "ok",
+            "entry_count": 1,
+            "verification_snapshot": {"status": "current"},
+        }
 
     app = FastAPI()
     app.include_router(
@@ -411,6 +425,7 @@ def test_runtime_storage_cleanup_attaches_after_report() -> None:
                 runtime_storage_policy=_policy,
                 build_runtime_storage_report=_report,
                 cleanup_runtime_storage=_cleanup,
+                refresh_cold_archive_status=_refresh_cold_archive_status,
             )
         )
     )
@@ -422,9 +437,16 @@ def test_runtime_storage_cleanup_attaches_after_report() -> None:
     assert response.json() == {
         "status": "ok",
         "deleted": ["old.pdf"],
+        "archived": [{"entry_id": "archive-1", "verified": True}],
+        "cold_archive_verification": {
+            "status": "ok",
+            "entry_count": 1,
+            "verification_snapshot": {"status": "current"},
+        },
         "after": {"status": "ok", "runtime_dir": ".runtime"},
     }
     assert cleanup_calls == [({"runtime_dir": ".runtime"}, False, False)]
+    assert verification_calls == 1
 
 
 def test_runtime_storage_cleanup_dry_run_refreshes_after_report() -> None:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import logging
+import os
+import subprocess
+import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from tradecraft.config import AppSettings
@@ -12,17 +15,13 @@ from tradecraft.runtime.process_status import (
     write_current_runner_pid,
 )
 from tradecraft.runtime.state_store import RuntimeStateStore
-from tradecraft.services.intelligence import (
-    build_report_intelligence_stack,
-    is_symbol_directory_stale,
-    run_report_collection_cycle,
-    run_report_collection_cycle_with_timeout,
-)
+from tradecraft.services.intelligence import is_symbol_directory_stale
 
 logger = logging.getLogger(__name__)
 _is_symbol_directory_stale = is_symbol_directory_stale
 CollectOnceFn = Callable[[], dict[str, Any]]
 SleepFn = Callable[[float], None]
+MonotonicFn = Callable[[], float]
 
 
 def _setting(settings: Any, name: str, default: Any) -> Any:
@@ -53,6 +52,36 @@ def _next_run_at(started_at: str, interval: int) -> str:
     return datetime.fromtimestamp(started_ts + interval, tz=timezone.utc).isoformat()
 
 
+def _worker_state_paths(
+    state_path: Path,
+    *,
+    parent_pid: int | None = None,
+) -> tuple[Path, Path]:
+    resolved_parent_pid = int(parent_pid if parent_pid is not None else os.getpid())
+    worker_stem = f"{state_path.stem}.worker-{resolved_parent_pid}"
+    return (
+        state_path.with_name(f"{worker_stem}-result.json"),
+        state_path.with_name(f"{worker_stem}-progress.json"),
+    )
+
+
+def _latest_successful_worker_started_at(state_path: Path) -> str:
+    latest_text = ""
+    latest_timestamp = 0.0
+    pattern = f"{state_path.stem}.worker*-result.json"
+    for result_path in state_path.parent.glob(pattern):
+        payload = RuntimeStateStore(result_path).read_snapshot() or {}
+        if str(payload.get("status") or "").lower() != "ok":
+            continue
+        started_at = str(payload.get("started_at") or "").strip()
+        started_timestamp = _timestamp_from_iso(started_at)
+        if started_timestamp <= latest_timestamp:
+            continue
+        latest_text = started_at
+        latest_timestamp = started_timestamp
+    return latest_text
+
+
 def _rag_sync_error_detail(rag_result: dict[str, Any]) -> str:
     for key in ("error_message", "error", "reason", "detail"):
         detail = str(rag_result.get(key) or "").strip()
@@ -61,21 +90,143 @@ def _rag_sync_error_detail(rag_result: dict[str, Any]) -> str:
     return ""
 
 
+def wait_for_exit(
+    process: Any,
+    *,
+    grace_sec: float,
+    monotonic: MonotonicFn = time.monotonic,
+    sleep: SleepFn = time.sleep,
+) -> bool:
+    grace = max(float(grace_sec), 0.0)
+    if process.poll() is not None:
+        return True
+    if grace <= 0:
+        return False
+    deadline = monotonic() + grace
+    while monotonic() < deadline:
+        sleep(min(0.1, max(deadline - monotonic(), 0.0)))
+        if process.poll() is not None:
+            return True
+    return process.poll() is not None
+
+
+def supervise_report_worker(
+    *,
+    process: Any,
+    result_store: RuntimeStateStore,
+    progress_store: RuntimeStateStore,
+    parent_state: RuntimeStateStore,
+    timeout_sec: float,
+    heartbeat_interval_sec: float,
+    terminate_grace_sec: float = 0.0,
+    monotonic: MonotonicFn = time.monotonic,
+    sleep: SleepFn = time.sleep,
+) -> dict[str, Any]:
+    started_at = _utc_now_iso()
+    timeout = max(float(timeout_sec), 0.1)
+    deadline = monotonic() + timeout
+    deadline_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=timeout)
+    ).isoformat()
+    heartbeat_interval = max(float(heartbeat_interval_sec), 0.1)
+    parent_context = dict(parent_state.read_snapshot() or {})
+
+    while process.poll() is None:
+        progress = progress_store.read_snapshot() or {}
+        parent_state.write_snapshot(
+            {
+                **parent_context,
+                "service": "tradecraft-naver-reports",
+                "status": "collecting",
+                "stage": str(progress.get("stage") or "starting"),
+                "stage_started_at": str(
+                    progress.get("stage_started_at") or started_at
+                ),
+                "heartbeat_at": _utc_now_iso(),
+                "deadline_at": deadline_at,
+                "worker_pid": int(process.pid),
+            }
+        )
+        if monotonic() >= deadline:
+            process.terminate()
+            if not wait_for_exit(
+                process,
+                grace_sec=terminate_grace_sec,
+                monotonic=monotonic,
+                sleep=sleep,
+            ):
+                process.kill()
+            return {
+                "status": "timeout",
+                "timeout_sec": timeout,
+                "started_at": started_at,
+                "finished_at": _utc_now_iso(),
+                "worker_pid": int(process.pid),
+                "stage": str(progress.get("stage") or "starting"),
+            }
+        sleep(heartbeat_interval)
+
+    result = result_store.read_snapshot() or {}
+    if str(result.get("status") or "") in {"", "pending"}:
+        return {
+            "status": "error",
+            "error_message": "naver reports worker exited without a result",
+            "worker_exit_code": process.poll(),
+            "worker_pid": int(process.pid),
+        }
+    return dict(result)
+
+
 def _build_default_collect_once(settings: AppSettings) -> CollectOnceFn:
-    stack = build_report_intelligence_stack(settings)
+    state_path = Path(
+        str(
+            _setting(
+                settings,
+                "naver_reports_state_path",
+                ".runtime/naver_reports_runner.json",
+            )
+        )
+    )
+    result_path, progress_path = _worker_state_paths(state_path)
+    result_store = RuntimeStateStore(result_path)
+    progress_store = RuntimeStateStore(progress_path)
+    parent_state = RuntimeStateStore(state_path)
 
     def collect_once() -> dict[str, Any]:
-        return asyncio.run(
-            run_report_collection_cycle_with_timeout(
-                run_report_collection_cycle(
-                    crawler=stack.crawler,
-                    repository=stack.repository,
-                    rag_store=stack.rag_store,
-                    rag_enabled=settings.rag_enabled,
-                    rag_sync_chunk_limit=settings.rag_sync_chunk_limit,
-                ),
-                timeout_sec=max(int(settings.naver_reports_cycle_timeout_sec), 0),
-            )
+        result_store.write_snapshot({"status": "pending"})
+        progress_store.write_snapshot(
+            {
+                "status": "pending",
+                "stage": "starting",
+                "stage_started_at": _utc_now_iso(),
+            }
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tradecraft.runtime.naver_reports_worker",
+                "--result-path",
+                str(result_path),
+                "--progress-path",
+                str(progress_path),
+            ],
+            start_new_session=True,
+        )
+        return supervise_report_worker(
+            process=process,
+            result_store=result_store,
+            progress_store=progress_store,
+            parent_state=parent_state,
+            timeout_sec=max(int(settings.naver_reports_cycle_timeout_sec), 1),
+            heartbeat_interval_sec=max(
+                float(settings.naver_reports_heartbeat_interval_sec),
+                0.1,
+            ),
+            terminate_grace_sec=max(
+                float(settings.naver_reports_worker_terminate_grace_sec),
+                0.0,
+            ),
         )
 
     logger.info(
@@ -123,6 +274,18 @@ def run_naver_reports_loop(
     last_collection_started_at = str(
         previous_snapshot.get("last_collection_started_at") or ""
     )
+    if not last_collection_started_at:
+        last_collection_started_at = _latest_successful_worker_started_at(
+            Path(
+                str(
+                    _setting(
+                        settings,
+                        "naver_reports_state_path",
+                        ".runtime/naver_reports_runner.json",
+                    )
+                )
+            )
+        )
 
     while True:
         cycle += 1

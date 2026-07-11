@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import gzip
+import json
+import re
 import sqlite3
 import shutil
 from dataclasses import dataclass
@@ -8,30 +10,44 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from tradecraft.runtime.runner_manifest import RUNNER_SPECS
+from tradecraft.services.runtime_cold_archive import (
+    ArchiveCandidateV1,
+    RuntimeColdArchiveV1,
+)
+
 ArchiveRetentionPolicy = int | dict[str, int]
 ARCHIVE_RETENTION_DIAGNOSTIC_GRACE_DAYS = 1.0
+RUNTIME_STORAGE_WARN_BYTES = 4 * 1024 * 1024 * 1024
+RUNTIME_STORAGE_RISK_BYTES = 6 * 1024 * 1024 * 1024
 
 
 @dataclass(slots=True)
 class RuntimeStoragePolicy:
     runtime_dir: str = ".runtime"
+    cold_archive_root: str | None = None
     reports_db_path: str = ".runtime/naver_reports.db"
     pdf_archive_dir: str = ".runtime/naver_reports/pdfs"
     rag_persist_path: str = ".runtime/rag_chroma"
     large_file_threshold_mb: int = 10
     prune_unreferenced_pdfs: bool = True
     prune_extracted_report_pdfs: bool = False
+    archive_extracted_report_pdfs: bool = True
     extracted_report_pdf_retention_days: int = 14
     prune_rag_repair_artifacts: bool = True
     rag_repair_artifact_retention_days: int = 7
     prune_rag_rebuild_backups: bool = True
     rag_rebuild_backup_retention_days: int = 7
+    archive_rag_rebuild_backups: bool = True
     prune_old_runtime_logs: bool = True
     runtime_log_retention_days: int = 7
+    prune_duplicate_runtime_logs: bool = True
+    duplicate_runtime_log_retention_days: int = 7
     rotate_large_active_logs: bool = True
     active_log_max_mb: int = 16
     active_log_tail_kb: int = 2048
     prune_repair_backup_artifacts: bool = True
+    archive_repair_backup_artifacts: bool = True
     repair_backup_artifact_retention_days: int = 7
     prune_scratch_artifacts: bool = True
     scratch_artifact_retention_days: int = 7
@@ -39,6 +55,12 @@ class RuntimeStoragePolicy:
     backtest_artifact_retention_days: int = 30
     prune_old_ui_check_artifacts: bool = True
     ui_check_artifact_retention_days: int = 30
+    prune_old_dryrun_artifacts: bool = True
+    dryrun_artifact_retention_days: int = 14
+    dryrun_recent_per_scenario: int = 3
+    dryrun_hot_hours: int = 24
+    archive_dryrun_artifacts: bool = True
+    dryrun_protected_manifest_name: str = "protected_manifest.json"
     prune_zero_byte_runtime_markers: bool = True
     zero_byte_marker_retention_days: int = 7
     prune_retired_state_artifacts: bool = True
@@ -71,6 +93,15 @@ class RuntimeStoragePolicy:
     )
     now_iso: str = ""
 
+    def __post_init__(self) -> None:
+        if self.cold_archive_root:
+            return
+        runtime_dir = Path(self.runtime_dir)
+        runtime_name = runtime_dir.name or ".runtime"
+        self.cold_archive_root = str(
+            runtime_dir.parent / f"{runtime_name}-cold-archive"
+        )
+
 
 def _file_size(path: Path) -> int:
     try:
@@ -94,6 +125,20 @@ def _human_bytes(bytes_value: Any) -> str:
         if value < 1024.0 or unit == units[-1]:
             return f"{round(value, 1)} {unit}"
     return f"{size} B"
+
+
+def _runtime_storage_pressure(total_bytes: int) -> dict[str, Any]:
+    status = "ok"
+    if total_bytes >= RUNTIME_STORAGE_RISK_BYTES:
+        status = "risk"
+    elif total_bytes >= RUNTIME_STORAGE_WARN_BYTES:
+        status = "warning"
+    return {
+        "status": status,
+        "total_bytes": int(total_bytes),
+        "warn_bytes": RUNTIME_STORAGE_WARN_BYTES,
+        "risk_bytes": RUNTIME_STORAGE_RISK_BYTES,
+    }
 
 
 def _with_size_mb(row: dict[str, Any], *, byte_key: str = "bytes") -> dict[str, Any]:
@@ -390,11 +435,77 @@ def _rag_rebuild_backups(
     return sorted(out)
 
 
+def _canonical_runner_log_paths(policy: RuntimeStoragePolicy) -> set[Path]:
+    runtime_dir = Path(policy.runtime_dir)
+    paths: set[Path] = set()
+    for spec in RUNNER_SPECS.values():
+        configured = Path(spec.log_path)
+        parts = configured.parts
+        if ".runtime" in parts:
+            relative = Path(*parts[parts.index(".runtime") + 1 :])
+        else:
+            relative = Path(configured.name)
+        paths.add(runtime_dir / relative)
+    return paths
+
+
+def _normalized_log_name(value: Any) -> str:
+    return "".join(character for character in str(value or "").lower() if character.isalnum())
+
+
+def _runner_log_aliases() -> set[str]:
+    aliases: set[str] = set()
+    for spec in RUNNER_SPECS.values():
+        command_name = Path(str(spec.command).split()[0]).name
+        for value in (spec.key, command_name, Path(spec.log_path).stem):
+            normalized = _normalized_log_name(value)
+            if normalized:
+                aliases.add(normalized)
+    return aliases
+
+
+def _duplicate_runtime_logs(policy: RuntimeStoragePolicy) -> list[Path]:
+    runtime_dir = Path(policy.runtime_dir)
+    if not runtime_dir.exists():
+        return []
+    canonical = _canonical_runner_log_paths(policy)
+    aliases = _runner_log_aliases()
+    cutoff = _path_age_cutoff(
+        policy,
+        int(policy.duplicate_runtime_log_retention_days),
+    )
+    out: list[Path] = []
+    for item in runtime_dir.rglob("*.log"):
+        if not item.is_file() or item in canonical:
+            continue
+        if item.name in set(policy.retired_log_artifact_names):
+            continue
+        if not _is_relative_to(item, runtime_dir) or not _is_path_older_than(item, cutoff):
+            continue
+        relative = item.relative_to(runtime_dir)
+        duplicate_directory = (
+            len(relative.parts) == 2
+            and relative.parts[0] == "process_logs"
+        )
+        normalized = _normalized_log_name(item.stem)
+        runner_named = any(
+            normalized == alias
+            or normalized == f"tradecraft{alias}"
+            or normalized == f"{alias}runner"
+            for alias in aliases
+        )
+        if duplicate_directory or runner_named:
+            out.append(item)
+    return sorted(out)
+
+
 def _old_runtime_logs(policy: RuntimeStoragePolicy) -> list[Path]:
     runtime_dir = Path(policy.runtime_dir)
     if not runtime_dir.exists():
         return []
     cutoff = _path_age_cutoff(policy, int(policy.runtime_log_retention_days))
+    canonical = _canonical_runner_log_paths(policy)
+    duplicates = set(_duplicate_runtime_logs(policy))
     out: list[Path] = []
     for item in runtime_dir.rglob("*"):
         if not item.is_file():
@@ -403,6 +514,8 @@ def _old_runtime_logs(policy: RuntimeStoragePolicy) -> list[Path]:
         if not (name.endswith(".log") or ".log." in name):
             continue
         if not _is_relative_to(item, runtime_dir):
+            continue
+        if item in canonical or item in duplicates:
             continue
         if not _is_path_older_than(item, cutoff):
             continue
@@ -428,6 +541,135 @@ def _large_active_runtime_logs(policy: RuntimeStoragePolicy) -> list[Path]:
             continue
         out.append(item)
     return sorted(out)
+
+
+def _dryrun_root(policy: RuntimeStoragePolicy) -> Path:
+    return Path(policy.runtime_dir) / "dryrun"
+
+
+def _protected_dryrun_artifacts(policy: RuntimeStoragePolicy) -> set[Path]:
+    root = _dryrun_root(policy)
+    manifest = root / str(policy.dryrun_protected_manifest_name)
+    protected: set[Path] = {manifest}
+    if not manifest.exists():
+        return protected
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return protected
+    for value in payload.get("protected_paths", []) if isinstance(payload, dict) else []:
+        candidate = root / str(value or "")
+        if str(value or "").strip() and _is_relative_to(candidate, root):
+            protected.add(candidate)
+    return protected
+
+
+def _dryrun_artifact_is_protected(path: Path, protected: set[Path]) -> bool:
+    for item in protected:
+        if path == item:
+            return True
+        if path.parent == item.parent and path.name.startswith(f"{item.name}-"):
+            return True
+    return False
+
+
+def _dryrun_scenario_key(path: Path, root: Path) -> str:
+    relative = path.relative_to(root)
+    if len(relative.parts) > 1:
+        return relative.parts[0]
+    name = relative.name
+    for suffix in ("-wal", "-shm", ".json", ".db", ".jsonl"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    for prefix in (
+        "binance_block_trader_",
+        "binance_blocks_",
+        "kis_block_trader_",
+        "kis_blocks_",
+    ):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+            break
+    name = re.sub(r"(?i)^(rehearsal)\d+$", r"\1", name)
+    return name or "default"
+
+
+def _dryrun_run_key(path: Path, root: Path) -> str:
+    relative = path.relative_to(root)
+    name = relative.name
+    for suffix in ("-wal", "-shm", ".json", ".db", ".jsonl"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    for prefix in (
+        "binance_block_trader_",
+        "binance_blocks_",
+        "kis_block_trader_",
+        "kis_blocks_",
+    ):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+            break
+    parent = relative.parent.as_posix()
+    return f"{parent}:{name or 'default'}"
+
+
+@dataclass(frozen=True)
+class _DryrunArchiveBundle:
+    scenario: str
+    run_key: str
+    paths: tuple[Path, ...]
+    sidecars: tuple[Path, ...]
+    modified_at: float
+
+
+def _old_dryrun_bundles(policy: RuntimeStoragePolicy) -> list[_DryrunArchiveBundle]:
+    root = _dryrun_root(policy)
+    if not root.exists():
+        return []
+    protected = _protected_dryrun_artifacts(policy)
+    grouped: dict[str, list[Path]] = {}
+    sidecars: dict[str, list[Path]] = {}
+    for item in root.rglob("*"):
+        if not item.is_file() or _dryrun_artifact_is_protected(item, protected):
+            continue
+        if item.name == policy.dryrun_protected_manifest_name:
+            continue
+        key = _dryrun_run_key(item, root)
+        target = sidecars if item.name.endswith(("-wal", "-shm")) else grouped
+        target.setdefault(key, []).append(item)
+
+    by_scenario: dict[str, list[_DryrunArchiveBundle]] = {}
+    for run_key, paths in grouped.items():
+        if not paths:
+            continue
+        scenario = _dryrun_scenario_key(paths[0], root)
+        bundle = _DryrunArchiveBundle(
+            scenario=scenario,
+            run_key=run_key,
+            paths=tuple(sorted(paths)),
+            sidecars=tuple(sorted(sidecars.get(run_key, []))),
+            modified_at=max(path.stat().st_mtime for path in paths),
+        )
+        by_scenario.setdefault(scenario, []).append(bundle)
+
+    cutoff = _policy_now(policy) - timedelta(hours=max(int(policy.dryrun_hot_hours), 0))
+    keep_count = max(int(policy.dryrun_recent_per_scenario), 0)
+    selected: list[_DryrunArchiveBundle] = []
+    for bundles in by_scenario.values():
+        bundles.sort(key=lambda row: row.modified_at, reverse=True)
+        for index, bundle in enumerate(bundles):
+            modified_at = datetime.fromtimestamp(bundle.modified_at, tz=timezone.utc)
+            if modified_at < cutoff or index >= keep_count:
+                selected.append(bundle)
+    return sorted(selected, key=lambda row: (row.scenario, row.modified_at, row.run_key))
+
+
+def _old_dryrun_artifacts(policy: RuntimeStoragePolicy) -> list[Path]:
+    return sorted(
+        path
+        for bundle in _old_dryrun_bundles(policy)
+        for path in bundle.paths
+    )
 
 
 def _is_repair_backup_artifact(path: Path) -> bool:
@@ -1568,6 +1810,12 @@ def build_runtime_storage_report(policy: RuntimeStoragePolicy) -> dict[str, Any]
     retained_rag_rebuild_backup_bytes = sum(
         _path_cleanup_size(path) for path in retained_rag_rebuild_backups
     )
+    duplicate_logs = (
+        _duplicate_runtime_logs(policy)
+        if bool(policy.prune_duplicate_runtime_logs)
+        else []
+    )
+    duplicate_log_bytes = sum(_file_size(path) for path in duplicate_logs)
     old_logs = _old_runtime_logs(policy)
     old_log_bytes = sum(_file_size(path) for path in old_logs)
     large_active_logs = (
@@ -1598,6 +1846,22 @@ def build_runtime_storage_report(policy: RuntimeStoragePolicy) -> dict[str, Any]
         else []
     )
     old_ui_check_bytes = sum(_file_size(path) for path in old_ui_checks)
+    old_dryrun_artifacts = (
+        _old_dryrun_artifacts(policy)
+        if bool(policy.prune_old_dryrun_artifacts)
+        else []
+    )
+    old_dryrun_artifact_bytes = sum(
+        _file_size(path) for path in old_dryrun_artifacts
+    )
+    protected_dryrun_artifacts = sorted(
+        path
+        for path in _protected_dryrun_artifacts(policy)
+        if path.exists() and path.name != policy.dryrun_protected_manifest_name
+    )
+    protected_dryrun_artifact_bytes = sum(
+        _file_size(path) for path in protected_dryrun_artifacts
+    )
     zero_byte_markers = (
         _zero_byte_runtime_markers(policy)
         if bool(policy.prune_zero_byte_runtime_markers)
@@ -1660,6 +1924,11 @@ def build_runtime_storage_report(policy: RuntimeStoragePolicy) -> dict[str, Any]
             "bytes": old_log_bytes,
             "sample": [str(path) for path in old_logs[:12]],
         },
+        "duplicate_runtime_logs": {
+            "count": len(duplicate_logs),
+            "bytes": duplicate_log_bytes,
+            "sample": [str(path) for path in duplicate_logs[:12]],
+        },
         "large_active_runtime_logs": {
             "count": len(large_active_logs),
             "bytes": large_active_log_bytes,
@@ -1684,6 +1953,11 @@ def build_runtime_storage_report(policy: RuntimeStoragePolicy) -> dict[str, Any]
             "count": len(old_ui_checks),
             "bytes": old_ui_check_bytes,
             "sample": [str(path) for path in old_ui_checks[:12]],
+        },
+        "old_dryrun_artifacts": {
+            "count": len(old_dryrun_artifacts),
+            "bytes": old_dryrun_artifact_bytes,
+            "sample": [str(path) for path in old_dryrun_artifacts[:12]],
         },
         "zero_byte_runtime_markers": {
             "count": len(zero_byte_markers),
@@ -1739,9 +2013,13 @@ def build_runtime_storage_report(policy: RuntimeStoragePolicy) -> dict[str, Any]
     return {
         "status": "ok",
         "runtime_dir": str(runtime_dir),
+        "canonical_runner_log_paths": sorted(
+            str(path) for path in _canonical_runner_log_paths(policy)
+        ),
         "total_bytes": total_bytes,
         "total_size_mb": round(total_bytes / (1024 * 1024), 2),
         "total_human": _human_bytes(total_bytes),
+        "storage_pressure": _runtime_storage_pressure(total_bytes),
         "top_level": [_with_size_mb(row) for row in tree_snapshot["top_level"][:40]],
         "top_level_count": len(tree_snapshot["top_level"]),
         "large_files": [_with_size_mb(row) for row in large_files],
@@ -1791,6 +2069,12 @@ def build_runtime_storage_report(policy: RuntimeStoragePolicy) -> dict[str, Any]
             ),
             "prune_old_runtime_logs": bool(policy.prune_old_runtime_logs),
             "runtime_log_retention_days": int(policy.runtime_log_retention_days),
+            "prune_duplicate_runtime_logs": bool(
+                policy.prune_duplicate_runtime_logs
+            ),
+            "duplicate_runtime_log_retention_days": int(
+                policy.duplicate_runtime_log_retention_days
+            ),
             "rotate_large_active_logs": bool(policy.rotate_large_active_logs),
             "active_log_max_mb": int(policy.active_log_max_mb),
             "active_log_tail_kb": int(policy.active_log_tail_kb),
@@ -1809,6 +2093,16 @@ def build_runtime_storage_report(policy: RuntimeStoragePolicy) -> dict[str, Any]
             ),
             "ui_check_artifact_retention_days": int(
                 policy.ui_check_artifact_retention_days
+            ),
+            "prune_old_dryrun_artifacts": bool(
+                policy.prune_old_dryrun_artifacts
+            ),
+            "dryrun_artifact_retention_days": int(
+                policy.dryrun_artifact_retention_days
+            ),
+            "dryrun_recent_per_scenario": int(policy.dryrun_recent_per_scenario),
+            "dryrun_protected_manifest_name": str(
+                policy.dryrun_protected_manifest_name
             ),
             "prune_zero_byte_runtime_markers": bool(
                 policy.prune_zero_byte_runtime_markers
@@ -1849,6 +2143,11 @@ def build_runtime_storage_report(policy: RuntimeStoragePolicy) -> dict[str, Any]
             ),
         },
         "retained_artifacts": {
+            "protected_dryrun_artifacts": {
+                "count": len(protected_dryrun_artifacts),
+                "bytes": protected_dryrun_artifact_bytes,
+                "sample": [str(path) for path in protected_dryrun_artifacts[:12]],
+            },
             "repair_backup_artifacts": {
                 "count": len(retained_repair_backups),
                 "bytes": retained_repair_backup_bytes,
@@ -1894,6 +2193,17 @@ def _archive_and_tail_active_log(
     }
 
 
+def _validate_completed_dryrun_bundle(bundle: _DryrunArchiveBundle) -> None:
+    for path in bundle.paths:
+        if path.suffix != ".db":
+            continue
+        with sqlite3.connect(str(path), timeout=5.0) as conn:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or str(integrity[0]).lower() != "ok":
+                raise sqlite3.DatabaseError(f"dryrun integrity check failed: {path}")
+
+
 def cleanup_runtime_storage(
     policy: RuntimeStoragePolicy,
     *,
@@ -1902,14 +2212,48 @@ def cleanup_runtime_storage(
 ) -> dict[str, Any]:
     deleted: list[dict[str, Any]] = []
     rotated: list[dict[str, Any]] = []
+    archive_candidates: list[dict[str, Any]] = []
+    archived: list[dict[str, Any]] = []
+    archive_failures: list[dict[str, Any]] = []
+    dryrun_bundles = (
+        _old_dryrun_bundles(policy)
+        if bool(policy.prune_old_dryrun_artifacts)
+        and bool(policy.archive_dryrun_artifacts)
+        else []
+    )
+    rag_rebuild_archive_paths = (
+        _rag_rebuild_backups(policy, expired=True)
+        if bool(policy.prune_rag_rebuild_backups)
+        and bool(policy.archive_rag_rebuild_backups)
+        else []
+    )
+    extracted_pdf_archive_paths = (
+        _extracted_report_pdfs(policy)
+        if bool(policy.prune_extracted_report_pdfs)
+        and bool(policy.archive_extracted_report_pdfs)
+        else []
+    )
+    repair_backup_archive_paths = (
+        _repair_backup_artifacts(policy, expired=True)
+        if bool(policy.prune_repair_backup_artifacts)
+        and bool(policy.archive_repair_backup_artifacts)
+        else []
+    )
     candidates_by_category = {
+        "duplicate_runtime_logs": (
+            _duplicate_runtime_logs(policy)
+            if bool(policy.prune_duplicate_runtime_logs)
+            else []
+        ),
         "unreferenced_report_pdfs": (
             _unreferenced_report_pdfs(policy)
             if bool(policy.prune_unreferenced_pdfs)
             else []
         ),
         "extracted_report_pdfs": (
-            _extracted_report_pdfs(policy)
+            []
+            if extracted_pdf_archive_paths
+            else _extracted_report_pdfs(policy)
             if bool(policy.prune_extracted_report_pdfs)
             else []
         ),
@@ -1919,7 +2263,9 @@ def cleanup_runtime_storage(
             else []
         ),
         "rag_rebuild_backups": (
-            _rag_rebuild_backups(policy, expired=True)
+            []
+            if rag_rebuild_archive_paths
+            else _rag_rebuild_backups(policy, expired=True)
             if bool(policy.prune_rag_rebuild_backups)
             else []
         ),
@@ -1929,7 +2275,9 @@ def cleanup_runtime_storage(
             else []
         ),
         "repair_backup_artifacts": (
-            _repair_backup_artifacts(policy, expired=True)
+            []
+            if repair_backup_archive_paths
+            else _repair_backup_artifacts(policy, expired=True)
             if bool(policy.prune_repair_backup_artifacts)
             else []
         ),
@@ -1946,6 +2294,13 @@ def cleanup_runtime_storage(
         "old_ui_check_artifacts": (
             _old_ui_check_artifacts(policy)
             if bool(policy.prune_old_ui_check_artifacts)
+            else []
+        ),
+        "old_dryrun_artifacts": (
+            []
+            if dryrun_bundles
+            else _old_dryrun_artifacts(policy)
+            if bool(policy.prune_old_dryrun_artifacts)
             else []
         ),
         "zero_byte_runtime_markers": (
@@ -1991,6 +2346,259 @@ def cleanup_runtime_storage(
     }
     seen: set[Path] = set()
     rotate_seen: set[Path] = set()
+
+    cold_archive = RuntimeColdArchiveV1(policy.cold_archive_root)
+    lossless_file_groups = (
+        (
+            "extracted_report_pdfs",
+            "extracted-report-pdfs",
+            tuple(extracted_pdf_archive_paths),
+        ),
+        (
+            "repair_backup_artifacts",
+            "repair-backups",
+            tuple(repair_backup_archive_paths),
+        ),
+    )
+    for category, scenario, source_paths in lossless_file_groups:
+        if not source_paths:
+            continue
+        candidate_row = {
+            "category": category,
+            "scenario": scenario,
+            "paths": [str(path) for path in source_paths],
+            "bytes": sum(_file_size(path) for path in source_paths),
+        }
+        archive_candidates.append(candidate_row)
+        if dry_run:
+            for path in source_paths:
+                size = _file_size(path)
+                deleted.append(
+                    {"path": str(path), "bytes": size, "category": category}
+                )
+                deleted_by_category[category]["count"] += 1
+                deleted_by_category[category]["bytes"] += size
+            continue
+        try:
+            archive_result = cold_archive.archive(
+                ArchiveCandidateV1(
+                    category=category.replace("_", "-"),
+                    logical_scenario=scenario,
+                    source_paths=source_paths,
+                    restore_contract={
+                        "kind": "lossless-file-bundle-v1",
+                        "source_category": category,
+                    },
+                )
+            )
+            if not archive_result.verified:
+                archive_failures.append(
+                    {**candidate_row, "reason": archive_result.reason}
+                )
+                continue
+            removal = cold_archive.mark_hot_removed(
+                archive_result.entry_id,
+                source_paths,
+            )
+            if not removal.removed:
+                archive_failures.append({**candidate_row, "reason": removal.reason})
+                continue
+            archived.append(
+                {
+                    **candidate_row,
+                    "entry_id": archive_result.entry_id,
+                    "archive_path": str(archive_result.archive_path),
+                    "verified": True,
+                    "lifecycle": "hot_removed",
+                }
+            )
+            entry = cold_archive.entry(archive_result.entry_id)
+            size_by_path = {
+                source.original_path: source.hot_size_bytes
+                for source in entry.sources
+            }
+            for path in source_paths:
+                size = int(size_by_path.get(path.resolve(), 0))
+                deleted.append(
+                    {"path": str(path), "bytes": size, "category": category}
+                )
+                deleted_by_category[category]["count"] += 1
+                deleted_by_category[category]["bytes"] += size
+        except (OSError, ValueError) as exc:
+            archive_failures.append(
+                {**candidate_row, "reason": f"{type(exc).__name__}: {exc}"}
+            )
+
+    for backup_path in rag_rebuild_archive_paths:
+        source_paths = tuple(
+            sorted(path for path in backup_path.rglob("*") if path.is_file())
+        )
+        candidate_row = {
+            "category": "rag_rebuild_backups",
+            "scenario": backup_path.name,
+            "paths": [str(backup_path)],
+            "bytes": _path_cleanup_size(backup_path),
+        }
+        archive_candidates.append(candidate_row)
+        if dry_run:
+            deleted.append(
+                {
+                    "path": str(backup_path),
+                    "bytes": candidate_row["bytes"],
+                    "category": "rag_rebuild_backups",
+                }
+            )
+            deleted_by_category["rag_rebuild_backups"]["count"] += 1
+            deleted_by_category["rag_rebuild_backups"]["bytes"] += int(
+                candidate_row["bytes"]
+            )
+            continue
+        if not source_paths:
+            archive_failures.append({**candidate_row, "reason": "empty_backup"})
+            continue
+        try:
+            for source_path in source_paths:
+                if source_path.suffix not in {".db", ".sqlite", ".sqlite3"}:
+                    continue
+                with sqlite3.connect(str(source_path), timeout=5.0) as conn:
+                    integrity = conn.execute("PRAGMA integrity_check").fetchone()
+                    if not integrity or str(integrity[0]).lower() != "ok":
+                        raise sqlite3.DatabaseError(
+                            f"RAG backup integrity check failed: {source_path}"
+                        )
+            archive_result = cold_archive.archive(
+                ArchiveCandidateV1(
+                    category="rag-rebuild",
+                    logical_scenario=backup_path.name,
+                    source_paths=source_paths,
+                    restore_contract={
+                        "kind": "rag-rebuild-bundle-v1",
+                        "source_root": str(backup_path),
+                    },
+                )
+            )
+            if not archive_result.verified:
+                archive_failures.append(
+                    {**candidate_row, "reason": archive_result.reason}
+                )
+                continue
+            removal = cold_archive.mark_hot_removed(
+                archive_result.entry_id,
+                source_paths,
+            )
+            if not removal.removed:
+                archive_failures.append({**candidate_row, "reason": removal.reason})
+                continue
+            shutil.rmtree(backup_path)
+            archived.append(
+                {
+                    **candidate_row,
+                    "entry_id": archive_result.entry_id,
+                    "archive_path": str(archive_result.archive_path),
+                    "verified": True,
+                    "lifecycle": "hot_removed",
+                }
+            )
+            deleted.append(
+                {
+                    "path": str(backup_path),
+                    "bytes": candidate_row["bytes"],
+                    "category": "rag_rebuild_backups",
+                }
+            )
+            deleted_by_category["rag_rebuild_backups"]["count"] += 1
+            deleted_by_category["rag_rebuild_backups"]["bytes"] += int(
+                candidate_row["bytes"]
+            )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            archive_failures.append(
+                {**candidate_row, "reason": f"{type(exc).__name__}: {exc}"}
+            )
+
+    for bundle in dryrun_bundles:
+        candidate_row = {
+            "category": "old_dryrun_artifacts",
+            "scenario": bundle.scenario,
+            "run_key": bundle.run_key,
+            "paths": [str(path) for path in bundle.paths],
+            "bytes": sum(_file_size(path) for path in bundle.paths),
+        }
+        archive_candidates.append(candidate_row)
+        if dry_run:
+            for path in bundle.paths:
+                size = _file_size(path)
+                deleted.append(
+                    {
+                        "path": str(path),
+                        "bytes": size,
+                        "category": "old_dryrun_artifacts",
+                    }
+                )
+                deleted_by_category["old_dryrun_artifacts"]["count"] += 1
+                deleted_by_category["old_dryrun_artifacts"]["bytes"] += size
+            continue
+        try:
+            _validate_completed_dryrun_bundle(bundle)
+            archive_result = cold_archive.archive(
+                ArchiveCandidateV1(
+                    category="dryrun",
+                    logical_scenario=bundle.scenario,
+                    source_paths=bundle.paths,
+                    restore_contract={
+                        "kind": "dryrun-bundle-v1",
+                        "run_key": bundle.run_key,
+                        "sqlite_backup": True,
+                    },
+                )
+            )
+            if not archive_result.verified:
+                archive_failures.append(
+                    {**candidate_row, "reason": archive_result.reason}
+                )
+                continue
+            removal = cold_archive.mark_hot_removed(
+                archive_result.entry_id,
+                bundle.paths,
+            )
+            if not removal.removed:
+                archive_failures.append({**candidate_row, "reason": removal.reason})
+                continue
+            for sidecar in bundle.sidecars:
+                sidecar.unlink(missing_ok=True)
+            archived.append(
+                {
+                    **candidate_row,
+                    "entry_id": archive_result.entry_id,
+                    "archive_path": str(archive_result.archive_path),
+                    "verified": True,
+                    "lifecycle": "hot_removed",
+                }
+            )
+            for path in bundle.paths:
+                size = next(
+                    (
+                        int(source.size_bytes)
+                        for source in cold_archive.entry(
+                            archive_result.entry_id
+                        ).sources
+                        if source.original_path == path.resolve()
+                    ),
+                    0,
+                )
+                deleted.append(
+                    {
+                        "path": str(path),
+                        "bytes": size,
+                        "category": "old_dryrun_artifacts",
+                    }
+                )
+                deleted_by_category["old_dryrun_artifacts"]["count"] += 1
+                deleted_by_category["old_dryrun_artifacts"]["bytes"] += size
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            archive_failures.append(
+                {**candidate_row, "reason": f"{type(exc).__name__}: {exc}"}
+            )
+
     for category, candidates in rotate_candidates_by_category.items():
         for path in candidates:
             if path in rotate_seen:
@@ -2065,8 +2673,16 @@ def cleanup_runtime_storage(
     actual_rotated_bytes = 0 if dry_run else rotated_bytes
 
     return {
-        "status": "ok",
+        "status": "warning" if archive_failures else "ok",
         "dry_run": bool(dry_run),
+        "archive_candidates": archive_candidates,
+        "archived": archived,
+        "archive_failures": archive_failures,
+        "hot_removed": [
+            path
+            for row in archived
+            for path in row.get("paths", [])
+        ],
         "would_delete_count": would_delete_count,
         "would_delete_bytes": would_delete_bytes,
         "would_delete_size_mb": _size_mb(would_delete_bytes),

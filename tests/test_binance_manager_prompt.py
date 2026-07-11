@@ -27,6 +27,7 @@ from tradecraft.services.binance_manager_prompt import (
     compact_manager_prompt_context,
     compact_manager_response_payload,
     compact_manager_sections_for_final_budget,
+    compact_manager_sections_for_warn_budget,
     compact_manager_storage_payload,
     compact_prompt_section,
     compact_jue_wiki_for_prompt,
@@ -37,6 +38,7 @@ from tradecraft.services.binance_manager_prompt import (
     compact_live_authority_prompt_value,
     compact_prompt_candidate_minimal,
     compact_prompt_candidates_minimal,
+    enforce_prompt_budget,
     latency_recovery_core_prompt,
     manager_latency_guard_from_runs,
     manager_response_contract_error,
@@ -65,6 +67,151 @@ from tradecraft.services.binance_manager_prompt import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _wiki_gate_storage_contracts() -> dict[str, object]:
+    return {
+        "jue_wiki_decision_gate": {
+            "allow_new_risk": False,
+            "allow_exit_actions": True,
+            "reason": "wiki_required_coverage_missing",
+            "read_mode": "required",
+            "snapshot_id": "snapshot:binance:storage",
+            "version": "wiki_decision_gate_v1",
+            "untrusted_noise": "x" * 20_000,
+        },
+        "jue_wiki_decision_gate_policy": {"instruction": "preserve reduce-only exits"},
+        "jue_wiki_raw_rag_strip_audit": {
+            "read_mode": "required",
+            "snapshot_id": "snapshot:binance:storage",
+            "removed_path_count": 200,
+            "removed_paths": [f"raw_rag.items[{index}]" for index in range(200)],
+        },
+        "jue_wiki_suppression_audit": {
+            "venue": "binance",
+            "snapshot_id": "snapshot:binance:storage",
+            "read_mode": "required",
+            "reason": "wiki_required_coverage_missing",
+            "original_action_count": 200,
+            "filtered_action_count": 1,
+            "suppressed_new_risk_count": 199,
+            "suppressed_actions": [
+                {
+                    "venue": "binance",
+                    "action_kind": "create_blocks",
+                    "symbol": f"COIN{index}USDT",
+                    "block_id": "",
+                    "snapshot_id": "snapshot:binance:storage",
+                    "read_mode": "required",
+                    "reason": "wiki_required_coverage_missing",
+                }
+                for index in range(200)
+            ],
+        },
+    }
+
+
+def test_binance_storage_compaction_preserves_wiki_gate_contracts_at_every_label() -> None:
+    source = {
+        **_wiki_gate_storage_contracts(),
+        "decision_inputs": ["jue_wiki_decision_gate", "jue_wiki_raw_rag_strip_audit"],
+        "create_blocks": [
+            {"symbol": f"COIN{index}USDT", "thesis": "x" * 500}
+            for index in range(100)
+        ],
+        "noise": "x" * 80_000,
+    }
+
+    for label in (
+        "binance_manager_prompt",
+        "binance_manager_response",
+        "binance_manager_actions",
+    ):
+        compact = compact_manager_storage_payload(source, limit=1_500, label=label)
+
+        assert compact["jue_wiki_decision_gate"]["snapshot_id"] == (
+            "snapshot:binance:storage"
+        )
+        assert compact["jue_wiki_raw_rag_strip_audit"]["removed_path_count"] == 200
+        assert compact["jue_wiki_suppression_audit"][
+            "suppressed_new_risk_count"
+        ] == 199
+        assert compact["jue_wiki_decision_gate_policy"]["instruction"] == (
+            "preserve reduce-only exits"
+        )
+        assert "untrusted_noise" not in compact["jue_wiki_decision_gate"]
+
+
+def test_binance_storage_compaction_bounds_adversarial_wiki_audit_strings() -> None:
+    huge = "x" * 100_000
+    source = _wiki_gate_storage_contracts()
+    source["jue_wiki_decision_gate"]["reason"] = huge  # type: ignore[index]
+    source["jue_wiki_decision_gate"]["snapshot_id"] = huge  # type: ignore[index]
+    source["jue_wiki_raw_rag_strip_audit"]["removed_paths"] = [huge] * 100  # type: ignore[index]
+    source["jue_wiki_suppression_audit"]["reason"] = huge  # type: ignore[index]
+
+    for label in ("binance_manager_prompt", "binance_manager_response"):
+        compact = compact_manager_storage_payload(source, limit=1_500, label=label)
+
+        documented_minimum = 10_000 if label == "binance_manager_prompt" else 1_500
+        assert len(json.dumps(compact, ensure_ascii=False)) <= documented_minimum
+        assert len(compact["jue_wiki_decision_gate"]["reason"]) <= 120
+        assert len(compact["jue_wiki_decision_gate"]["snapshot_id"]) <= 120
+        assert len(compact["jue_wiki_suppression_audit"]["reason"]) <= 120
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["binance_manager_prompt", "binance_manager_response"],
+)
+@pytest.mark.parametrize("with_emergency_noise", [False, True])
+def test_binance_valid_gate_identity_round_trips_through_storage(
+    label: str,
+    with_emergency_noise: bool,
+) -> None:
+    reason_prefix = "wiki_required_  coverage  "
+    reason = reason_prefix + ("r" * (118 - len(reason_prefix))) + "  "
+    snapshot_prefix = "  snapshot  with  spaces  "
+    snapshot_id = snapshot_prefix + ("s" * (118 - len(snapshot_prefix))) + "  "
+    source = _wiki_gate_storage_contracts()
+    source["jue_wiki_decision_gate"]["reason"] = reason  # type: ignore[index]
+    source["jue_wiki_decision_gate"]["snapshot_id"] = snapshot_id  # type: ignore[index]
+    source["jue_wiki_raw_rag_strip_audit"]["snapshot_id"] = snapshot_id  # type: ignore[index]
+    source["jue_wiki_suppression_audit"]["reason"] = reason  # type: ignore[index]
+    source["jue_wiki_suppression_audit"]["snapshot_id"] = snapshot_id  # type: ignore[index]
+    if with_emergency_noise:
+        source["noise"] = "x" * 100_000
+    else:
+        source["jue_wiki_decision_gate"].pop("untrusted_noise")  # type: ignore[union-attr]
+        source["jue_wiki_raw_rag_strip_audit"]["removed_paths"] = []  # type: ignore[index]
+        source["jue_wiki_suppression_audit"]["suppressed_actions"] = []  # type: ignore[index]
+
+    compact = compact_manager_storage_payload(
+        source,
+        limit=1_500 if with_emergency_noise else 10_000,
+        label=label,
+    )
+
+    assert compact["jue_wiki_decision_gate"]["reason"] == reason
+    assert compact["jue_wiki_decision_gate"]["snapshot_id"] == snapshot_id
+    assert compact["jue_wiki_raw_rag_strip_audit"]["snapshot_id"] == snapshot_id
+    assert compact["jue_wiki_suppression_audit"]["reason"] == reason
+    assert compact["jue_wiki_suppression_audit"]["snapshot_id"] == snapshot_id
+    if with_emergency_noise:
+        assert compact["_storage_compaction"]["emergency"] is True
+    else:
+        assert "_storage_compaction" not in compact
+
+
+def test_binance_compact_manager_response_preserves_wiki_suppression_audit() -> None:
+    response = {
+        "payload": {"decision": "hold"},
+        **_wiki_gate_storage_contracts(),
+    }
+
+    compact = compact_manager_response_payload(response)
+
+    assert compact["jue_wiki_suppression_audit"]["suppressed_new_risk_count"] == 199
 
 
 def test_compact_jue_wiki_for_prompt_canonicalizes_quality_aliases() -> None:
@@ -1050,7 +1197,12 @@ def test_binance_manager_prompt_exposes_native_output_schema_for_manager_contrac
     assert "jue_wiki_memory_card_quality" in prompt["native_output_schema"][
         "validation_repair_resolution"
     ]["required"]
+    candidate_visibility = critical_contract["create_blocks_candidate_visibility"]
+    assert candidate_visibility["error"] == "manager_create_candidate_not_visible"
+    assert "visible candidates" in candidate_visibility["instruction"]
+    assert "market_universe" in candidate_visibility["instruction"]
     create_schema = prompt["native_output_schema"]["create_blocks"][0]
+    assert "visible candidates" in create_schema["symbol"]
     assert "jue_wiki_repair_pressure" in create_schema
     assert "repair pressure" in create_schema["jue_wiki_repair_pressure"]
     assert "jue_wiki_repair_resolution" in create_schema
@@ -2782,6 +2934,67 @@ def test_binance_manager_response_contract_rejects_action_ignoring_wiki_referenc
     assert resolved_error == ""
 
 
+def test_binance_manager_response_contract_prioritizes_wiki_reference_over_probe_action_gap() -> None:
+    prompt = {
+        "validation_repair": {
+            "scope": "binance",
+            "status": "needs_repair",
+            "repair_item_count": 1,
+        },
+        "memory": {
+            "jue_wiki_action_reference_memory": {
+                "status": "available",
+                "target_scope": "binance",
+                "items": [
+                    {
+                        "policy_id": "jue_wiki_action_reference_gap.binance.missing",
+                        "application_guidance": {
+                            "status": "wiki_reference_repair_required",
+                            "manager_instruction": (
+                                "attach_jue_wiki_reference_or_explicitly_record_non_wiki_basis"
+                            ),
+                            "required_evidence": [
+                                "jue_wiki_freshness_cross_check",
+                                "live_cross_check",
+                            ],
+                        },
+                    }
+                ],
+            }
+        },
+        "execution_gate": {
+            "status": "ok",
+            "kill_switch": {"enabled": False},
+            "execution": {"futures_orders_enabled": True},
+        },
+    }
+
+    error = manager_response_contract_error(
+        prompt=prompt,
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "NEARUSDT",
+                        "market": "futures",
+                        "resolution": "probe_waiting_block",
+                        "next_trigger": "funding and depth refresh before probe",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == "wiki_action_reference_resolution_missing_from_model"
+
+
 def test_binance_manager_response_contract_rejects_action_using_degraded_wiki_without_repair_metadata() -> None:
     error = manager_response_contract_error(
         prompt={
@@ -3288,6 +3501,1602 @@ def test_binance_manager_response_contract_rejects_action_pressure_without_trigg
     assert error == "hold_decision_missing_concrete_trigger"
 
 
+def test_binance_manager_response_contract_rejects_upbit_action_masking_binance_gap() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "candidates": [
+                {"symbol": "ETHUSDT", "market": "futures", "side": "long"},
+                {"symbol": "KRW-SOL", "market": "upbit_spot", "side": "long"},
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "pressure_source": "binance_activity_gap",
+                "binance_market_activity_gap": {
+                    "status": "stale_binance_entries",
+                    "candidate_symbols": ["ETHUSDT"],
+                    "candidate_markets": ["futures"],
+                },
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {
+                    "futures_orders_enabled": True,
+                    "upbit_orders_enabled": True,
+                },
+            },
+        },
+        response={"hold_decision": {"summary": "KRW-SOL만 신규 대기"}},
+        actions={
+            "create_blocks": [
+                {"symbol": "KRW-SOL", "market": "upbit_spot", "side": "long"}
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={"summary": "KRW-SOL만 신규 대기"},
+    )
+
+    assert error == "binance_activity_gap_resolution_missing_from_model"
+
+
+def test_binance_manager_response_contract_rejects_generic_hold_masking_binance_gap() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "pressure_source": "binance_activity_gap",
+                "binance_market_activity_gap": {
+                    "status": "stale_binance_entries",
+                    "candidate_symbols": ["ETHUSDT"],
+                    "candidate_markets": ["futures"],
+                },
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={"hold_decision": {"summary": "시장 대기"}},
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={
+            "summary": "시장 대기",
+            "next_triggers": [
+                {
+                    "symbol": "ETHUSDT",
+                    "condition": "돌파 후 재검토",
+                    "reason": "generic market caution",
+                }
+            ],
+        },
+    )
+
+    assert error == "binance_activity_gap_resolution_missing_from_model"
+
+
+def test_binance_manager_response_contract_allows_binance_gap_rejection_with_trigger() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "pressure_source": "binance_activity_gap",
+                "binance_market_activity_gap": {
+                    "status": "stale_binance_entries",
+                    "candidate_symbols": ["ETHUSDT"],
+                    "candidate_markets": ["futures"],
+                },
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={
+            "hold_decision": {"summary": "ETHUSDT는 펀딩/호가 확인 후 대기"},
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "market": "futures",
+                        "resolution": "safety_gate_defer",
+                        "evidence_gap": "funding and order book depth not fresh",
+                        "next_trigger": "funding <= 0.01%, spread <= 12bps",
+                    }
+                ]
+            },
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={
+            "summary": "ETHUSDT는 펀딩/호가 확인 후 대기",
+            "next_triggers": [
+                {
+                    "symbol": "ETHUSDT",
+                    "condition": "funding <= 0.01%, spread <= 12bps",
+                    "reason": "funding and order book depth not fresh",
+                }
+            ],
+        },
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_allows_advertised_binance_gap_resolution_aliases() -> None:
+    base_prompt = {
+        "proactive_decision_pressure": {
+            "status": "action_required",
+            "pressure_source": "binance_activity_gap",
+            "binance_market_activity_gap": {
+                "status": "stale_binance_entries",
+                "candidate_symbols": ["ETHUSDT"],
+                "candidate_markets": ["futures"],
+            },
+        },
+        "execution_gate": {
+            "status": "ok",
+            "kill_switch": {"enabled": False},
+            "execution": {"futures_orders_enabled": True},
+        },
+    }
+
+    for resolution in ("explicit_reject_with_price_reason", "defer_due_to_safety_gate"):
+        error = manager_response_contract_error(
+            prompt=base_prompt,
+            response={
+                "hold_decision": {"summary": "ETHUSDT는 호가/펀딩 확인 후 대기"},
+                "validation_repair_resolution": {
+                    "resolved_candidates": [
+                        {
+                            "symbol": "ETHUSDT",
+                            "market": "futures",
+                            "resolution": resolution,
+                            "evidence_gap": "funding and order book depth not fresh",
+                            "next_trigger": "funding <= 0.01%, spread <= 12bps",
+                        }
+                    ]
+                },
+            },
+            actions={
+                "create_blocks": [],
+                "update_blocks": [],
+                "close_blocks": [],
+                "pause_blocks": [],
+            },
+            hold_decision={
+                "summary": "ETHUSDT는 호가/펀딩 확인 후 대기",
+                "next_triggers": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "condition": "funding <= 0.01%, spread <= 12bps",
+                        "reason": "funding and order book depth not fresh",
+                    }
+                ],
+            },
+        )
+
+        assert error == ""
+
+
+def test_binance_manager_response_contract_allows_binance_gap_probe_action() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "candidates": [
+                {"symbol": "ETHUSDT", "market": "futures", "side": "long"},
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "pressure_source": "binance_activity_gap",
+                "binance_market_activity_gap": {
+                    "status": "stale_binance_entries",
+                    "candidate_symbols": ["ETHUSDT"],
+                    "candidate_markets": ["futures"],
+                },
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={"hold_decision": {"summary": "ETHUSDT small probe"}},
+        actions={
+            "create_blocks": [
+                {"symbol": "ETHUSDT", "market": "futures", "side": "long"}
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={"summary": "ETHUSDT small probe"},
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_rejects_ignoring_repairable_probe_design() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "blocks": [
+                {
+                    "block_id": "btc-waiting",
+                    "symbol": "BTCUSDT",
+                    "market": "futures",
+                    "side": "short",
+                }
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.07156,
+                            "target_price": 0.06397,
+                            "stop_price": 0.0737068,
+                            "reward_risk": 3.535495,
+                        },
+                    }
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": (
+                            "original stop risk exceeded validation repair max "
+                            "stop cap"
+                        ),
+                        "next_trigger": "tightened stop later",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={
+            "summary": "ESPUSDT rejected because original stop was wide",
+            "watch_symbols": ["ESPUSDT"],
+            "next_triggers": [
+                {
+                    "symbol": "ESPUSDT",
+                    "condition": "tightened stop later",
+                    "reason": "original stop was wide",
+                }
+            ],
+        },
+    )
+
+    assert error == "validation_repair_probe_design_ignored_from_model"
+
+
+def test_binance_manager_response_contract_rejects_unrelated_action_masking_repairable_probe_rejection() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.07156,
+                            "target_price": 0.06397,
+                            "stop_price": 0.0737068,
+                            "reward_risk": 3.535495,
+                        },
+                    }
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": "original stop risk exceeded repair cap",
+                        "next_trigger": "tightened stop later",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [
+                {
+                    "block_id": "btc-waiting",
+                    "entry_price": 60_000,
+                    "target_price": 58_000,
+                    "stop_price": 61_000,
+                }
+            ],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == "validation_repair_probe_design_ignored_from_model"
+
+
+def test_binance_manager_response_contract_rejects_close_action_masking_repairable_probe_rejection() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "blocks": [
+                {
+                    "block_id": "esp-live",
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "side": "short",
+                }
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.07156,
+                            "target_price": 0.06397,
+                            "stop_price": 0.0737068,
+                            "reward_risk": 3.535495,
+                        },
+                    }
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": "original stop risk exceeded repair cap",
+                        "next_trigger": "tightened stop later",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [{"block_id": "esp-live", "reason": "risk off"}],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == "validation_repair_probe_design_ignored_from_model"
+
+
+def test_binance_manager_response_contract_rejects_metadata_only_update_masking_repairable_probe_rejection() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "blocks": [
+                {
+                    "block_id": "esp-live",
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "side": "short",
+                }
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.07156,
+                            "target_price": 0.06397,
+                            "stop_price": 0.0737068,
+                            "reward_risk": 3.535495,
+                        },
+                    }
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": "original stop risk exceeded repair cap",
+                        "next_trigger": "tightened stop later",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [{"block_id": "esp-live", "reason": "metadata only"}],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == "validation_repair_probe_design_ignored_from_model"
+
+
+def test_binance_manager_response_contract_allows_one_repair_probe_action_with_other_repairable_watch() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 2},
+            "candidates": [
+                {"symbol": "SENTUSDT", "market": "futures", "side": "short"}
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "SENTUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.013612,
+                            "target_price": 0.012807,
+                            "stop_price": 0.014005,
+                            "reward_risk": 2.05,
+                        },
+                    },
+                    {
+                        "symbol": "HMSTRUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.000204,
+                            "target_price": 0.00019,
+                            "stop_price": 0.000210,
+                            "reward_risk": 2.33,
+                        },
+                    },
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "SENTUSDT",
+                        "market": "futures",
+                        "resolution": "probe_waiting_block",
+                        "next_trigger": "SENTUSDT >= 0.013612 waiting short probe",
+                    },
+                    {
+                        "symbol": "HMSTRUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": (
+                            "original stop risk exceeded validation repair max stop cap"
+                        ),
+                        "next_trigger": "tightened stop later",
+                    },
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "SENTUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "entry_style": "wait_for_price",
+                    "entry_price": 0.013612,
+                    "target_price": 0.012807,
+                    "stop_price": 0.014005,
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={"summary": "SENTUSDT repair probe action; HMSTRUSDT watched"},
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_allows_response_probe_action_even_if_not_current_repairable_pressure() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 2},
+            "candidates": [
+                {"symbol": "SENTUSDT", "market": "futures", "side": "short"}
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "HMSTRUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.000204,
+                            "target_price": 0.00019,
+                            "stop_price": 0.000210,
+                            "reward_risk": 2.33,
+                        },
+                    }
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "SENTUSDT",
+                        "market": "futures",
+                        "resolution": "probe_waiting_block",
+                        "next_trigger": "SENTUSDT >= 0.013612 waiting short probe",
+                    },
+                    {
+                        "symbol": "HMSTRUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": (
+                            "original stop risk exceeded validation repair max stop cap"
+                        ),
+                        "next_trigger": "tightened stop later",
+                    },
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "SENTUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "entry_style": "wait_for_price",
+                    "entry_price": 0.013612,
+                    "target_price": 0.012807,
+                    "stop_price": 0.014005,
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={"summary": "SENTUSDT repair probe action; HMSTRUSDT watched"},
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_allows_repairable_probe_rejection_with_live_gate() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.07156,
+                            "target_price": 0.06397,
+                            "stop_price": 0.0737068,
+                            "reward_risk": 3.535495,
+                        },
+                    }
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": (
+                            "live spread is 18bps and orderbook depth is below "
+                            "the minimum probe-liquidity gate"
+                        ),
+                        "next_trigger": (
+                            "reconsider the provided probe design when spread <= 10bps, "
+                            "depth recovers, and funding is neutral"
+                        ),
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={
+            "summary": "ESPUSDT repairable probe deferred by live liquidity gate",
+            "watch_symbols": ["ESPUSDT"],
+            "next_triggers": [
+                {
+                    "symbol": "ESPUSDT",
+                    "condition": "spread <= 10bps and depth recovers",
+                }
+            ],
+        },
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_allows_repairable_probe_rejection_with_pattern_or_authority_gate() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.07156,
+                            "target_price": 0.06397,
+                            "stop_price": 0.0737068,
+                            "reward_risk": 3.535495,
+                        },
+                    },
+                    {
+                        "symbol": "SOLUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 76.553,
+                            "target_price": 77.777,
+                            "stop_price": 74.25641,
+                            "reward_risk": 0.532953,
+                        },
+                    },
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": (
+                            "pattern prior missing and live_authority "
+                            "validation_probe blocks immediate execution"
+                        ),
+                        "next_trigger": (
+                            "pattern prior recovers and live_authority becomes "
+                            "qualified"
+                        ),
+                    },
+                    {
+                        "symbol": "SOLUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": "lane cooldown active until validation recovers",
+                        "next_trigger": "cooldown clears and RR >= 2.0",
+                    },
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={
+            "summary": "Binance probes deferred by current pattern and authority gates",
+            "watch_symbols": ["ESPUSDT", "SOLUSDT"],
+            "next_triggers": [
+                {
+                    "symbol": "ESPUSDT",
+                    "condition": "pattern prior recovers and live_authority qualifies",
+                },
+                {
+                    "symbol": "SOLUSDT",
+                    "condition": "cooldown clears and RR >= 2.0",
+                },
+            ],
+        },
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_rejects_pattern_not_qualified_as_live_gate() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.07156,
+                            "target_price": 0.06397,
+                            "stop_price": 0.0737068,
+                            "reward_risk": 3.535495,
+                        },
+                    }
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": "pattern prior is not qualified yet",
+                        "next_trigger": "pattern prior qualifies later",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={
+            "summary": "ESPUSDT pattern not qualified",
+            "watch_symbols": ["ESPUSDT"],
+            "next_triggers": [
+                {
+                    "symbol": "ESPUSDT",
+                    "condition": "pattern prior qualifies later",
+                }
+            ],
+        },
+    )
+
+    assert error == "validation_repair_probe_design_ignored_from_model"
+
+
+def test_binance_manager_response_contract_rejects_safety_gate_defer_that_ignores_repairable_probe_design() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.07156,
+                            "target_price": 0.06397,
+                            "stop_price": 0.0737068,
+                            "reward_risk": 3.535495,
+                        },
+                    }
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "resolution": "safety_gate_defer",
+                        "evidence_gap": "original stop risk exceeded repair cap",
+                        "next_trigger": "tightened stop later",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={
+            "summary": "ESPUSDT defer because original stop was wide",
+            "watch_symbols": ["ESPUSDT"],
+            "next_triggers": [
+                {"symbol": "ESPUSDT", "condition": "tightened stop later"}
+            ],
+        },
+    )
+
+    assert error == "validation_repair_probe_design_ignored_from_model"
+
+
+def test_binance_manager_response_contract_rejects_wrong_market_action_masking_repairable_probe_rejection() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "blocks": [
+                {
+                    "block_id": "esp-spot-waiting",
+                    "symbol": "ESPUSDT",
+                    "market": "spot",
+                    "side": "long",
+                }
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.07156,
+                            "target_price": 0.06397,
+                            "stop_price": 0.0737068,
+                            "reward_risk": 3.535495,
+                        },
+                    }
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"spot_orders_enabled": True, "futures_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": "original stop risk exceeded repair cap",
+                        "next_trigger": "tightened stop later",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [
+                {
+                    "block_id": "esp-spot-waiting",
+                    "entry_price": 0.071,
+                    "target_price": 0.073,
+                    "stop_price": 0.07,
+                }
+            ],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == "validation_repair_probe_design_ignored_from_model"
+
+
+def test_binance_manager_response_contract_rejects_repair_probe_below_min_executable_qty() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.033983,
+                            "target_price": 0.035219,
+                            "stop_price": 0.03296351,
+                            "reward_risk": 2.0,
+                            "min_executable_notional_usdt": 20.0,
+                            "min_executable_qty": 588.52955949,
+                        },
+                    }
+                ],
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "resolution": "probe_waiting_block",
+                        "next_trigger": "CHIPUSDT <= 0.033983 waiting long probe",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "qty": 63.75,
+                    "entry_price": 0.033983,
+                    "target_price": 0.035219,
+                    "stop_price": 0.03296351,
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == "validation_repair_min_executable_qty_missing_from_model"
+
+
+def test_binance_manager_response_contract_rejects_repair_probe_below_min_executable_notional() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.033983,
+                            "target_price": 0.035219,
+                            "stop_price": 0.03296351,
+                            "reward_risk": 2.0,
+                            "min_executable_notional_usdt": 20.0,
+                            "min_executable_qty": 588.52955949,
+                        },
+                    }
+                ],
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "resolution": "probe_waiting_block",
+                        "next_trigger": "CHIPUSDT <= 0.033983 waiting long probe",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "quote_budget_usdt": 5.0,
+                    "entry_price": 0.033983,
+                    "target_price": 0.035219,
+                    "stop_price": 0.03296351,
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == "validation_repair_min_executable_qty_missing_from_model"
+
+
+def test_binance_manager_response_contract_rejects_block_id_update_below_min_executable_qty() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "blocks": [
+                {
+                    "block_id": "chip-waiting",
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                }
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.033983,
+                            "target_price": 0.035219,
+                            "stop_price": 0.03296351,
+                            "reward_risk": 2.0,
+                            "min_executable_notional_usdt": 20.0,
+                            "min_executable_qty": 588.52955949,
+                        },
+                    }
+                ],
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "resolution": "updated_price_geometry",
+                        "next_trigger": "tightened active waiting probe geometry",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [
+                {
+                    "block_id": "chip-waiting",
+                    "qty": 63.75,
+                    "entry_price": 0.033983,
+                    "target_price": 0.035219,
+                    "stop_price": 0.03296351,
+                }
+            ],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == "validation_repair_min_executable_qty_missing_from_model"
+
+
+def test_binance_manager_response_contract_allows_block_id_update_at_min_executable_notional() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "blocks": [
+                {
+                    "block_id": "chip-waiting",
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                }
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.033983,
+                            "target_price": 0.035219,
+                            "stop_price": 0.03296351,
+                            "reward_risk": 2.0,
+                            "min_executable_notional_usdt": 20.0,
+                            "min_executable_qty": 588.52955949,
+                        },
+                    }
+                ],
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "resolution": "updated_price_geometry",
+                        "next_trigger": "tightened active waiting probe geometry",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [
+                {
+                    "block_id": "chip-waiting",
+                    "quote_budget_usdt": 20.0,
+                    "entry_price": 0.033983,
+                    "target_price": 0.035219,
+                    "stop_price": 0.03296351,
+                }
+            ],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_allows_block_id_update_with_existing_executable_qty() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "blocks": [
+                {
+                    "block_id": "chip-waiting",
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "qty_initial": 600.0,
+                    "entry_price": 0.033983,
+                }
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.033983,
+                            "target_price": 0.035219,
+                            "stop_price": 0.03296351,
+                            "reward_risk": 2.0,
+                            "min_executable_notional_usdt": 20.0,
+                            "min_executable_qty": 588.52955949,
+                        },
+                    }
+                ],
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "resolution": "updated_price_geometry",
+                        "next_trigger": "tightened active waiting probe geometry",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [
+                {
+                    "block_id": "chip-waiting",
+                    "entry_price": 0.033983,
+                    "target_price": 0.035219,
+                    "stop_price": 0.03296351,
+                }
+            ],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_allows_block_id_update_to_resolve_executable_repair() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "blocks": [
+                {
+                    "block_id": "chip-waiting",
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "qty_initial": 600.0,
+                    "entry_price": 0.033983,
+                }
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.033983,
+                            "target_price": 0.035219,
+                            "stop_price": 0.03296351,
+                            "reward_risk": 2.0,
+                            "min_executable_notional_usdt": 20.0,
+                            "min_executable_qty": 588.52955949,
+                        },
+                    }
+                ],
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "resolution": "probe_waiting_block",
+                        "next_trigger": "tightened active waiting probe geometry",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [
+                {
+                    "block_id": "chip-waiting",
+                    "entry_price": 0.033983,
+                    "target_price": 0.035219,
+                    "stop_price": 0.03296351,
+                }
+            ],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_ignores_wrong_market_action_for_min_executable_floor() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "blocks": [
+                {
+                    "block_id": "chip-spot-waiting",
+                    "symbol": "CHIPUSDT",
+                    "market": "spot",
+                    "side": "long",
+                }
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.033983,
+                            "target_price": 0.035219,
+                            "stop_price": 0.03296351,
+                            "reward_risk": 2.0,
+                            "min_executable_notional_usdt": 20.0,
+                            "min_executable_qty": 588.52955949,
+                        },
+                    }
+                ],
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": "live spread is 18bps and orderbook depth is thin",
+                        "next_trigger": "spread <= 10bps and depth recovers",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [
+                {
+                    "block_id": "chip-spot-waiting",
+                    "qty": 1.0,
+                    "entry_price": 0.033983,
+                    "target_price": 0.035219,
+                    "stop_price": 0.03296351,
+                }
+            ],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_rejects_updated_price_geometry_without_update_action() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "blocks": [
+                {
+                    "block_id": "chip-waiting",
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "qty_initial": 600.0,
+                    "entry_price": 0.033983,
+                }
+            ],
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.033983,
+                            "target_price": 0.035219,
+                            "stop_price": 0.03296351,
+                            "reward_risk": 2.0,
+                            "min_executable_notional_usdt": 20.0,
+                            "min_executable_qty": 588.52955949,
+                        },
+                    }
+                ],
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "resolution": "updated_price_geometry",
+                        "next_trigger": "tightened active waiting probe geometry",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={
+            "summary": "CHIPUSDT geometry updated",
+            "watch_symbols": ["CHIPUSDT"],
+            "next_triggers": [
+                {"symbol": "CHIPUSDT", "condition": "tightened geometry is ready"}
+            ],
+        },
+    )
+
+    assert error == "validation_repair_action_missing_from_model"
+
+
+def test_binance_manager_response_contract_allows_repair_probe_at_min_executable_qty() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.033983,
+                            "target_price": 0.035219,
+                            "stop_price": 0.03296351,
+                            "reward_risk": 2.0,
+                            "min_executable_notional_usdt": 20.0,
+                            "min_executable_qty": 588.52955949,
+                        },
+                    }
+                ],
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "resolution": "probe_waiting_block",
+                        "next_trigger": "CHIPUSDT <= 0.033983 waiting long probe",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "qty": 588.52955949,
+                    "entry_price": 0.033983,
+                    "target_price": 0.035219,
+                    "stop_price": 0.03296351,
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_allows_repair_probe_at_min_executable_notional() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {"repair_item_count": 1},
+            "proactive_decision_pressure": {
+                "status": "action_required",
+                "top_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "validation_repair_probe_design": {
+                            "resolution": "probe_waiting_block",
+                            "entry_price": 0.033983,
+                            "target_price": 0.035219,
+                            "stop_price": 0.03296351,
+                            "reward_risk": 2.0,
+                            "min_executable_notional_usdt": 20.0,
+                            "min_executable_qty": 588.52955949,
+                        },
+                    }
+                ],
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "CHIPUSDT",
+                        "market": "futures",
+                        "resolution": "probe_waiting_block",
+                        "next_trigger": "CHIPUSDT <= 0.033983 waiting long probe",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "quote_budget_usdt": 20.0,
+                    "entry_price": 0.033983,
+                    "target_price": 0.035219,
+                    "stop_price": 0.03296351,
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == ""
+
+
 def test_binance_manager_ignores_kis_scoped_action_pressure() -> None:
     prompt = {
         "proactive_decision_pressure": {
@@ -3632,6 +5441,19 @@ def test_compact_manager_account_for_prompt_summarizes_assets_risk_and_errors() 
                 "unRealizedProfit": "0.35",
                 "raw": {"large": "DROP_ME" * 100},
             }
+        ]
+        + [
+            {
+                "symbol": "SUIDUSTUSDT",
+                "positionAmt": "-0.1",
+                "entryPrice": "0.7171",
+                "markPrice": "0.7144",
+                "liquidationPrice": "1.4209",
+                "leverage": "1",
+                "marginType": "isolated",
+                "unRealizedProfit": "0.0002",
+                "raw": {"large": "DROP_ME" * 100},
+            }
         ],
         "errors": [
             {"source": "binance futures", "error_message": " timeout " * 80},
@@ -3661,13 +5483,29 @@ def test_compact_manager_account_for_prompt_summarizes_assets_risk_and_errors() 
             "leverage": 2,
             "margin_type": "isolated",
             "unrealized_profit": 0.35,
+            "position_notional_usdt": 10.85,
+            "management_status": "open_position",
+        },
+        {
+            "symbol": "SUIDUSTUSDT",
+            "position_amt": -0.1,
+            "entry_price": 0.7171,
+            "mark_price": 0.7144,
+            "liquidation_price": 1.4209,
+            "leverage": 1,
+            "margin_type": "isolated",
+            "unrealized_profit": 0.0002,
+            "position_notional_usdt": 0.07144,
+            "management_status": "dust_below_min_notional",
+            "min_manageable_notional_usdt": 5.0,
         }
     ]
     assert compact["futures_position_risk_summary"] == {
-        "total_count": 4,
-        "nonzero_count": 1,
-        "visible_count": 1,
+        "total_count": 5,
+        "nonzero_count": 2,
+        "visible_count": 2,
         "omitted_zero_count": 3,
+        "dust_count": 1,
     }
     assert len(compact["errors"]) == 2
     assert len(compact["errors"][0]["error_message"]) <= 240
@@ -3848,6 +5686,9 @@ def test_build_binance_manager_prompt_payload_preserves_core_policy_contract() -
         assert "copy the compact repair note" in action_schema[
             "metadata_contract_repair_note"
         ]
+        if action_name == "create_blocks":
+            assert "active futures" in action_schema["liquidation_price"]
+            assert "proposed wait_for_price" in action_schema["liquidation_price"]
     assert "same symbol" in prompt["policy"]["multi_block_policy"]
     assert "futures:short" in prompt["policy"]["lane_balance_policy"]
     assert "edge_rebuild" in prompt["policy"]["growth_governor_policy"]
@@ -3901,10 +5742,28 @@ def test_build_binance_manager_prompt_payload_preserves_core_policy_contract() -
     assert prompt["critical_response_contract"]["validation_repair_resolution"][
         "blanket_hold_allowed"
     ] is False
+    assert "validation_repair_action_missing_from_model" in prompt[
+        "critical_response_contract"
+    ]["validation_repair_resolution"]["action_required_for_resolutions"]["error"]
+    assert "validation_repair_probe_design_ignored_from_model" in prompt[
+        "critical_response_contract"
+    ]["validation_repair_resolution"]["repairable_probe_design"]["error"]
+    assert "next_trigger alone does not satisfy this rejection evidence" in prompt[
+        "critical_response_contract"
+    ]["validation_repair_resolution"]["repairable_probe_design"]["error"]
+    assert "pattern prior, research_only, immediate_block_allowed" in prompt[
+        "critical_response_contract"
+    ]["validation_repair_resolution"]["repairable_probe_design"]["error"]
+    assert "validation_repair_min_executable_qty_missing_from_model" in prompt[
+        "critical_response_contract"
+    ]["validation_repair_resolution"]["repairable_probe_design"][
+        "min_executable_qty_error"
+    ]
     assert "blanket reason to stop all exploration" in prompt["policy"][
         "validation_repair_response_policy"
     ]
-    assert prompt["native_thread_mode"] == "ephemeral"
+    assert prompt["native_thread_mode"] == "daily"
+    assert prompt["native_thread_key"] == "binance:block_manager:{date}"
 
 
 def test_compact_account_asset_rows_limits_and_omits_raw_fields() -> None:
@@ -3963,6 +5822,8 @@ def test_futures_risk_helpers_detect_and_compact_live_exposure() -> None:
         "leverage": 3,
         "margin_type": "cross",
         "unrealized_profit": -2.5,
+        "position_notional_usdt": 772.5,
+        "management_status": "open_position",
     }
 
 
@@ -4466,6 +6327,37 @@ def test_binance_prompt_budget_finalize_prefers_warn_budget_for_latency_sections
         "entry_gate_policy": {"items": [{"body": marker * 120} for _ in range(20)]},
         "policy": {"items": [{"body": marker * 120} for _ in range(20)]},
         "memory": {"notes": [{"summary": marker * 120} for _ in range(20)]},
+        "proactive_decision_pressure": {
+            "version": "binance_proactive_decision_pressure_v1",
+            "status": "action_required",
+            "pressure_level": "high",
+            "zero_action_streak": 5,
+            "previous_error_streak": 5,
+            "binance_zero_action_streak": 7,
+            "binance_previous_error_streak": 2,
+            "effective_zero_action_streak": 7,
+            "pressure_source": "binance_activity_gap",
+            "candidate_count": 8,
+            "strong_candidate_count": 8,
+            "growth_governor_mode": "edge_rebuild",
+            "growth_governor_allows_new_blocks": True,
+            "live_grade": "insufficient",
+            "previous_hold_summary": "관망",
+            "top_candidates": [
+                {"symbol": "KRW-SOL", "market": "upbit_spot", "reason": marker * 50}
+            ],
+            "binance_market_activity_gap": {
+                "version": "binance_market_activity_gap_v1",
+                "status": "stale_binance_entries",
+                "latest_binance_entry_at": "2026-07-03T05:08:52+00:00",
+                "latest_binance_entry_market": "futures",
+                "latest_upbit_entry_at": "2026-07-06T08:35:20+00:00",
+                "binance_entry_stale_hours": 72.0,
+                "binance_candidate_count": 3,
+                "candidate_markets": ["futures", "spot"],
+                "candidate_symbols": ["ESPUSDT", "BTCUSDT"],
+            },
+        },
     }
 
     finalize_prompt_budget(
@@ -4482,6 +6374,12 @@ def test_binance_prompt_budget_finalize_prefers_warn_budget_for_latency_sections
     assert prompt_chars(prompt) <= 90_000
     assert "recent_performance" in prompt
     assert "validation_repair" in prompt
+    pressure = prompt["proactive_decision_pressure"]
+    assert pressure["binance_zero_action_streak"] == 7
+    assert pressure["effective_zero_action_streak"] == 7
+    assert pressure["pressure_source"] == "binance_activity_gap"
+    gap = prompt["proactive_decision_pressure"]["binance_market_activity_gap"]
+    assert gap["candidate_symbols"] == ["ESPUSDT", "BTCUSDT"]
 
 
 def test_binance_prompt_budget_compacts_large_jue_wiki_context() -> None:
@@ -5537,6 +7435,180 @@ def test_binance_prompt_budget_handles_operational_203k_pressure() -> None:
         assert section in prompt
 
 
+def test_binance_prompt_budget_compacts_policy_rule_memory_bloat_under_warn() -> None:
+    marker = "BINANCE_POLICY_RULE_MEMORY_BLOAT"
+    prompt = {
+        "account": {"spot_cash_usdt": 500.0, "futures_cash_usdt": 500.0},
+        "memory": {
+            "status": "ok",
+            "memory_scope": "binance",
+            "persona": "Jue searches for executable crypto asymmetry.",
+            "policy_rule_evaluation": {
+                f"rule_{idx}": {
+                    "policy_id": f"binance.policy.{idx}",
+                    "rule_id": f"binance.policy.{idx}@v1",
+                    "effect": {"entry_bias": "allow_probe"},
+                    "evidence": {
+                        "workflow_ids": ["binance_cycle"],
+                        "skill_ids": ["jue-binance-trading"],
+                        "contract_ids": ["jue_wiki_action_reference_contract"],
+                        "raw": marker * 45,
+                    },
+                    "raw_context": marker * 45,
+                }
+                for idx in range(90)
+            },
+            "validation_repair_backlog": {
+                f"case_{idx}": {
+                    "symbol": "ICPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "summary": marker * 30,
+                }
+                for idx in range(30)
+            },
+            "translated_policy_context": {
+                "status": "available",
+                "target_scope": "binance",
+                "available_count": 2,
+                "selected_count": 1,
+                "omitted_count": 1,
+                "items": [
+                    {
+                        "policy_id": "kis.value.pullback",
+                        "source_scope": "kis",
+                        "transferability": "translated",
+                        "reason": "Translated KIS pullback lesson for Binance.",
+                    }
+                ],
+            },
+        },
+        "candidates": {
+            "futures": [
+                {
+                    "symbol": "ICPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "horizon": "intraday",
+                    "entry_price": 2.2266,
+                    "target_price": 2.34,
+                    "stop_price": 2.18,
+                    "liquidation_price": 1.71,
+                    "quote_budget_usdt": 8.0,
+                    "min_executable_notional_usdt": 5.0,
+                    "min_executable_qty": 2.25,
+                    "validation_repair_probe_design": {
+                        "status": "repairable",
+                        "min_executable_notional_usdt": 5.0,
+                        "min_executable_qty": 2.25,
+                        "liquidation_price": 1.71,
+                    },
+                    "reason_md": marker * 10,
+                }
+            ]
+        },
+        "entry_gate_policy": {"status": "active", "policy": marker * 400},
+        "candidate_generation": {"status": "ok", "source": "research"},
+        "jue_wiki_repair_contract": {
+            "status": "required",
+            "top_priorities": [
+                {
+                    "page_id": "binance.symbol.ICPUSDT",
+                    "priority_type": "validation_repair",
+                    "repair_action": "Create executable ICPUSDT probe.",
+                }
+            ],
+        },
+        "critical_response_contract": {
+            "create_blocks": {
+                "must_use_min_executable_notional_usdt": True,
+                "must_preserve_liquidation_price_for_futures": True,
+            }
+        },
+        "native_output_schema": {
+            "create_blocks": [
+                {
+                    "symbol": "ICPUSDT",
+                    "market": "futures",
+                    "liquidation_price": "required before live trigger",
+                }
+            ]
+        },
+    }
+
+    finalize_prompt_budget(
+        prompt,
+        target_chars=45_000,
+        warn_chars=65_000,
+        max_chars=190_000,
+    )
+
+    assert prompt_budget_error(prompt) == ""
+    assert prompt["prompt_budget"]["over_warn"] is False
+    assert prompt["prompt_budget"]["total_chars"] <= 65_000
+    assert prompt_chars({"memory": prompt["memory"]}) < 12_000
+    policy_impact = prompt["memory"]["policy_rule_evaluation"]["rule_0"]
+    assert policy_impact["policy_id"] == "binance.policy.0"
+    assert policy_impact["evidence"]["workflow_ids"] == ["binance_cycle"]
+    candidate = prompt["candidates"]["futures"][0]
+    assert candidate["min_executable_notional_usdt"] == 5.0
+    assert candidate["min_executable_qty"] == 2.25
+    assert candidate["liquidation_price"] == 1.71
+    assert (
+        candidate["validation_repair_probe_design"]["min_executable_notional_usdt"]
+        == 5.0
+    )
+
+
+def test_binance_prompt_budget_preserves_validation_repair_geometry_constraints() -> None:
+    marker = "BINANCE_REPAIR_CONSTRAINT_BLOAT"
+    prompt = {
+        "memory": {
+            "policy_rule_evaluation": {
+                f"rule_{idx}": {"raw": marker * 80}
+                for idx in range(90)
+            }
+        },
+        "jue_wiki_application": {"raw": marker * 1_000},
+        "validation_repair": {
+            "version": "validation_repair_action_v1",
+            "status": "needs_repair",
+            "repair_item_count": 2,
+            "constraint_count": 2,
+            "max_budget_multiplier": 0.25,
+            "risk_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+            "policy_ids": [f"policy_{idx}" for idx in range(40)],
+            "runner_hints": [marker * 20 for _ in range(20)],
+        },
+        "candidates": [
+            {
+                "symbol": "ESPUSDT",
+                "market": "futures",
+                "side": "short",
+                "entry_price": 0.07156,
+                "target_price": 0.06397,
+                "stop_price": 0.075262,
+            }
+        ],
+    }
+
+    finalize_prompt_budget(
+        prompt,
+        target_chars=45_000,
+        warn_chars=65_000,
+        max_chars=190_000,
+    )
+
+    assert prompt["prompt_budget"]["over_warn"] is False
+    repair = prompt["validation_repair"]
+    assert repair["max_budget_multiplier"] == pytest.approx(0.25)
+    assert repair["risk_budget_multiplier"] == pytest.approx(0.25)
+    assert repair["min_reward_risk"] == pytest.approx(2.0)
+    assert repair["max_stop_risk_pct"] == pytest.approx(3.0)
+
+
 def test_binance_prompt_budget_emergency_compacts_large_instruction_sections() -> None:
     marker = "BINANCE_LARGE_INSTRUCTION_SECTIONS"
     prompt = {
@@ -6062,6 +8134,78 @@ def test_finalize_binance_manager_prompt_budget_uses_latency_guard_target() -> N
     assert prompt["native_thread_mode"] == "ephemeral"
 
 
+def test_binance_prompt_budget_finalizes_under_warn_after_soft_recovery_case() -> None:
+    marker = "BINANCE_SOFT_WARN_RECOVERY_BLOAT "
+    multiplier = 2
+    prompt = {
+        "critical_response_contract": {"lane_review": {"required": True}},
+        "memory": {
+            "memory_scope": "binance",
+            "persona": "Jue searches for executable crypto asymmetry.",
+            "policy_rule_evaluation": {
+                f"rule_{idx}": {
+                    "policy_id": f"binance.policy.{idx}",
+                    "evidence": {"workflow_ids": ["binance_cycle"], "raw": marker * (18 * multiplier)},
+                    "raw_context": marker * (18 * multiplier),
+                }
+                for idx in range(120)
+            },
+            "active_insights": [
+                {"summary": marker * (24 * multiplier), "symbols": ["ESPUSDT", "HMSTRUSDT"]}
+                for _ in range(70)
+            ],
+        },
+        "jue_wiki_application": {
+            "pages": [
+                {"page_id": f"binance.symbol.{idx}", "summary": marker * (22 * multiplier)}
+                for idx in range(45)
+            ],
+            "trust_profile": {"notes": [marker * (18 * multiplier) for _ in range(20)]},
+        },
+        "validation_repair": {
+            "status": "needs_repair",
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+            "runner_hints": [marker * (18 * multiplier) for _ in range(20)],
+        },
+        "candidates": [
+            {
+                "symbol": "ESPUSDT",
+                "market": "futures",
+                "side": "short",
+                "entry_price": 0.07156,
+                "target_price": 0.06397,
+                "stop_price": 0.075262,
+                "reason_md": marker * (18 * multiplier),
+            }
+        ],
+        "candidate_generation": {
+            "observe_universe": [
+                {"symbol": f"C{idx:03d}USDT", "reason": marker * (14 * multiplier)}
+                for idx in range(60)
+            ]
+        },
+        "entry_gate_policy": {"status": "active", "raw": marker * (160 * multiplier)},
+        "jue_wiki_repair_contract": {"status": "active", "raw": marker * (140 * multiplier)},
+        "live_authority": {"raw": marker * (120 * multiplier)},
+        "diagnostics": {"raw": marker * (100 * multiplier)},
+    }
+
+    finalize_prompt_budget(
+        prompt,
+        target_chars=70_000,
+        warn_chars=90_000,
+        max_chars=190_000,
+    )
+
+    assert prompt_budget_error(prompt) == ""
+    assert prompt["prompt_budget"]["over_warn"] is False
+    assert prompt["prompt_budget"]["total_chars"] <= 90_000
+    assert prompt_chars({"memory": prompt["memory"]}) < 12_000
+    assert prompt["validation_repair"]["min_reward_risk"] == pytest.approx(2.0)
+    assert prompt["validation_repair"]["max_stop_risk_pct"] == pytest.approx(3.0)
+
+
 def test_finalize_binance_manager_prompt_budget_preserves_ephemeral_after_latency_emergency() -> None:
     prompt = {
         "native_thread_mode": "ephemeral",
@@ -6256,13 +8400,19 @@ def test_finalize_binance_manager_latency_core_keeps_executable_candidate_items(
     )
 
     candidates = prompt["candidates"]
-    assert candidates["item_count"] > 0
-    first = candidates["items"][0]
+    assert isinstance(candidates, list)
+    assert candidates
+    first = candidates[0]
     assert first["symbol"] == "RIFUSDT"
     assert first["entry_price"] == 1.2
     assert first["target_price"] == 1.38
     assert first["stop_price"] == 1.12
     assert "calculated" in first
+    assert prompt["compaction_meta"]["sections"]["candidates"] == {
+        "item_count": 61,
+        "retained_item_count": len(candidates),
+        "omitted_item_count": 61 - len(candidates),
+    }
 
 
 def test_compact_manager_storage_payload_preserves_precompacted_candidate_items() -> None:
@@ -6426,9 +8576,259 @@ def test_final_budget_candidate_compaction_preserves_deep_volatile_attack() -> N
     }
 
     compact_manager_sections_for_final_budget(prompt, target_chars=10_000)
-    rows = prompt["candidates"]["items"]
+    rows = prompt["candidates"]
 
+    assert isinstance(rows, list)
     assert any(row.get("lane") == "volatile_attack" for row in rows)
+
+
+def test_final_budget_candidate_compaction_keeps_more_than_four_lane_diverse_rows() -> None:
+    candidates = [
+        {
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "side": "long",
+            "entry_price": 100.0,
+            "target_price": 106.0,
+            "stop_price": 97.0,
+            "reason_md": "spot candidate " * 20,
+        },
+        {
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "long",
+            "entry_price": 200.0,
+            "target_price": 212.0,
+            "stop_price": 194.0,
+            "reason_md": "futures long candidate " * 20,
+        },
+        {
+            "symbol": "SOLUSDT",
+            "market": "futures",
+            "side": "short",
+            "entry_price": 50.0,
+            "target_price": 47.0,
+            "stop_price": 51.5,
+            "reason_md": "futures short candidate " * 20,
+        },
+        {
+            "symbol": "KRW-XRP",
+            "market": "upbit_spot",
+            "side": "long",
+            "entry_price": 700.0,
+            "target_price": 735.0,
+            "stop_price": 682.0,
+            "reason_md": "upbit candidate " * 20,
+        },
+        {
+            "symbol": "HEIUSDT",
+            "market": "futures",
+            "side": "short",
+            "lane": "volatile_attack",
+            "entry_price": 0.12,
+            "target_price": 0.108,
+            "stop_price": 0.123,
+            "reason_md": "volatile candidate " * 20,
+            "calculated": {"lane": "volatile_attack", "volatile_attack": True},
+        },
+        {
+            "symbol": "BNBUSDT",
+            "market": "spot",
+            "side": "long",
+            "entry_price": 600.0,
+            "target_price": 630.0,
+            "stop_price": 585.0,
+            "reason_md": "extra binance candidate " * 20,
+        },
+    ]
+    prompt = {
+        "critical_response_contract": {"text": "keep"},
+        "candidates": candidates,
+        "memory": {"blob": "M" * 80_000},
+        "jue_wiki_application": {"blob": "W" * 20_000},
+    }
+
+    compact_manager_sections_for_final_budget(prompt, target_chars=70_000)
+
+    rows = prompt["candidates"]
+    assert isinstance(rows, list)
+    selected_symbols = {row["symbol"] for row in rows}
+    assert len(rows) >= 5
+    assert {"BTCUSDT", "ETHUSDT", "SOLUSDT", "KRW-XRP", "HEIUSDT"}.issubset(
+        selected_symbols
+    )
+
+
+def test_final_budget_preserves_binance_activity_gap_pressure() -> None:
+    prompt = {
+        "critical_response_contract": {"lane_review": {"required": True}},
+        "proactive_decision_pressure": {
+            "version": "binance_proactive_decision_pressure_v1",
+            "status": "action_required",
+            "pressure_level": "high",
+            "zero_action_streak": 5,
+            "previous_error_streak": 5,
+            "binance_zero_action_streak": 7,
+            "binance_previous_error_streak": 2,
+            "effective_zero_action_streak": 7,
+            "pressure_source": "binance_activity_gap",
+            "candidate_count": 8,
+            "strong_candidate_count": 8,
+            "growth_governor_mode": "edge_rebuild",
+            "growth_governor_allows_new_blocks": True,
+            "live_grade": "insufficient",
+            "previous_hold_summary": "관망",
+            "top_candidates": [
+                {"symbol": "KRW-SOL", "market": "upbit_spot", "reason": "x" * 20_000}
+            ],
+            "required_resolution": "resolve at least one candidate",
+            "response_contract": {"action_required": "cite exact blocker"},
+            "allowed_resolutions": ["small_probe"],
+            "binance_market_activity_gap": {
+                "version": "binance_market_activity_gap_v1",
+                "status": "stale_binance_entries",
+                "latest_binance_entry_at": "2026-07-03T05:08:52+00:00",
+                "latest_binance_entry_market": "futures",
+                "latest_upbit_entry_at": "2026-07-06T08:35:20+00:00",
+                "binance_entry_stale_hours": 72.0,
+                "binance_candidate_count": 3,
+                "candidate_markets": ["futures", "spot"],
+                "candidate_symbols": ["ESPUSDT", "BTCUSDT"],
+                "manager_instruction": (
+                    "prefer at least one Binance spot/futures waiting probe"
+                ),
+            },
+        },
+        "memory": {"blob": "M" * 80_000},
+    }
+
+    compact_manager_sections_for_final_budget(prompt, target_chars=10_000)
+
+    pressure = prompt["proactive_decision_pressure"]
+    assert pressure["binance_zero_action_streak"] == 7
+    assert pressure["effective_zero_action_streak"] == 7
+    assert pressure["pressure_source"] == "binance_activity_gap"
+    gap = prompt["proactive_decision_pressure"]["binance_market_activity_gap"]
+    assert gap["status"] == "stale_binance_entries"
+    assert gap["candidate_symbols"] == ["ESPUSDT", "BTCUSDT"]
+    assert gap["candidate_markets"] == ["futures", "spot"]
+
+
+def test_warn_budget_preserves_binance_activity_gap_pressure() -> None:
+    prompt = {
+        "proactive_decision_pressure": {
+            "version": "binance_proactive_decision_pressure_v1",
+            "status": "action_required",
+            "pressure_level": "high",
+            "zero_action_streak": 5,
+            "previous_error_streak": 5,
+            "binance_zero_action_streak": 7,
+            "binance_previous_error_streak": 2,
+            "effective_zero_action_streak": 7,
+            "pressure_source": "binance_activity_gap",
+            "candidate_count": 8,
+            "strong_candidate_count": 8,
+            "growth_governor_mode": "edge_rebuild",
+            "growth_governor_allows_new_blocks": True,
+            "live_grade": "insufficient",
+            "previous_hold_summary": "관망",
+            "top_candidates": [
+                {"symbol": "KRW-SOL", "market": "upbit_spot", "reason": "x" * 20_000}
+            ],
+            "required_resolution": "resolve at least one candidate",
+            "response_contract": {"action_required": "cite exact blocker"},
+            "allowed_resolutions": ["small_probe"],
+            "binance_market_activity_gap": {
+                "version": "binance_market_activity_gap_v1",
+                "status": "stale_binance_entries",
+                "latest_binance_entry_at": "2026-07-03T05:08:52+00:00",
+                "latest_binance_entry_market": "futures",
+                "latest_upbit_entry_at": "2026-07-06T08:35:20+00:00",
+                "binance_entry_stale_hours": 72.0,
+                "binance_candidate_count": 3,
+                "candidate_markets": ["futures", "spot"],
+                "candidate_symbols": ["ESPUSDT", "BTCUSDT"],
+            },
+        }
+    }
+
+    compact_manager_sections_for_warn_budget(prompt, warn_chars=10_000)
+
+    pressure = prompt["proactive_decision_pressure"]
+    assert pressure["binance_zero_action_streak"] == 7
+    assert pressure["effective_zero_action_streak"] == 7
+    assert pressure["pressure_source"] == "binance_activity_gap"
+    gap = prompt["proactive_decision_pressure"]["binance_market_activity_gap"]
+    assert gap["status"] == "stale_binance_entries"
+    assert gap["candidate_symbols"] == ["ESPUSDT", "BTCUSDT"]
+    assert gap["candidate_markets"] == ["futures", "spot"]
+
+
+def test_prompt_budget_candidate_emergency_compaction_keeps_binance_lanes() -> None:
+    prompt = {
+        "critical_response_contract": {"lane_review": {"required": True}},
+        "task": "manage Binance blocks " + ("T" * 60_000),
+        "candidates": [
+            {
+                "symbol": f"KRW-{idx:03d}",
+                "market": "upbit_spot",
+                "side": "long",
+                "entry_price": 1000 + idx,
+                "target_price": 1040 + idx,
+                "stop_price": 980 + idx,
+                "reason_md": "upbit candidate " * 80,
+            }
+            for idx in range(24)
+        ]
+        + [
+            {
+                "symbol": "BTCUSDT",
+                "market": "spot",
+                "side": "long",
+                "entry_price": 100.0,
+                "target_price": 104.0,
+                "stop_price": 98.0,
+                "reason_md": "binance spot candidate " * 80,
+            },
+            {
+                "symbol": "ETHUSDT",
+                "market": "futures",
+                "side": "long",
+                "entry_price": 200.0,
+                "target_price": 208.0,
+                "stop_price": 196.0,
+                "reason_md": "binance futures long candidate " * 80,
+            },
+            {
+                "symbol": "SOLUSDT",
+                "market": "futures",
+                "side": "short",
+                "entry_price": 50.0,
+                "target_price": 48.0,
+                "stop_price": 51.0,
+                "reason_md": "binance futures short candidate " * 80,
+            },
+        ],
+        "memory": {"blob": "M" * 80_000},
+    }
+
+    enforce_prompt_budget(prompt, max_chars=10_000)
+    rows = (
+        prompt["candidates"]["items"]
+        if isinstance(prompt.get("candidates"), dict)
+        else prompt["candidates"]
+    )
+    lanes = {
+        f"{row.get('market')}:{row.get('side')}"
+        for row in rows
+        if isinstance(row, dict)
+    }
+    selected_symbols = {
+        row.get("symbol") for row in rows if isinstance(row, dict)
+    }
+
+    assert {"spot:long", "futures:long", "futures:short"}.issubset(lanes)
+    assert "KRW-000" in selected_symbols
 
 
 def test_binance_manager_latency_recovery_preserves_ephemeral_thread_mode() -> None:
@@ -6458,6 +8858,76 @@ def test_binance_manager_latency_recovery_preserves_ephemeral_thread_mode() -> N
     )
 
     assert recovered["native_thread_mode"] == "ephemeral"
+
+
+def test_binance_manager_latency_recovery_preserves_activity_gap() -> None:
+    prompt = {
+        "native_thread_mode": "ephemeral",
+        "critical_response_contract": {"lane_review": {"required": True}},
+        "native_output_schema": {
+            "create_blocks": [{"symbol": "BTCUSDT", "entry_price": "required"}],
+            "lane_review": {"required": "mandatory"},
+        },
+        "execution_gate": {"status": "ok"},
+        "account": {"status": "ok", "cash_usdt": 1000.0},
+        "proactive_decision_pressure": {
+            "version": "binance_proactive_decision_pressure_v1",
+            "status": "action_required",
+            "pressure_level": "high",
+            "zero_action_streak": 5,
+            "previous_error_streak": 5,
+            "binance_zero_action_streak": 7,
+            "binance_previous_error_streak": 2,
+            "effective_zero_action_streak": 7,
+            "pressure_source": "binance_activity_gap",
+            "candidate_count": 8,
+            "strong_candidate_count": 8,
+            "growth_governor_mode": "edge_rebuild",
+            "growth_governor_allows_new_blocks": True,
+            "live_grade": "insufficient",
+            "previous_hold_summary": "관망",
+            "binance_market_activity_gap": {
+                "version": "binance_market_activity_gap_v1",
+                "status": "stale_binance_entries",
+                "latest_binance_entry_at": "2026-07-03T05:08:52+00:00",
+                "latest_binance_entry_market": "futures",
+                "latest_upbit_entry_at": "2026-07-06T08:35:20+00:00",
+                "binance_entry_stale_hours": 72.0,
+                "binance_candidate_count": 3,
+                "candidate_markets": ["futures", "spot"],
+                "candidate_symbols": ["ESPUSDT", "BTCUSDT"],
+                "manager_instruction": (
+                    "prefer at least one Binance spot/futures waiting probe"
+                ),
+            },
+            "top_candidates": [
+                {"symbol": "KRW-SOL", "market": "upbit_spot", "reason": "x" * 200}
+            ],
+        },
+    }
+    guard = {
+        "version": "binance_manager_latency_guard_v1",
+        "active": True,
+        "reason": "recent_manager_timeout",
+        "recent_timeout_count": 6,
+        "target_chars": 18_000,
+    }
+
+    recovered = latency_recovery_core_prompt(
+        prompt,
+        latency_guard=guard,
+        original_chars=300_000,
+        label="binance_manager_latency_guard_core",
+    )
+
+    gap = recovered["proactive_decision_pressure"]["binance_market_activity_gap"]
+    pressure = recovered["proactive_decision_pressure"]
+    assert pressure["binance_zero_action_streak"] == 7
+    assert pressure["effective_zero_action_streak"] == 7
+    assert pressure["pressure_source"] == "binance_activity_gap"
+    assert gap["status"] == "stale_binance_entries"
+    assert gap["candidate_symbols"] == ["ESPUSDT", "BTCUSDT"]
+    assert gap["candidate_markets"] == ["futures", "spot"]
 
 
 def test_apply_binance_manager_latency_guard_compacts_priority_policy_context() -> None:
@@ -6990,6 +9460,149 @@ def test_binance_manager_run_diagnostics_flags_unresolved_degraded_wiki_effectiv
         "action_metadata"
     )
     assert "unresolved_degraded_jue_wiki_effectiveness" not in resolved[
+        "blocker_tags"
+    ]
+
+
+def test_binance_manager_contract_accepts_resolved_missing_from_model_contract_id() -> None:
+    prompt = {
+        "jue_wiki": {
+            "pages": [
+                {
+                    "page_id": "binance.risk.trading_validation",
+                    "effectiveness": {
+                        "status": "degraded",
+                        "reasons": ["aggregated_effectiveness_rows:3"],
+                    },
+                }
+            ]
+        },
+        "execution_gate": {
+            "status": "ok",
+            "kill_switch": {"enabled": False},
+            "execution": {"upbit_orders_enabled": True},
+        },
+    }
+    actions = {
+        "create_blocks": [
+            {
+                "symbol": "KRW-SOL",
+                "market": "upbit_spot",
+                "side": "long",
+                "metadata": {
+                    "jue_wiki_repair_resolution": {
+                        "source": "validation_repair_resolution",
+                        "degraded_wiki_page_ids": [
+                            "binance.risk.trading_validation"
+                        ],
+                        "resolution": {
+                            "symbol": "KRW-SOL",
+                            "market": "upbit_spot",
+                            "resolution": "probe_waiting_block",
+                            "memory_contract": (
+                                "manager_contract_error.binance."
+                                "validation_repair_resolution_missing_from_model"
+                            ),
+                            "memory_contract_resolution": (
+                                "cite_memory_and_apply: validation_repair 요구에 "
+                                "따라 waiting/probe, 소액, no scale-up으로 처리했다."
+                            ),
+                            "next_trigger": (
+                                "121516.01 이하 대기 진입, 목표 123460.27, "
+                                "손절 120543.89"
+                            ),
+                        },
+                    }
+                },
+            }
+        ],
+        "update_blocks": [],
+        "close_blocks": [],
+        "pause_blocks": [],
+    }
+
+    error = manager_response_contract_error(
+        prompt=prompt,
+        response={},
+        actions=actions,
+        hold_decision={"summary": "validation repair action metadata recorded"},
+    )
+    diagnostics = manager_run_diagnostics(
+        prompt=prompt,
+        response={},
+        actions=actions,
+        hold_decision={"summary": "validation repair action metadata recorded"},
+    )
+
+    assert error == ""
+    assert diagnostics["degraded_jue_wiki_effectiveness_resolution_status"] == (
+        "action_metadata"
+    )
+
+
+def test_binance_manager_diagnostics_accepts_degraded_wiki_action_resolution_with_negative_evidence_gap() -> None:
+    prompt = {
+        "jue_wiki": {
+            "pages": [
+                {
+                    "page_id": "binance.risk.trading_validation",
+                    "effectiveness": {
+                        "status": "degraded",
+                        "reasons": ["aggregated_effectiveness_rows:3"],
+                    },
+                }
+            ]
+        },
+    }
+    actions = {
+        "create_blocks": [
+            {
+                "symbol": "ESPUSDT",
+                "market": "futures",
+                "side": "short",
+                "metadata": {
+                    "jue_wiki_repair_resolution": {
+                        "source": "validation_repair_resolution",
+                        "degraded_wiki_page_ids": [
+                            "binance.risk.trading_validation"
+                        ],
+                        "resolution": {
+                            "symbol": "ESPUSDT",
+                            "market": "futures",
+                            "resolution": "probe_waiting_block",
+                            "evidence_gap": (
+                                "cost_simulation/monte_carlo repair 미해결이라 "
+                                "즉시·확대 진입은 불가"
+                            ),
+                            "memory_contract_resolution": (
+                                "cite_memory_and_apply: 소액 대기 프로브로만 "
+                                "검증수리 요구를 적용한다."
+                            ),
+                            "next_trigger": (
+                                "가격 0.07156 이상, 스프레드 10bps 이내, "
+                                "펀딩 급변 없음이면 대기 숏 프로브 유효"
+                            ),
+                        },
+                    }
+                },
+            }
+        ],
+        "update_blocks": [],
+        "close_blocks": [],
+        "pause_blocks": [],
+    }
+
+    diagnostics = manager_run_diagnostics(
+        prompt=prompt,
+        response={},
+        actions=actions,
+        hold_decision={"summary": "validation repair action metadata recorded"},
+    )
+
+    assert diagnostics["degraded_jue_wiki_effectiveness_resolution_status"] == (
+        "action_metadata"
+    )
+    assert "unresolved_degraded_jue_wiki_effectiveness" not in diagnostics[
         "blocker_tags"
     ]
 
@@ -11583,6 +14196,377 @@ def test_binance_manager_run_diagnostics_keeps_degraded_wiki_action_response_onl
     assert diagnostics["blocker_tags"]["unresolved_degraded_jue_wiki_effectiveness"] >= 3
 
 
+def test_binance_manager_response_contract_rejects_create_for_non_visible_candidate_symbol() -> None:
+    response = {
+        "create_blocks": [
+            {
+                "symbol": "KRW-SOL",
+                "market": "upbit_spot",
+                "side": "long",
+                "metadata": {
+                    "jue_wiki_repair_resolution": {
+                        "resolution": "probe_waiting_block"
+                    }
+                },
+            }
+        ],
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "KRW-SOL",
+                    "market": "upbit_spot",
+                    "resolution": "probe_waiting_block",
+                    "next_trigger": "KRW-SOL pullback",
+                }
+            ]
+        },
+    }
+    error = manager_response_contract_error(
+        prompt={
+            "candidates": [
+                {"symbol": "ESPUSDT", "market": "futures", "side": "short"},
+                {"symbol": "ZROUSDT", "market": "futures", "side": "long"},
+                {"symbol": "KRW-ZRO", "market": "upbit_spot", "side": "long"},
+            ],
+            "validation_repair": {
+                "status": "needs_repair",
+                "repair_item_count": 1,
+            },
+        },
+        response=response,
+        actions={"create_blocks": response["create_blocks"]},
+        hold_decision={},
+    )
+
+    assert error == "manager_create_candidate_not_visible"
+
+
+def test_binance_manager_response_contract_allows_create_from_proactive_pressure_candidate() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "candidates": [
+                {"symbol": "ESPUSDT", "market": "futures", "side": "short"},
+                {"symbol": "KRW-ZRO", "market": "upbit_spot", "side": "long"},
+            ],
+            "proactive_decision_pressure": {
+                "status": "candidate_present",
+                "top_candidates": [
+                    {
+                        "symbol": "KRW-SOL",
+                        "market": "upbit_spot",
+                        "side": "long",
+                        "horizon": "short",
+                        "entry_price": 120_000,
+                        "target_price": 123_000,
+                        "stop_price": 119_000,
+                    }
+                ],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "execution": {"upbit_orders_enabled": True},
+            },
+        },
+        response={},
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "KRW-SOL",
+                    "market": "upbit_spot",
+                    "side": "long",
+                    "horizon": "short",
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={"summary": "KRW-SOL pressure candidate selected"},
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_allows_no_action_when_all_visible_candidates_rejected_with_repair_evidence() -> None:
+    prompt = {
+        "jue_wiki": {
+            "pages": [
+                {
+                    "page_id": "binance.risk.trading_validation",
+                    "effectiveness": {
+                        "status": "degraded",
+                        "reasons": ["samples:120", "status_mix:futures:degraded"],
+                    },
+                }
+            ]
+        },
+        "jue_wiki_requested_symbol_coverage": {
+            "status": "partial",
+            "missing_summary_symbols": ["AVAXUSDT"],
+            "prompt_omitted_symbols": ["AAVEUSDT", "AVAXUSDT"],
+        },
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+        },
+        "candidates": [
+            {"symbol": "ESPUSDT", "market": "futures", "side": "short"},
+            {"symbol": "KRW-AVAX", "market": "upbit_spot", "side": "long"},
+        ],
+    }
+    response = {
+        "validation_repair_resolution": {
+            "blanket_hold_allowed": False,
+            "resolved_candidates": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "resolution": "candidate_rejected",
+                    "evidence_gap": (
+                        "stop risk exceeds validation max and pattern prior missing"
+                    ),
+                    "memory_contract_resolution": (
+                        "reject_memory_with_reason: validation repair requires "
+                        "cost/depth/funding evidence before a futures probe"
+                    ),
+                    "next_trigger": (
+                        "entry >= 0.07156 with stop risk <= 3%, RR >= 2, "
+                        "fresh depth and funding evidence"
+                    ),
+                },
+                {
+                    "symbol": "KRW-AVAX",
+                    "market": "upbit_spot",
+                    "resolution": "candidate_rejected",
+                    "evidence_gap": (
+                        "confidence below waiting threshold and RR below validation min"
+                    ),
+                    "memory_contract_resolution": (
+                        "reject_memory_with_reason: degraded AVAX summary and weak "
+                        "reward/risk keep the candidate in watch-only mode"
+                    ),
+                    "next_trigger": (
+                        "waiting entry recalculated with confidence >= 0.58, "
+                        "RR >= 2, and refreshed AVAX summary"
+                    ),
+                },
+            ],
+        }
+    }
+
+    error = manager_response_contract_error(
+        prompt=prompt,
+        response=response,
+        actions={"create_blocks": [], "update_blocks": [], "close_blocks": []},
+        hold_decision={},
+    )
+    diagnostics = manager_run_diagnostics(
+        prompt=prompt,
+        response=response,
+        actions={"create_blocks": [], "update_blocks": [], "close_blocks": []},
+        hold_decision={},
+    )
+
+    assert error == ""
+    assert diagnostics["degraded_jue_wiki_effectiveness_resolution_status"] == (
+        "response_resolution"
+    )
+    assert diagnostics["jue_wiki_requested_symbol_coverage_resolution_status"] == (
+        "response_resolution"
+    )
+
+
+def test_binance_manager_response_contract_allows_candidate_rejection_with_existing_position_actions() -> None:
+    prompt = {
+        "jue_wiki": {
+            "pages": [
+                {
+                    "page_id": "binance.risk.trading_validation",
+                    "effectiveness": {
+                        "status": "degraded",
+                        "reasons": ["samples:120", "status_mix:futures:degraded"],
+                    },
+                }
+            ]
+        },
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+        },
+        "candidates": [
+            {"symbol": "ESPUSDT", "market": "futures", "side": "short"},
+            {"symbol": "HMSTRUSDT", "market": "futures", "side": "short"},
+        ],
+    }
+    response = {
+        "validation_repair_resolution": {
+            "blanket_hold_allowed": False,
+            "resolved_candidates": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "resolution": "candidate_rejected",
+                    "evidence_gap": (
+                        "pattern prior missing and stop risk exceeds validation cap"
+                    ),
+                    "memory_contract_resolution": (
+                        "reject_memory_with_reason: keep the candidate watch-only "
+                        "until validation repair evidence is refreshed"
+                    ),
+                    "next_trigger": (
+                        "entry >= 0.07156 with stop risk <= 3%, RR >= 2, "
+                        "fresh depth and funding evidence"
+                    ),
+                },
+                {
+                    "symbol": "HMSTRUSDT",
+                    "market": "futures",
+                    "resolution": "candidate_rejected",
+                    "evidence_gap": (
+                        "stop risk exceeds validation cap and pattern prior is absent"
+                    ),
+                    "memory_contract_resolution": (
+                        "reject_memory_with_reason: do not create a volatile probe "
+                        "until the risk geometry is repaired"
+                    ),
+                    "next_trigger": (
+                        "entry >= 0.000209 with stop risk <= 3%, RR >= 2, "
+                        "and pattern prior confirmed"
+                    ),
+                },
+            ],
+        }
+    }
+    actions = {
+        "adopt_existing_blocks": [
+            {
+                "symbol": "JTOUSDT",
+                "market": "spot",
+                "side": "long",
+                "reason": "adopt unmanaged wallet dust into the ledger",
+            }
+        ],
+        "create_blocks": [],
+        "update_blocks": [],
+        "close_blocks": [
+            {
+                "block_id": "xrp-stale",
+                "reason": "close stale block below stop",
+            }
+        ],
+        "pause_blocks": [],
+    }
+
+    error = manager_response_contract_error(
+        prompt=prompt,
+        response=response,
+        actions=actions,
+        hold_decision={},
+    )
+    diagnostics = manager_run_diagnostics(
+        prompt=prompt,
+        response=response,
+        actions=actions,
+        hold_decision={},
+    )
+
+    assert error == ""
+    assert diagnostics["degraded_jue_wiki_effectiveness_resolution_status"] == (
+        "response_resolution"
+    )
+    assert "unresolved_degraded_jue_wiki_effectiveness" not in diagnostics[
+        "blocker_tags"
+    ]
+
+
+def test_binance_manager_response_contract_allows_no_action_with_price_geometry_update_repair_evidence() -> None:
+    prompt = {
+        "jue_wiki": {
+            "pages": [
+                {
+                    "page_id": "binance.risk.trading_validation",
+                    "effectiveness": {
+                        "status": "degraded",
+                        "reasons": ["samples:120"],
+                    },
+                }
+            ]
+        },
+        "jue_wiki_requested_symbol_coverage": {
+            "status": "partial",
+            "missing_summary_symbols": ["AAVEUSDT"],
+            "unsummarized_symbols": ["AAVEUSDT"],
+        },
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+        },
+        "candidates": [
+            {"symbol": "ESPUSDT", "market": "futures", "side": "short"},
+            {"symbol": "KRW-ZRO", "market": "upbit_spot", "side": "long"},
+        ],
+    }
+    response = {
+        "validation_repair_resolution": {
+            "blanket_hold_allowed": False,
+            "resolved_candidates": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "resolution": "updated_price_geometry",
+                    "evidence_gap": (
+                        "pattern_live_crosscheck=no_pattern_prior and stop risk "
+                        "5.17% exceeds validation max_stop_risk_pct 3.0"
+                    ),
+                    "memory_contract_resolution": (
+                        "wait_until_memory_refresh: validation repair 기준으로 "
+                        "가격 구조만 재계산하고 신규 블록은 보류합니다."
+                    ),
+                    "next_trigger": (
+                        "가격이 0.07307 이상이고 stop 0.075262 대비 손절폭이 "
+                        "3% 이내, target 0.06397 기준 RR>=2이면 재검토"
+                    ),
+                },
+                {
+                    "symbol": "KRW-ZRO",
+                    "market": "upbit_spot",
+                    "resolution": "candidate_rejected",
+                    "evidence_gap": "confidence 0.47 below waiting threshold",
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: memory contract를 반영해 저신뢰 "
+                        "후보를 신규 블록으로 승격하지 않음."
+                    ),
+                    "next_trigger": (
+                        "entry<=1499.51, confidence>=0.58, spread<=25bps이면 "
+                        "소액 waiting probe 재검토"
+                    ),
+                },
+            ],
+        }
+    }
+
+    error = manager_response_contract_error(
+        prompt=prompt,
+        response=response,
+        actions={"create_blocks": [], "update_blocks": [], "close_blocks": []},
+        hold_decision={},
+    )
+    diagnostics = manager_run_diagnostics(
+        prompt=prompt,
+        response=response,
+        actions={"create_blocks": [], "update_blocks": [], "close_blocks": []},
+        hold_decision={},
+    )
+
+    assert error == ""
+    assert diagnostics["degraded_jue_wiki_effectiveness_resolution_status"] == (
+        "response_resolution"
+    )
+    assert diagnostics["jue_wiki_requested_symbol_coverage_resolution_status"] == (
+        "response_resolution"
+    )
+
+
 def test_binance_manager_response_contract_rejects_unresolved_requested_symbol_coverage() -> None:
     error = manager_response_contract_error(
         prompt={
@@ -11665,6 +14649,52 @@ def test_binance_manager_response_contract_rejects_requested_symbol_coverage_tri
     assert error == "validation_repair_resolution_missing_from_model"
 
 
+def test_binance_manager_response_contract_allows_validation_repair_hold_with_unrelated_requested_symbol_coverage() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {
+                "scope": "binance",
+                "status": "needs_repair",
+                "repair_item_count": 1,
+                "constraint_count": 1,
+            },
+            "jue_wiki_requested_symbol_coverage": {
+                "status": "partial",
+                "hard_blocker": False,
+                "prompt_omitted_symbols": ["AAVEUSDT", "ASTERUSDT"],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "execution": {"spot_orders_enabled": True},
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": (
+                            "pattern prior is missing and stop risk exceeds "
+                            "the validation repair limit"
+                        ),
+                        "next_trigger": (
+                            "wait for fresh pattern prior, spread <= 10bps, "
+                            "and stop risk <= 3% before reconsidering"
+                        ),
+                    }
+                ]
+            },
+            "hold_decision": {"summary": "관망"},
+        },
+        actions={"create_blocks": [], "update_blocks": [], "close_blocks": []},
+        hold_decision={"summary": "관망"},
+    )
+
+    assert error == ""
+
+
 def test_binance_manager_response_contract_rejects_action_with_unresolved_requested_symbol_coverage() -> None:
     error = manager_response_contract_error(
         prompt={
@@ -11704,6 +14734,73 @@ def test_binance_manager_response_contract_rejects_action_with_unresolved_reques
             "pause_blocks": [],
         },
         hold_decision={"summary": "created unrelated wiki repair action"},
+    )
+
+    assert error == "validation_repair_resolution_missing_from_model"
+
+
+def test_binance_manager_response_contract_allows_unrelated_action_for_non_hard_requested_symbol_coverage() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "jue_wiki_requested_symbol_coverage": {
+                "status": "partial",
+                "hard_blocker": False,
+                "missing_summary_symbols": ["ETHUSDT"],
+                "prompt_omitted_symbols": ["SOLUSDT"],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "execution": {"spot_orders_enabled": True},
+            },
+        },
+        response={},
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "metadata": {},
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={"summary": "created unrelated action"},
+    )
+
+    assert error == ""
+
+
+def test_binance_manager_response_contract_keeps_hard_requested_symbol_coverage_blocking_unrelated_action() -> None:
+    error = manager_response_contract_error(
+        prompt={
+            "jue_wiki_requested_symbol_coverage": {
+                "status": "partial",
+                "hard_blocker": True,
+                "missing_summary_symbols": ["ETHUSDT"],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "execution": {"spot_orders_enabled": True},
+            },
+        },
+        response={},
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "metadata": {},
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={"summary": "created unrelated action"},
     )
 
     assert error == "validation_repair_resolution_missing_from_model"
@@ -11970,6 +15067,77 @@ def test_binance_manager_run_diagnostics_tags_unresolved_requested_symbol_covera
     assert diagnostics["blocker_tags"]["unresolved_jue_wiki_requested_symbol_coverage"] >= 2
     assert diagnostics["jue_wiki_requested_symbol_coverage_status"] == "partial"
     assert diagnostics["jue_wiki_missing_summary_symbols"] == ["ETHUSDT"]
+
+
+def test_binance_manager_run_diagnostics_clears_unrelated_non_hard_requested_symbol_coverage_action() -> None:
+    diagnostics = manager_run_diagnostics(
+        prompt={
+            "jue_wiki_requested_symbol_coverage": {
+                "status": "partial",
+                "hard_blocker": False,
+                "missing_summary_symbols": ["ETHUSDT"],
+                "prompt_omitted_symbols": ["SOLUSDT"],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "execution": {"spot_orders_enabled": True},
+            },
+        },
+        response={},
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "metadata": {},
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={"summary": "created unrelated action"},
+    )
+
+    assert "unresolved_jue_wiki_requested_symbol_coverage" not in diagnostics[
+        "blocker_tags"
+    ]
+    assert diagnostics["jue_wiki_requested_symbol_coverage_status"] == "partial"
+
+
+def test_binance_manager_run_diagnostics_keeps_hard_requested_symbol_coverage_blocking_unrelated_action() -> None:
+    diagnostics = manager_run_diagnostics(
+        prompt={
+            "jue_wiki_requested_symbol_coverage": {
+                "status": "partial",
+                "hard_blocker": True,
+                "missing_summary_symbols": ["ETHUSDT"],
+            },
+            "execution_gate": {
+                "status": "ok",
+                "execution": {"spot_orders_enabled": True},
+            },
+        },
+        response={},
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "metadata": {},
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={"summary": "created unrelated action"},
+    )
+
+    assert diagnostics["blocker_tags"]["unresolved_jue_wiki_requested_symbol_coverage"] >= 2
+    assert diagnostics["jue_wiki_requested_symbol_coverage_status"] == "partial"
 
 
 def test_binance_manager_run_diagnostics_reads_nested_jue_wiki_requested_symbol_coverage() -> None:
@@ -13381,6 +16549,58 @@ def test_manager_prompt_storage_emergency_payload_prioritizes_action_candidates(
         if isinstance(row, dict)
     ]
     assert "jue_wiki_usage_contract_resolution" in contract_ids
+
+
+def test_manager_prompt_storage_emergency_payload_prioritizes_proactive_pressure_candidates() -> None:
+    payload = {
+        "prompt_budget": {"total_chars": 120_000},
+        "critical_response_contract": {
+            "create_blocks_candidate_visibility": {
+                "required": True,
+                "instruction": "use visible candidates only",
+            }
+        },
+        "proactive_decision_pressure": {
+            "status": "candidate_present",
+            "top_candidates": [
+                {
+                    "symbol": "KRW-SOL",
+                    "market": "upbit_spot",
+                    "side": "long",
+                    "horizon": "short",
+                    "score": 78,
+                    "confidence": 0.58,
+                }
+            ],
+        },
+        "candidates": [
+            {"symbol": "BTCUSDT", "market": "spot", "side": "long"},
+            {"symbol": "ETHUSDT", "market": "futures", "side": "long"},
+            {"symbol": "ESPUSDT", "market": "futures", "side": "short"},
+            {"symbol": "KRW-ZRO", "market": "upbit_spot", "side": "long"},
+            {
+                "symbol": "KRW-SOL",
+                "market": "upbit_spot",
+                "side": "long",
+                "horizon": "short",
+                "reason_md": "proactive pressure candidate " * 20,
+            },
+        ],
+        "memory": {"blob": "M" * 60_000},
+        "jue_wiki_application": {"blob": "W" * 60_000},
+    }
+
+    compact = manager_prompt_storage_emergency_payload(
+        payload,
+        limit=1_500,
+        label="binance_manager_prompt_runtime",
+        original_chars=120_000,
+        retained_keys=list(payload.keys()),
+        compact_value=compact_prompt_value_bounded,
+    )
+
+    rows = compact["candidates"]["items"]
+    assert any(row.get("symbol") == "KRW-SOL" for row in rows)
 
 
 def test_manager_prompt_storage_emergency_payload_falls_back_when_still_too_large() -> None:

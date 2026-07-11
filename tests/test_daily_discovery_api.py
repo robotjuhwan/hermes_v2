@@ -71,7 +71,8 @@ def test_daily_discovery_status_shape_with_admin_token(monkeypatch) -> None:
     expected_limit = min(
         max(
             int(main.settings.daily_discovery_kospi_count)
-            + int(main.settings.daily_discovery_kosdaq_count),
+            + int(main.settings.daily_discovery_kosdaq_count)
+            + int(main.settings.daily_discovery_etf_count),
             10,
         ),
         120,
@@ -87,6 +88,7 @@ def test_daily_discovery_status_shape_with_admin_token(monkeypatch) -> None:
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["config"]["kospi_count"] == main.settings.daily_discovery_kospi_count
+    assert payload["config"]["etf_count"] == main.settings.daily_discovery_etf_count
     assert payload["latest"]["trading_day"] == "2026-05-21"
     assert fake.calls == [{"method": "latest_context", "limit": expected_limit}]
 

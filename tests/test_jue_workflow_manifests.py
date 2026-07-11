@@ -89,9 +89,9 @@ def test_workflow_model_policy_matches_jue_split() -> None:
     kis = registry.compile_prompt_pack("kis_intraday_manager")
     binance = registry.compile_prompt_pack("binance_cycle")
 
-    assert kis["model_policy"]["expected_runtime_model"] == "gpt-5.5"
+    assert kis["model_policy"]["expected_runtime_model"] == "gpt-5.6-sol"
     assert kis["model_policy"]["expected_reasoning_effort"] == "xhigh"
-    assert binance["model_policy"]["expected_runtime_model"] == "gpt-5.5"
+    assert binance["model_policy"]["expected_runtime_model"] == "gpt-5.6-sol"
     assert binance["model_policy"]["expected_reasoning_effort"] == "xhigh"
 
 

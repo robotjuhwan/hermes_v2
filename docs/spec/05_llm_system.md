@@ -4,22 +4,29 @@
 
 | Area | Intended Model | Reasoning | Role |
 | --- | --- | --- | --- |
-| KIS 쥬 | GPT-5.5 | xhigh when configured | Korean equities block manager, memory, strategy synthesis. |
-| Binance 쥬 | GPT-5.5 | xhigh when configured | 24h crypto block manager with compact quant/research context. |
-| Memory | GPT-5.5 unless configured otherwise | configured | Journals, reflection, policy updates, context compression. |
-| Research/Report Intelligence | GPT-5.5 unless configured otherwise | configured | Report interpretation, strategy intelligence, RAG summaries. |
+| KIS/Binance critical | GPT-5.6 Sol | xhigh | Korean equities and 24h crypto block-manager decisions. |
+| Market Judge | GPT-5.6 Sol | xhigh | Live market-state and trading-authority judgment. |
+| Memory/Research | GPT-5.6 Terra | high | Journals, reflection, symbol analysis, discovery, strategy and RAG synthesis. |
+| Report extraction | GPT-5.6 Luna | medium | Structured fact extraction, repetitive summary and classification. |
+| Offline policy/lab | GPT-5.6 Sol | max | Weekly/monthly policy revision and verified code-lab work. |
 
-`src/tradecraft/services/codex_native.py` defaults to `gpt-5.5` and `xhigh`.
+`src/tradecraft/services/llm_model_policy.py` selects GPT-5.6 by role. Critical
+trading decisions use `gpt-5.6-sol` with `xhigh`, research and memory synthesis
+use `gpt-5.6-terra` with `high`, and extraction/summary work uses
+`gpt-5.6-luna` with `medium`.
 `src/tradecraft/config.py` exposes the global native runtime values through
 `TRADECRAFT_LLM_MODEL`, `TRADECRAFT_LLM_REASONING_EFFORT`, and
-`TRADECRAFT_CODEX_NATIVE_TIMEOUT_MS`. KIS 쥬 uses the shared native model, so
-GPT-5.5/xhigh is the configured intent unless those environment settings change.
+`TRADECRAFT_CODEX_NATIVE_TIMEOUT_MS`. The shared fields are retained as the
+critical KIS/Market Judge compatibility override; reasoning, utility, and
+offline tiers have separate model and effort settings.
 Binance 쥬 has venue-specific model settings:
 `TRADECRAFT_BINANCE_BLOCK_TRADER_LLM_MODEL` defaults to
-`gpt-5.5`, and
+`gpt-5.6-sol`, and
 `TRADECRAFT_BINANCE_BLOCK_TRADER_LLM_REASONING_EFFORT` defaults to `xhigh`.
-The crypto research and alpha runners also default their LLM model fields to
-`gpt-5.5` with `xhigh`.
+Crypto research defaults to `gpt-5.6-terra` with `high`; crypto alpha utility
+work defaults to `gpt-5.6-luna` with `medium`. Weekly/monthly policy revision is
+the only memory path promoted to `gpt-5.6-sol` with `max`; live trading never
+uses `max`.
 
 ## Jue Workflow Registry
 

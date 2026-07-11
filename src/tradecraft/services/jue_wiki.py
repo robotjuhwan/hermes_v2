@@ -8,9 +8,27 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from tradecraft.services.daily_discovery import enrich_discovery_result
+from tradecraft.services.jue_wiki_context import JueWikiContextService
+from tradecraft.services.jue_wiki_contract import (
+    WikiContextPacketV1,
+    WikiContextRequestV1,
+)
+from tradecraft.services.jue_wiki_repair_health import (
+    WikiRepairHealthPolicy,
+    evaluate_repair_queue_health,
+)
+from tradecraft.services.jue_wiki_repair_lanes import classify_repair_action
+from tradecraft.services.jue_wiki_repository import JueWikiRepository
+from tradecraft.services.jue_wiki_selection_audit import JueWikiSelectionAuditStore
+from tradecraft.services.ops_section_snapshot import (
+    OPS_SECTION_SNAPSHOT_VERSION,
+    OpsSectionSnapshotV1,
+    persist_ops_section_snapshot,
+    read_ops_section_snapshot,
+)
 
 
 WIKI_SECTION_ORDER = [
@@ -87,6 +105,10 @@ class JueWikiConfig:
     context_max_chars: int = 24000
     page_max_chars: int = 12000
     context_page_limit: int = 8
+    repair_overdue_sec: int = 86_400
+    repair_stall_sec: int = 21_600
+    repair_growth_window_sec: int = 86_400
+    repair_growth_warn_count: int = 25
     kis_blocks_db_path: Path | None = None
     binance_blocks_db_path: Path | None = None
     investment_memory_db_path: Path | None = None
@@ -102,10 +124,17 @@ class JueWikiConfig:
     crypto_quant_db_path: Path | None = None
     crypto_pattern_lab_db_path: Path | None = None
     crypto_alpha_db_path: Path | None = None
+    cold_archive_root: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "root_path", Path(self.root_path))
         object.__setattr__(self, "db_path", Path(self.db_path))
+        if self.cold_archive_root is not None:
+            object.__setattr__(
+                self,
+                "cold_archive_root",
+                Path(self.cold_archive_root),
+            )
         if self.kis_blocks_db_path is not None:
             object.__setattr__(
                 self,
@@ -271,6 +300,8 @@ class JueWikiDataIntegrityError(RuntimeError):
 
 
 class JueWikiService:
+    OPS_SNAPSHOT_SECTION = "jue_wiki"
+
     def __init__(
         self,
         config: JueWikiConfig,
@@ -283,6 +314,23 @@ class JueWikiService:
         self.rag_store = rag_store
         self.etf_research_provider = etf_research_provider
         self.crypto_market_research_provider = crypto_market_research_provider
+
+    def repository(self) -> JueWikiRepository:
+        return JueWikiRepository(self.config.db_path)
+
+    def selection_audit_store(self) -> JueWikiSelectionAuditStore:
+        cold_root = self.config.cold_archive_root
+        if cold_root is None:
+            runtime_root = next(
+                (
+                    parent
+                    for parent in self.config.db_path.parents
+                    if parent.name == ".runtime"
+                ),
+                self.config.db_path.parent,
+            )
+            cold_root = runtime_root.parent / ".runtime-cold-archive"
+        return JueWikiSelectionAuditStore(self.config.db_path, cold_root)
 
     def initialize(self) -> dict[str, Any]:
         self.config.root_path.mkdir(parents=True, exist_ok=True)
@@ -623,70 +671,20 @@ class JueWikiService:
         now = _utc_now_iso()
         clean_scope = _normalize_scope(target_scope)
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO wiki_selection_runs (
-                    run_id, target_scope, request_json, budget_report_json, selected_count,
-                    rejected_count, char_count, max_chars, status,
-                    error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    target_scope,
-                    _json_dumps(request),
-                    _json_dumps(budget_report or {}),
-                    len(selected_pages),
-                    len(rejected_pages),
-                    int(char_count),
-                    int(max_chars),
-                    status,
-                    error_message,
-                    now,
-                ),
+            self.selection_audit_store().record_run(
+                conn,
+                run_id=run_id,
+                target_scope=target_scope,
+                request=request,
+                budget_report=budget_report or {},
+                selected_pages=selected_pages,
+                rejected_pages=rejected_pages,
+                char_count=char_count,
+                max_chars=max_chars,
+                status=status,
+                error_message=error_message,
+                created_at=now,
             )
-            conn.execute(
-                "DELETE FROM wiki_selection_pages WHERE run_id = ?",
-                (run_id,),
-            )
-            for page in selected_pages:
-                conn.execute(
-                    """
-                    INSERT INTO wiki_selection_pages (
-                        run_id, page_id, rank, score, reasons_json,
-                        penalties_json, char_count, included, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
-                    """,
-                    (
-                        run_id,
-                        str(page.get("page_id") or ""),
-                        int(page.get("rank") or 0),
-                        float(page.get("score") or 0.0),
-                        _json_dumps(page.get("reasons") or []),
-                        _json_dumps(page.get("penalties") or []),
-                        int(page.get("char_count") or 0),
-                        now,
-                    ),
-                )
-            for page in rejected_pages:
-                conn.execute(
-                    """
-                    INSERT INTO wiki_selection_pages (
-                        run_id, page_id, rank, score, reasons_json,
-                        penalties_json, char_count, included, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
-                    """,
-                    (
-                        run_id,
-                        str(page.get("page_id") or ""),
-                        int(page.get("rank") or 0),
-                        float(page.get("score") or 0.0),
-                        _json_dumps(page.get("reasons") or []),
-                        _json_dumps(page.get("penalties") or [page.get("reason")]),
-                        int(page.get("char_count") or 0),
-                        now,
-                    ),
-                )
             self._record_requested_symbol_coverage_repairs(
                 conn,
                 run_id=run_id,
@@ -756,6 +754,7 @@ class JueWikiService:
         missing_count = int(
             budget_report.get("requested_symbol_missing_summary_count") or len(symbols)
         )
+        summary_lane = classify_repair_action("refresh_requested_symbol_summary")
         for symbol in dict.fromkeys(symbols):
             page_id = self.page_id(scope=clean_scope, page_type="symbol", key=symbol)
             action_id = f"repair:coverage:{clean_scope}:{symbol}"
@@ -804,15 +803,18 @@ class JueWikiService:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO wiki_repair_actions (
-                    action_id, finding_id, page_id, action_type, status,
+                    action_id, finding_id, page_id, action_type,
+                    repair_lane, repair_lane_registered, status,
                     details_json, created_at, finished_at, error_message
-                ) VALUES (?, ?, ?, ?, 'scheduled', ?, ?, '', '')
+                ) VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, '', '')
                 """,
                 (
                     action_id,
                     finding_id,
                     page_id,
                     "refresh_requested_symbol_summary",
+                    summary_lane.lane,
+                    int(summary_lane.registered),
                     _json_dumps(details),
                     created_at,
                 ),
@@ -895,15 +897,18 @@ class JueWikiService:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO wiki_repair_actions (
-                    action_id, finding_id, page_id, action_type, status,
+                    action_id, finding_id, page_id, action_type,
+                    repair_lane, repair_lane_registered, status,
                     details_json, created_at, finished_at, error_message
-                ) VALUES (?, ?, ?, ?, 'scheduled', ?, ?, '', '')
+                ) VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, '', '')
                 """,
                 (
                     action_id,
                     finding_id,
                     page_id,
                     "refresh_requested_symbol_summary",
+                    summary_lane.lane,
+                    int(summary_lane.registered),
                     _json_dumps(details),
                     created_at,
                 ),
@@ -1014,18 +1019,22 @@ class JueWikiService:
                         ],
                         "requires_manager_confirmation": True,
                     }
+                    lane = classify_repair_action(action_type)
                     conn.execute(
                         """
                         INSERT OR REPLACE INTO wiki_repair_actions (
-                            action_id, finding_id, page_id, action_type, status,
+                            action_id, finding_id, page_id, action_type,
+                            repair_lane, repair_lane_registered, status,
                             details_json, created_at, finished_at, error_message
-                        ) VALUES (?, ?, ?, ?, 'scheduled', ?, ?, '', '')
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, '', '')
                         """,
                         (
                             action_id,
                             finding_id,
                             page_id,
                             action_type,
+                            lane.lane,
+                            int(lane.registered),
                             _json_dumps(details),
                             created_at,
                         ),
@@ -1047,7 +1056,7 @@ class JueWikiService:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT action_id, page_id, action_type, details_json
+                SELECT action_id, finding_id, page_id, action_type, details_json
                 FROM wiki_repair_actions
                 WHERE status IN ('scheduled', 'unresolved')
                 ORDER BY created_at ASC, action_id ASC
@@ -1105,10 +1114,13 @@ class JueWikiService:
                         break
                 if resolved_row is None:
                     continue
-                resolved_details = {
-                    **details,
-                    "resolved_by": "manager_context_evidence_quality_recovered",
-                    "resolved_at": now,
+                repair_identity = self._repair_identity(
+                    finding_id=str(row["finding_id"] or ""),
+                    page_id=str(row["page_id"] or ""),
+                    action_type=str(row["action_type"] or ""),
+                    details=details,
+                )
+                resolution_details = {
                     "resolved_symbol": resolved_symbol,
                     "resolved_manager_run_id": str(
                         resolved_row.get("manager_run_id") or ""
@@ -1129,25 +1141,14 @@ class JueWikiService:
                     ),
                     "resolved_warnings": list(details.get("quality_warnings") or []),
                 }
-                conn.execute(
-                    """
-                    UPDATE wiki_repair_actions
-                    SET status = 'resolved',
-                        finished_at = CASE
-                            WHEN COALESCE(finished_at, '') = '' THEN ?
-                            ELSE finished_at
-                        END,
-                        details_json = ?
-                    WHERE action_id = ?
-                      AND status IN ('scheduled', 'unresolved')
-                    """,
-                    (
-                        now,
-                        _json_dumps(resolved_details),
-                        action_id,
-                    ),
+                resolved_rows = self._resolve_repair_identity_in_connection(
+                    conn,
+                    repair_identity=repair_identity,
+                    resolved_by="manager_context_evidence_quality_recovered",
+                    resolved_at=now,
+                    resolution_details=resolution_details,
                 )
-                resolved += 1
+                resolved += len(resolved_rows)
         return resolved
 
     @classmethod
@@ -1184,6 +1185,29 @@ class JueWikiService:
         return strong_count > 0
 
     def status(self) -> dict[str, Any]:
+        snapshot = read_ops_section_snapshot(
+            self.config.db_path,
+            section=self.OPS_SNAPSHOT_SECTION,
+        )
+        if snapshot is None:
+            return {
+                "status": "unavailable",
+                "enabled": bool(self.config.enabled),
+                "root_path": str(self.config.root_path),
+                "db_path": str(self.config.db_path),
+                "snapshot_version": OPS_SECTION_SNAPSHOT_VERSION,
+                "snapshot_section": self.OPS_SNAPSHOT_SECTION,
+                "reason": "ops_snapshot_missing",
+            }
+        return dict(snapshot.payload)
+
+    def project_status_snapshot(
+        self,
+        *,
+        v3_run_results: Mapping[str, Mapping[str, Any]] | None = None,
+        active_read_mode: str | None = None,
+        mode_eligibility: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
             rows = conn.execute(
@@ -1200,7 +1224,33 @@ class JueWikiService:
             JueWikiApplicationService,
         )
 
-        return {
+        previous_snapshot = read_ops_section_snapshot(
+            self.config.db_path,
+            section=self.OPS_SNAPSHOT_SECTION,
+        )
+        previous_v3 = (
+            previous_snapshot.payload.get("v3", {})
+            if previous_snapshot is not None
+            and isinstance(previous_snapshot.payload.get("v3"), dict)
+            else {}
+        )
+        v3_status = self._v3_status_projection(
+            repair_backlog_count=int(health["repair_queue"].get("open_count") or 0),
+            repair_backlog_by_scope={
+                scope: int(row.get("open_count") or 0)
+                for scope, row in (
+                    health["repair_queue"].get("by_scope") or {}
+                ).items()
+                if isinstance(row, Mapping)
+            }
+            if isinstance(health["repair_queue"].get("by_scope"), Mapping)
+            else {},
+            run_results=v3_run_results,
+            previous_status=previous_v3,
+            active_read_mode=active_read_mode,
+            mode_eligibility=mode_eligibility,
+        )
+        payload = {
             "status": "ok",
             "enabled": bool(self.config.enabled),
             "root_path": str(self.config.root_path),
@@ -1209,8 +1259,312 @@ class JueWikiService:
             "scopes": scopes,
             "research_coverage": self._research_coverage_status(),
             "application": JueWikiApplicationService(self).status(),
+            "v3": v3_status,
             **health,
         }
+        generated_at = _utc_now_iso()
+        payload["ops_snapshot"] = {
+            "version": OPS_SECTION_SNAPSHOT_VERSION,
+            "section": self.OPS_SNAPSHOT_SECTION,
+            "generated_at": generated_at,
+        }
+        with self._connect() as conn:
+            persist_ops_section_snapshot(
+                conn,
+                OpsSectionSnapshotV1(
+                    section=self.OPS_SNAPSHOT_SECTION,
+                    generated_at=generated_at,
+                    payload=payload,
+                ),
+            )
+        return payload
+
+    def _v3_status_projection(
+        self,
+        *,
+        repair_backlog_count: int,
+        repair_backlog_by_scope: Mapping[str, int] | None = None,
+        run_results: Mapping[str, Mapping[str, Any]] | None,
+        previous_status: Mapping[str, Any],
+        active_read_mode: str | None = None,
+        mode_eligibility: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        repository = self.repository()
+        published_by_scope: dict[str, str] = {}
+        claim_status_counts: dict[str, int] = {}
+        stale_count = 0
+        conflicted_count = 0
+        orphan_page_count = 0
+        scope_health: dict[str, dict[str, Any]] = {}
+        for scope in ("kis", "binance"):
+            try:
+                snapshot = repository.current_snapshot(scope)
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+                snapshot = None
+            published_by_scope[scope] = snapshot.snapshot_id if snapshot else ""
+            if snapshot is None:
+                scope_health[scope] = {
+                    "snapshot_id": "",
+                    "snapshot_created_at": "",
+                    "snapshot_age_sec": 0,
+                    "stale_count": 0,
+                    "conflicted_count": 0,
+                    "orphan_page_count": 0,
+                    "repair_backlog_count": int(
+                        (repair_backlog_by_scope or {}).get(scope, 0)
+                    ),
+                }
+                continue
+            scope_stale_count = 0
+            scope_conflicted_count = 0
+            scope_orphan_page_count = 0
+            for page in snapshot.pages:
+                if not page.claims:
+                    orphan_page_count += 1
+                    scope_orphan_page_count += 1
+                for claim in page.claims:
+                    claim_status_counts[claim.status] = (
+                        claim_status_counts.get(claim.status, 0) + 1
+                    )
+                    stale_count += int(claim.status == "stale")
+                    conflicted_count += int(claim.status == "conflicted")
+                    scope_stale_count += int(claim.status == "stale")
+                    scope_conflicted_count += int(claim.status == "conflicted")
+            try:
+                created_at = datetime.fromisoformat(
+                    str(snapshot.created_at).replace("Z", "+00:00")
+                )
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                snapshot_age_sec = max(
+                    int((datetime.now(timezone.utc) - created_at).total_seconds()),
+                    0,
+                )
+            except ValueError:
+                snapshot_age_sec = -1
+            scope_health[scope] = {
+                "snapshot_id": snapshot.snapshot_id,
+                "snapshot_created_at": snapshot.created_at,
+                "snapshot_age_sec": snapshot_age_sec,
+                "stale_count": scope_stale_count,
+                "conflicted_count": scope_conflicted_count,
+                "orphan_page_count": scope_orphan_page_count,
+                "repair_backlog_count": int(
+                    (repair_backlog_by_scope or {}).get(scope, 0)
+                ),
+            }
+
+        def stage_status(stage: str, default: str) -> str:
+            if not run_results:
+                return default
+            statuses = {
+                str(result.get(stage, {}).get("status") or "").lower()
+                for result in run_results.values()
+            }
+            completed_statuses = statuses & {"ok", "warning", "error"}
+            for completed_status in ("error", "warning", "ok"):
+                if completed_status in completed_statuses:
+                    return completed_status
+            if default in {"ok", "warning", "error"}:
+                return default
+            if "skipped" in statuses:
+                return "skipped"
+            return default
+
+        has_published = any(published_by_scope.values())
+        previous_compile_status = str(
+            previous_status.get("last_compile_status") or ""
+        )
+        previous_ingest_status = str(
+            previous_status.get("last_ingest_status") or ""
+        )
+        previous_lint_status = str(
+            previous_status.get("last_lint_status") or ""
+        )
+        previous_publish_status = str(
+            previous_status.get("last_publish_status") or ""
+        )
+        previous_projection_status = str(
+            previous_status.get("last_projection_status") or ""
+        )
+        def normalized_warnings(value: Any) -> list[str]:
+            rows = value if isinstance(value, (list, tuple, set)) else ()
+            return sorted(
+                {str(warning) for warning in rows if str(warning).strip()}
+            )
+
+        scopes = ("kis", "binance")
+        previous_flat_warnings = normalized_warnings(
+            previous_status.get("cleanup_warnings", ())
+        )
+        raw_previous_by_scope = previous_status.get("cleanup_warnings_by_scope")
+        previous_by_scope = (
+            raw_previous_by_scope
+            if isinstance(raw_previous_by_scope, Mapping)
+            else {}
+        )
+        cleanup_warnings_by_scope: dict[str, list[str]] = {}
+        for scope in scopes:
+            scope_warnings = normalized_warnings(previous_by_scope.get(scope, ()))
+            if scope not in previous_by_scope and previous_flat_warnings:
+                scope_warnings = list(previous_flat_warnings)
+            result = (run_results or {}).get(scope, {})
+            projection_status = str(
+                result.get("v3_projection", {}).get("status") or ""
+            ).lower()
+            if projection_status in {"ok", "warning"}:
+                scope_warnings = normalized_warnings(
+                    result.get("cleanup_warnings", ())
+                )
+            cleanup_warnings_by_scope[scope] = scope_warnings
+        cleanup_warnings = sorted(
+            {
+                warning
+                for scope_warnings in cleanup_warnings_by_scope.values()
+                for warning in scope_warnings
+            }
+        )
+        previous_by_scope = (
+            previous_status.get("by_scope")
+            if isinstance(previous_status.get("by_scope"), Mapping)
+            else {}
+        )
+        for scope in ("kis", "binance"):
+            previous_scope = (
+                previous_by_scope.get(scope)
+                if isinstance(previous_by_scope.get(scope), Mapping)
+                else {}
+            )
+            result_scope = (run_results or {}).get(scope, {})
+
+            def scope_stage_status(stage: str, previous_key: str) -> str:
+                stage_payload = result_scope.get(stage)
+                current = str(
+                    stage_payload.get("status")
+                    if isinstance(stage_payload, Mapping)
+                    else ""
+                ).lower()
+                if current in {"ok", "warning", "error"}:
+                    return current
+                previous = str(previous_scope.get(previous_key) or "").lower()
+                if previous in {"ok", "warning", "error"}:
+                    return previous
+                return "ok" if scope_health[scope]["snapshot_id"] else "not_run"
+
+            projection_status = scope_stage_status(
+                "v3_projection", "last_projection_status"
+            )
+            cleanup_only_projection_warning = (
+                projection_status == "warning"
+                and (
+                    (
+                        bool(result_scope.get("cleanup_warnings"))
+                        and not str(
+                            (
+                                result_scope.get("v3_projection")
+                                if isinstance(
+                                    result_scope.get("v3_projection"), Mapping
+                                )
+                                else {}
+                            ).get("error_message")
+                            or ""
+                        ).strip()
+                    )
+                    or previous_scope.get("projection_warning_reason")
+                    == "cleanup_only"
+                )
+            )
+            scope_health[scope].update(
+                {
+                    "last_ingest_status": scope_stage_status(
+                        "v3_ingest", "last_ingest_status"
+                    ),
+                    "last_compile_status": scope_stage_status(
+                        "v3_compile", "last_compile_status"
+                    ),
+                    "last_lint_status": scope_stage_status(
+                        "v3_lint", "last_lint_status"
+                    ),
+                    "last_publish_status": scope_stage_status(
+                        "v3_publish", "last_publish_status"
+                    ),
+                    "last_projection_status": projection_status,
+                    "index_rebuild": {
+                        "status": (
+                            "ok"
+                            if cleanup_only_projection_warning
+                            else projection_status
+                        )
+                    },
+                }
+            )
+            if cleanup_only_projection_warning:
+                scope_health[scope]["projection_warning_reason"] = "cleanup_only"
+        effective_eligibility: dict[str, dict[str, Any]] = {}
+        source_eligibility = (
+            mode_eligibility
+            if mode_eligibility is not None
+            else previous_status.get("mode_eligibility")
+            if isinstance(previous_status.get("mode_eligibility"), Mapping)
+            else {}
+        )
+        for venue in ("kis", "binance"):
+            raw_row = source_eligibility.get(venue, {})
+            effective_eligibility[venue] = (
+                dict(raw_row) if isinstance(raw_row, Mapping) else {}
+            )
+        result = {
+            "published_by_scope": published_by_scope,
+            "claim_status_counts": {
+                key: claim_status_counts[key] for key in sorted(claim_status_counts)
+            },
+            "stale_count": stale_count,
+            "conflicted_count": conflicted_count,
+            "orphan_page_count": orphan_page_count,
+            "repair_backlog_count": int(repair_backlog_count),
+            "last_ingest_status": stage_status(
+                "v3_ingest",
+                previous_ingest_status or ("ok" if has_published else "not_run"),
+            ),
+            "last_compile_status": stage_status(
+                "v3_compile",
+                previous_compile_status
+                or ("ok" if has_published else "not_run"),
+            ),
+            "last_lint_status": stage_status(
+                "v3_lint",
+                previous_lint_status or ("ok" if has_published else "not_run"),
+            ),
+            "last_publish_status": stage_status(
+                "v3_publish",
+                previous_publish_status
+                or ("ok" if has_published else "not_run"),
+            ),
+            "last_projection_status": stage_status(
+                "v3_projection",
+                previous_projection_status or "not_run",
+            ),
+            "cleanup_warnings": cleanup_warnings,
+            "cleanup_warnings_by_scope": cleanup_warnings_by_scope,
+            "by_scope": scope_health,
+            "mode_eligibility": effective_eligibility,
+        }
+        requested_read_mode = str(active_read_mode or "").strip().lower()
+        previous_read_mode = str(
+            previous_status.get("active_read_mode") or ""
+        ).strip().lower()
+        effective_read_mode = (
+            requested_read_mode
+            if requested_read_mode in {"shadow", "prefer", "required"}
+            else previous_read_mode
+            if previous_read_mode in {"shadow", "prefer", "required"}
+            else ""
+        )
+        if effective_read_mode:
+            result["active_read_mode"] = effective_read_mode
+        return result
 
     def _research_coverage_status(self) -> dict[str, Any]:
         by_scope: dict[str, Any] = {}
@@ -1452,8 +1806,95 @@ class JueWikiService:
         }
 
     def _repair_queue_status(self, conn: sqlite3.Connection) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        policy = WikiRepairHealthPolicy(
+            overdue_sec=self.config.repair_overdue_sec,
+            stall_sec=self.config.repair_stall_sec,
+            growth_window_sec=self.config.repair_growth_window_sec,
+            growth_warn_count=self.config.repair_growth_warn_count,
+        )
         if not self._table_exists(conn, "wiki_repair_actions"):
-            return {"open_count": 0, "resolved_count": 0, "by_scope": {}}
+            health_inputs = {
+                "open_count": 0,
+                "oldest_open_at": "",
+                "last_resolved_at": "",
+                "opened_in_window": 0,
+                "resolved_in_window": 0,
+            }
+            return {
+                "open_count": 0,
+                "resolved_count": 0,
+                "by_scope": {},
+                **health_inputs,
+                "repair_health_inputs": health_inputs,
+                "repair_health": evaluate_repair_queue_health(
+                    health_inputs,
+                    policy=policy,
+                    now=now,
+                ),
+            }
+        window_started_at = (
+            now - timedelta(seconds=policy.growth_window_sec)
+        ).isoformat()
+        timing_row = conn.execute(
+            """
+            SELECT
+                MIN(CASE
+                    WHEN status IN ('scheduled', 'unresolved') THEN created_at
+                    ELSE NULL
+                END) AS oldest_open_at,
+                MAX(CASE
+                    WHEN status = 'resolved' THEN finished_at
+                    ELSE NULL
+                END) AS last_resolved_at,
+                SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END)
+                    AS opened_in_window,
+                SUM(CASE
+                    WHEN status = 'resolved' AND finished_at >= ? THEN 1
+                    ELSE 0
+                END) AS resolved_in_window
+            FROM wiki_repair_actions
+            """,
+            (window_started_at, window_started_at),
+        ).fetchone()
+        by_lane: dict[str, dict[str, Any]] = {}
+        for lane_name in ("integrity", "evidence", "strategy"):
+            lane_row = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status IN ('scheduled', 'unresolved')
+                        THEN 1 ELSE 0 END) AS open_count,
+                    SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END)
+                        AS resolved_count,
+                    MIN(CASE WHEN status IN ('scheduled', 'unresolved')
+                        THEN created_at ELSE NULL END) AS oldest_open_at,
+                    MAX(CASE WHEN status = 'resolved' THEN finished_at ELSE NULL END)
+                        AS last_resolved_at,
+                    SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END)
+                        AS opened_in_window,
+                    SUM(CASE WHEN status = 'resolved' AND finished_at >= ?
+                        THEN 1 ELSE 0 END) AS resolved_in_window
+                FROM wiki_repair_actions
+                WHERE repair_lane = ?
+                """,
+                (window_started_at, window_started_at, lane_name),
+            ).fetchone()
+            lane_inputs = {
+                "open_count": int(lane_row["open_count"] or 0),
+                "oldest_open_at": str(lane_row["oldest_open_at"] or ""),
+                "last_resolved_at": str(lane_row["last_resolved_at"] or ""),
+                "opened_in_window": int(lane_row["opened_in_window"] or 0),
+                "resolved_in_window": int(lane_row["resolved_in_window"] or 0),
+            }
+            by_lane[lane_name] = {
+                **lane_inputs,
+                "resolved_count": int(lane_row["resolved_count"] or 0),
+                "repair_health": evaluate_repair_queue_health(
+                    lane_inputs,
+                    policy=policy,
+                    now=now,
+                ),
+            }
         rows = conn.execute(
             """
             SELECT page_id, action_type, status, details_json, COUNT(*) AS count
@@ -1531,9 +1972,40 @@ class JueWikiService:
             elif status == "resolved":
                 resolved_count += count
                 scope_row["resolved_count"] += count
+        total_health_inputs = {
+            "open_count": open_count,
+            "oldest_open_at": str(timing_row["oldest_open_at"] or ""),
+            "last_resolved_at": str(timing_row["last_resolved_at"] or ""),
+            "opened_in_window": int(timing_row["opened_in_window"] or 0),
+            "resolved_in_window": int(timing_row["resolved_in_window"] or 0),
+        }
         return {
             "open_count": open_count,
             "resolved_count": resolved_count,
+            **total_health_inputs,
+            "by_lane": by_lane,
+            "unclassified_action_types": [
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT action_type
+                    FROM wiki_repair_actions
+                    WHERE repair_lane_registered = 0
+                    ORDER BY action_type
+                    """
+                ).fetchall()
+            ],
+            "repair_health_inputs": {
+                key: by_lane["integrity"][key]
+                for key in (
+                    "open_count",
+                    "oldest_open_at",
+                    "last_resolved_at",
+                    "opened_in_window",
+                    "resolved_in_window",
+                )
+            },
+            "repair_health": by_lane["integrity"]["repair_health"],
             "by_scope": {
                 key: by_scope[key]
                 for key in sorted(by_scope)
@@ -1918,7 +2390,7 @@ class JueWikiService:
             return
         rows = conn.execute(
             """
-            SELECT action_id, details_json
+            SELECT action_id, finding_id, page_id, action_type, details_json
             FROM wiki_repair_actions
             WHERE status IN ('unresolved', 'scheduled')
             ORDER BY created_at ASC, action_id ASC
@@ -1950,30 +2422,21 @@ class JueWikiService:
                 warnings=warnings,
             ):
                 continue
-            resolved_details = {
-                **details,
-                "resolved_by": "repair_targets_cleaned",
-                "resolved_at": resolved_at,
-                "resolved_warnings": sorted(warnings),
-                "resolved_target_page_ids": target_page_ids,
-            }
-            conn.execute(
-                """
-                UPDATE wiki_repair_actions
-                SET status = 'resolved',
-                    finished_at = CASE
-                        WHEN COALESCE(finished_at, '') = '' THEN ?
-                        ELSE finished_at
-                    END,
-                    details_json = ?
-                WHERE action_id = ?
-                  AND status IN ('unresolved', 'scheduled')
-                """,
-                (
-                    resolved_at,
-                    _json_dumps(resolved_details),
-                    action_id,
-                ),
+            repair_identity = self._repair_identity(
+                finding_id=str(row["finding_id"] or ""),
+                page_id=str(row["page_id"] or ""),
+                action_type=str(row["action_type"] or ""),
+                details=details,
+            )
+            self._resolve_repair_identity_in_connection(
+                conn,
+                repair_identity=repair_identity,
+                resolved_by="repair_targets_cleaned",
+                resolved_at=resolved_at,
+                resolution_details={
+                    "resolved_warnings": sorted(warnings),
+                    "resolved_target_page_ids": target_page_ids,
+                },
             )
 
     @staticmethod
@@ -2193,7 +2656,7 @@ class JueWikiService:
                 used += next_len
         content = "\n\n".join(chunks)
         evidence_quality = self.merge_evidence_quality(evidence_quality_rows)
-        return {
+        payload = {
             "status": "ok",
             "target_scope": clean_scope or "all",
             "symbols": sorted(symbol_set),
@@ -2212,6 +2675,63 @@ class JueWikiService:
             "char_count": len(content),
             "budget": budget,
         }
+        payload.update(
+            self._context_pack_v3_metadata(
+                target_scope=clean_scope,
+                symbols=tuple(sorted(symbol_set)),
+                page_types=tuple(sorted(page_type_set)),
+                max_chars=max(budget, 2),
+            )
+        )
+        return payload
+
+    def _context_pack_v3_metadata(
+        self,
+        *,
+        target_scope: str,
+        symbols: tuple[str, ...],
+        page_types: tuple[str, ...],
+        max_chars: int,
+    ) -> dict[str, Any]:
+        packet: WikiContextPacketV1
+        if not target_scope:
+            packet = self._legacy_context_packet()
+        else:
+            try:
+                packet = JueWikiContextService(self.repository()).context_packet(
+                    request=WikiContextRequestV1(
+                        target_scope=target_scope,
+                        symbols=symbols,
+                        page_types=page_types,
+                        max_chars=max_chars,
+                    ),
+                    read_mode="shadow",
+                )
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+                packet = self._legacy_context_packet()
+        return {
+            "wiki_context_contract": packet.to_dict(),
+            "snapshot_id": packet.snapshot_id,
+            "read_mode": packet.read_mode,
+            "coverage_status": packet.coverage_status,
+            "repair_required": packet.repair_required,
+        }
+
+    @staticmethod
+    def _legacy_context_packet() -> WikiContextPacketV1:
+        return WikiContextPacketV1(
+            status="legacy",
+            read_mode="shadow",
+            snapshot_id="",
+            selected_pages=(),
+            rejected_page_ids=(),
+            coverage_status="legacy",
+            quality_warnings=(),
+            repair_required=False,
+            char_count=0,
+        )
 
     def _context_pack_open_repair_actions_by_page(
         self,
@@ -2956,6 +3476,166 @@ class JueWikiService:
             for row in rows
         ]
 
+    @staticmethod
+    def _repair_identity(
+        *,
+        finding_id: str,
+        page_id: str,
+        action_type: str,
+        details: dict[str, Any],
+    ) -> str:
+        explicit = str(details.get("repair_identity") or "").strip()
+        if explicit:
+            return explicit
+        scope = str(
+            details.get("decision_scope")
+            or details.get("scope")
+            or details.get("source_scope")
+            or "unknown"
+        ).strip().lower()
+        raw_symbols = details.get("symbols") or []
+        if not isinstance(raw_symbols, (list, tuple, set)):
+            raw_symbols = [raw_symbols]
+        symbols = sorted(
+            {
+                _normalize_symbol(item)
+                for item in raw_symbols
+                if _normalize_symbol(item)
+            }
+        )
+        raw = ":".join(
+            [
+                scope,
+                str(finding_id).strip(),
+                str(page_id).strip(),
+                str(action_type).strip(),
+                ",".join(symbols),
+            ]
+        )
+        return _hash_text(raw)[:32]
+
+    def _repair_action_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+        action_id = str(row["action_id"] or "")
+        details = self._parse_json(
+            row["details_json"],
+            {},
+            field=f"wiki_repair_actions.details_json:{action_id}",
+            allow_missing=True,
+        )
+        return {
+            "action_id": action_id,
+            "finding_id": str(row["finding_id"] or ""),
+            "page_id": str(row["page_id"] or ""),
+            "action_type": str(row["action_type"] or ""),
+            "status": str(row["status"] or ""),
+            "details": details if isinstance(details, dict) else {},
+            "created_at": str(row["created_at"] or ""),
+            "finished_at": str(row["finished_at"] or ""),
+            "error_message": str(row["error_message"] or ""),
+        }
+
+    def _record_or_refresh_repair_action(
+        self,
+        *,
+        finding_id: str,
+        page_id: str,
+        action_type: str,
+        status: str,
+        details: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = _utc_now_iso()
+        lane = classify_repair_action(action_type)
+        repair_identity = self._repair_identity(
+            finding_id=finding_id,
+            page_id=page_id,
+            action_type=action_type,
+            details=details,
+        )
+        clean_details = {**details, "repair_identity": repair_identity}
+        with self._connect() as conn:
+            if status in {"scheduled", "unresolved"}:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM wiki_repair_actions
+                    WHERE status IN ('scheduled', 'unresolved')
+                    ORDER BY created_at ASC, action_id ASC
+                    """
+                ).fetchall()
+                for row in rows:
+                    existing = self._repair_action_payload(row)
+                    existing_identity = self._repair_identity(
+                        finding_id=existing["finding_id"],
+                        page_id=existing["page_id"],
+                        action_type=existing["action_type"],
+                        details=existing["details"],
+                    )
+                    if existing_identity != repair_identity:
+                        continue
+                    refreshed_details = {
+                        **existing["details"],
+                        **clean_details,
+                        "last_observed_at": now,
+                        "observation_count": max(
+                            int(existing["details"].get("observation_count") or 1),
+                            1,
+                        )
+                        + 1,
+                    }
+                    conn.execute(
+                        """
+                        UPDATE wiki_repair_actions
+                        SET status = ?, details_json = ?, error_message = ''
+                        WHERE action_id = ?
+                        """,
+                        (
+                            status,
+                            _json_dumps(refreshed_details),
+                            existing["action_id"],
+                        ),
+                    )
+                    return {
+                        **existing,
+                        "status": status,
+                        "details": refreshed_details,
+                        "error_message": "",
+                    }
+
+            action_id = _hash_text(
+                f"{repair_identity}:{status}:{now}"
+            )[:32]
+            conn.execute(
+                """
+                INSERT INTO wiki_repair_actions (
+                    action_id, finding_id, page_id, action_type,
+                    repair_lane, repair_lane_registered, status,
+                    details_json, created_at, finished_at, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '')
+                """,
+                (
+                    action_id,
+                    finding_id,
+                    page_id,
+                    action_type,
+                    lane.lane,
+                    int(lane.registered),
+                    status,
+                    _json_dumps(clean_details),
+                    now,
+                ),
+            )
+        return {
+            "action_id": action_id,
+            "finding_id": finding_id,
+            "page_id": page_id,
+            "action_type": action_type,
+            "status": status,
+            "details": clean_details,
+            "created_at": now,
+            "finished_at": "",
+            "error_message": "",
+        }
+
     def record_repair_action(
         self,
         *,
@@ -2966,40 +3646,175 @@ class JueWikiService:
         details: dict[str, Any],
     ) -> dict[str, Any]:
         self.initialize()
-        now = _utc_now_iso()
-        action_id = _hash_text(
-            f"{finding_id}:{page_id}:{action_type}:{status}:{now}"
-        )[:32]
-        action = {
-            "action_id": action_id,
-            "finding_id": finding_id,
-            "page_id": page_id,
-            "action_type": action_type,
-            "status": status,
-            "details": details,
-            "created_at": now,
-            "finished_at": "",
-            "error_message": "",
-        }
-        with self._connect() as conn:
+        return self._record_or_refresh_repair_action(
+            finding_id=finding_id,
+            page_id=page_id,
+            action_type=action_type,
+            status=status,
+            details=details,
+        )
+
+    def _resolve_repair_identity_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        repair_identity: str,
+        resolved_by: str,
+        resolved_at: str,
+        resolution_details: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM wiki_repair_actions
+            WHERE status IN ('scheduled', 'unresolved')
+            ORDER BY created_at ASC, action_id ASC
+            """
+        ).fetchall()
+        matched_ids: list[str] = []
+        for row in rows:
+            action = self._repair_action_payload(row)
+            row_identity = self._repair_identity(
+                finding_id=action["finding_id"],
+                page_id=action["page_id"],
+                action_type=action["action_type"],
+                details=action["details"],
+            )
+            if row_identity != repair_identity:
+                continue
+            resolved_details = {
+                **action["details"],
+                "repair_identity": row_identity,
+                "resolved_by": resolved_by,
+                "resolved_at": resolved_at,
+                **(resolution_details or {}),
+            }
             conn.execute(
                 """
-                INSERT INTO wiki_repair_actions (
-                    action_id, finding_id, page_id, action_type, status,
-                    details_json, created_at, finished_at, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, '', '')
+                UPDATE wiki_repair_actions
+                SET status = 'resolved',
+                    finished_at = CASE
+                        WHEN COALESCE(finished_at, '') = '' THEN ?
+                        ELSE finished_at
+                    END,
+                    details_json = ?
+                WHERE action_id = ?
+                  AND status IN ('scheduled', 'unresolved')
                 """,
                 (
-                    action_id,
-                    finding_id,
-                    page_id,
-                    action_type,
-                    status,
-                    _json_dumps(details),
-                    now,
+                    resolved_at,
+                    _json_dumps(resolved_details),
+                    action["action_id"],
                 ),
             )
-        return action
+            matched_ids.append(action["action_id"])
+
+        resolved_rows: list[dict[str, Any]] = []
+        for action_id in matched_ids:
+            row = conn.execute(
+                "SELECT * FROM wiki_repair_actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if row is not None:
+                resolved_rows.append(self._repair_action_payload(row))
+        return resolved_rows
+
+    def resolve_repair_identity(
+        self,
+        *,
+        repair_identity: str,
+        resolved_by: str,
+    ) -> dict[str, Any]:
+        self.initialize()
+        resolved_at = _utc_now_iso()
+        with self._connect() as conn:
+            rows = self._resolve_repair_identity_in_connection(
+                conn,
+                repair_identity=str(repair_identity).strip(),
+                resolved_by=str(resolved_by).strip() or "repair_identity_resolved",
+                resolved_at=resolved_at,
+            )
+        return {
+            "repair_identity": str(repair_identity).strip(),
+            "resolved_count": len(rows),
+            "rows": rows,
+        }
+
+    def resolve_duplicate_open_repair_actions(self) -> dict[str, int]:
+        self.initialize()
+        resolved_at = _utc_now_iso()
+        resolved_count = 0
+        duplicate_identity_count = 0
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM wiki_repair_actions
+                WHERE status IN ('scheduled', 'unresolved')
+                ORDER BY created_at ASC, action_id ASC
+                """
+            ).fetchall()
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                action = self._repair_action_payload(row)
+                repair_identity = self._repair_identity(
+                    finding_id=action["finding_id"],
+                    page_id=action["page_id"],
+                    action_type=action["action_type"],
+                    details=action["details"],
+                )
+                action["repair_identity"] = repair_identity
+                grouped.setdefault(repair_identity, []).append(action)
+
+            for repair_identity, actions in grouped.items():
+                active = actions[0]
+                active_details = {
+                    **active["details"],
+                    "repair_identity": repair_identity,
+                }
+                conn.execute(
+                    """
+                    UPDATE wiki_repair_actions
+                    SET details_json = ?
+                    WHERE action_id = ?
+                    """,
+                    (_json_dumps(active_details), active["action_id"]),
+                )
+                duplicates = actions[1:]
+                if duplicates:
+                    duplicate_identity_count += 1
+                for duplicate in duplicates:
+                    resolved_details = {
+                        **duplicate["details"],
+                        "repair_identity": repair_identity,
+                        "resolved_by": "duplicate_open_repair_action",
+                        "resolved_at": resolved_at,
+                        "active_action_id": active["action_id"],
+                    }
+                    conn.execute(
+                        """
+                        UPDATE wiki_repair_actions
+                        SET status = 'resolved',
+                            finished_at = CASE
+                                WHEN COALESCE(finished_at, '') = '' THEN ?
+                                ELSE finished_at
+                            END,
+                            details_json = ?
+                        WHERE action_id = ?
+                          AND status IN ('scheduled', 'unresolved')
+                        """,
+                        (
+                            resolved_at,
+                            _json_dumps(resolved_details),
+                            duplicate["action_id"],
+                        ),
+                    )
+                    resolved_count += 1
+        return {
+            "identity_count": len(grouped),
+            "duplicate_identity_count": duplicate_identity_count,
+            "resolved_count": resolved_count,
+        }
 
     def upsert_playbook_metric(self, metric: dict[str, Any]) -> None:
         self.initialize()
@@ -3328,7 +4143,12 @@ class JueWikiService:
     def repair_once(self, *, scope: str | None = None) -> dict[str, Any]:
         from tradecraft.services.jue_wiki_repair import JueWikiRepairService
 
-        return JueWikiRepairService(self).run_once(scope=scope)
+        stable_identity_duplicates = self.resolve_duplicate_open_repair_actions()
+        result = JueWikiRepairService(self).run_once(scope=scope)
+        return {
+            **result,
+            "stable_identity_duplicates": stable_identity_duplicates,
+        }
 
     def page_sources(self, page_id: str) -> dict[str, Any]:
         self.initialize()
@@ -9038,6 +9858,7 @@ class JueWikiService:
                     "symbol": symbol,
                     "name": str(item.get("name") or analysis.get("name") or symbol),
                     "market": str(item.get("market") or ""),
+                    "asset_class": str(item.get("asset_class") or "stock"),
                     "status": str(item.get("status") or ""),
                     "score": item.get("score"),
                     "stance": analysis.get("stance"),
@@ -10219,12 +11040,14 @@ class JueWikiService:
             )
             risks = ", ".join(str(item) for item in list(row.get("risks") or [])[:3])
             discovery_lines.append(
-                "- {day}: market={market}, stance={stance}, confidence={confidence}, "
+                "- {day}: market={market}, asset_class={asset_class}, "
+                "stance={stance}, confidence={confidence}, "
                 "score={score}, pre_surge={pre_surge}, entry_bias={entry_bias}, "
                 "preferred_horizon={preferred_horizon}, reasons={reasons}, "
                 "risks={risks}, summary={summary}".format(
                     day=trading_day or "unknown",
                     market=row.get("market") or "",
+                    asset_class=row.get("asset_class") or "stock",
                     stance=row.get("stance") or "",
                     confidence=row.get("confidence") or "",
                     score=row.get("score") or "",
@@ -11058,6 +11881,8 @@ class JueWikiService:
                     finding_id TEXT NOT NULL,
                     page_id TEXT NOT NULL,
                     action_type TEXT NOT NULL,
+                    repair_lane TEXT NOT NULL DEFAULT 'integrity',
+                    repair_lane_registered INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL,
                     details_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
@@ -11116,6 +11941,29 @@ class JueWikiService:
                     evidence_json TEXT NOT NULL DEFAULT '{}',
                     computed_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS wiki_selection_outcomes_archive (
+                    outcome_id TEXT PRIMARY KEY,
+                    link_id TEXT NOT NULL,
+                    selection_run_id TEXT NOT NULL,
+                    page_id TEXT NOT NULL,
+                    decision_scope TEXT NOT NULL,
+                    venue TEXT NOT NULL DEFAULT '',
+                    symbol TEXT NOT NULL DEFAULT '',
+                    block_id TEXT NOT NULL DEFAULT '',
+                    horizon TEXT NOT NULL DEFAULT '',
+                    outcome_kind TEXT NOT NULL,
+                    outcome_status TEXT NOT NULL,
+                    pnl_value REAL NOT NULL DEFAULT 0.0,
+                    pnl_currency TEXT NOT NULL DEFAULT '',
+                    return_pct REAL NOT NULL DEFAULT 0.0,
+                    mfe_pct REAL NOT NULL DEFAULT 0.0,
+                    mae_pct REAL NOT NULL DEFAULT 0.0,
+                    holding_minutes REAL NOT NULL DEFAULT 0.0,
+                    evidence_gzip BLOB NOT NULL,
+                    evidence_sha256 TEXT NOT NULL,
+                    computed_at TEXT NOT NULL,
+                    archived_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS wiki_page_effectiveness (
                     page_id TEXT NOT NULL,
                     decision_scope TEXT NOT NULL,
@@ -11149,6 +11997,12 @@ class JueWikiService:
                     metric_presence_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS wiki_ops_section_snapshots (
+                    section TEXT PRIMARY KEY,
+                    version TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    generated_at TEXT NOT NULL
+                );
                 """
             )
             selection_columns = self._table_columns(conn, "wiki_selection_runs")
@@ -11158,6 +12012,39 @@ class JueWikiService:
                     ALTER TABLE wiki_selection_runs
                     ADD COLUMN budget_report_json TEXT NOT NULL DEFAULT '{}'
                     """
+                )
+            repair_columns = self._table_columns(conn, "wiki_repair_actions")
+            if "repair_lane" not in repair_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE wiki_repair_actions
+                    ADD COLUMN repair_lane TEXT NOT NULL DEFAULT 'integrity'
+                    """
+                )
+            if "repair_lane_registered" not in repair_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE wiki_repair_actions
+                    ADD COLUMN repair_lane_registered INTEGER NOT NULL DEFAULT 1
+                    """
+                )
+            action_types = conn.execute(
+                "SELECT DISTINCT action_type FROM wiki_repair_actions"
+            ).fetchall()
+            for row in action_types:
+                action_type = str(row["action_type"] or "")
+                classification = classify_repair_action(action_type)
+                conn.execute(
+                    """
+                    UPDATE wiki_repair_actions
+                    SET repair_lane = ?, repair_lane_registered = ?
+                    WHERE action_type = ?
+                    """,
+                    (
+                        classification.lane,
+                        int(classification.registered),
+                        action_type,
+                    ),
                 )
             playbook_metric_columns = self._table_columns(conn, "wiki_playbook_metrics")
             if "metric_presence_json" not in playbook_metric_columns:

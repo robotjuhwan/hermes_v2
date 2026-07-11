@@ -866,6 +866,8 @@ def test_build_core_runner_processes_uses_light_status_and_code_staleness(tmp_pa
         "services/strategy_intelligence.py",
     ]
     assert "services/binance_block_trader.py" in payload["binance_block_trader"]["checked_paths"]
+    assert "services/binance_manager_prompt.py" in payload["binance_block_trader"]["checked_paths"]
+    assert "services/binance_manager_contract.py" in payload["binance_block_trader"]["checked_paths"]
     assert payload["crypto_pattern_lab"]["checked_paths"] == [
         "runtime/crypto_pattern_lab_runner.py",
         "services/crypto_pattern_lab.py",
@@ -883,6 +885,11 @@ def test_build_llm_operational_status_marks_failures_stale_after_runner_restart(
             "latest_manager_status": "error",
             "latest_manager_mode": "error",
         },
+        binance_block_status={
+            "latest_manager_run_at": "2026-06-02T05:58:40+00:00",
+            "latest_manager_status": "error",
+            "latest_manager_mode": "llm",
+        },
         market_schedule={
             "recent_runs": [
                 {
@@ -895,6 +902,7 @@ def test_build_llm_operational_status_marks_failures_stale_after_runner_restart(
         },
         processes={
             "kis_block_trader": {"started_at_epoch": restarted_at},
+            "binance_block_trader": {"started_at_epoch": restarted_at},
             "market_judge": {"started_at_epoch": restarted_at},
         },
         configured=True,
@@ -908,8 +916,96 @@ def test_build_llm_operational_status_marks_failures_stale_after_runner_restart(
     assert payload["model"] == "gpt-5.5"
     assert critical["kis_block_manager"]["status"] == "error"
     assert critical["kis_block_manager"]["stale_after_restart"] is True
+    assert critical["binance_block_manager"]["status"] == "error"
+    assert critical["binance_block_manager"]["stale_after_restart"] is True
     assert critical["market_judge"]["status"] == "error"
     assert critical["market_judge"]["stale_after_restart"] is True
+
+
+def test_llm_operational_status_keeps_unresolved_binance_manager_error_critical() -> None:
+    payload = ops_payloads.build_llm_operational_status(
+        block_status={"latest_manager_status": "ok"},
+        binance_block_status={
+            "latest_manager_run_at": "2026-07-08T00:15:00+00:00",
+            "latest_manager_status": "blocked",
+            "latest_manager_mode": "runtime",
+            "latest_unresolved_manager_error": {
+                "run_at": "2026-07-08T00:06:00+00:00",
+                "status": "error",
+                "mode": "llm",
+                "error_message": "validation_repair_resolution_missing_from_model",
+            },
+            "latest_manager_error_recovered": False,
+        },
+        market_schedule={"recent_runs": []},
+        processes={
+            "binance_block_trader": {
+                "started_at_epoch": datetime(
+                    2026,
+                    7,
+                    8,
+                    0,
+                    0,
+                    tzinfo=timezone.utc,
+                ).timestamp()
+            }
+        },
+        configured=True,
+    )
+
+    critical = payload["critical"]["binance_block_manager"]
+    assert critical["status"] == "error"
+    assert critical["run_at"] == "2026-07-08T00:06:00+00:00"
+    assert critical["latest_manager_status"] == "blocked"
+    assert critical["error_message"] == "validation_repair_resolution_missing_from_model"
+    assert critical["stale_after_restart"] is False
+
+    summary = finalize_ops_readiness_signals(
+        environment_signals={"blockers": [], "warnings": []},
+        trading_validation_status={"status": "ok", "summary": {"readiness": "clear"}},
+        runner_liveness={"warnings": [], "stale_processes": [], "missing_processes": []},
+        llm_operational=payload,
+        semantic_checks={"warnings": []},
+    )
+
+    assert "binance_block_manager_last_run_failed" in summary["warnings"]
+
+
+def test_llm_operational_status_suppresses_recovered_binance_manager_error_warning() -> None:
+    payload = ops_payloads.build_llm_operational_status(
+        block_status={"latest_manager_status": "ok"},
+        binance_block_status={
+            "latest_manager_run_at": "2026-07-08T00:15:00+00:00",
+            "latest_manager_status": "error",
+            "latest_manager_mode": "llm",
+            "latest_manager_error_recovered": True,
+            "latest_unresolved_manager_error": {},
+            "latest_manager_error": {
+                "run_at": "2026-07-08T00:06:00+00:00",
+                "status": "error",
+                "mode": "llm",
+                "error_message": "validation_repair_resolution_missing_from_model",
+            },
+        },
+        market_schedule={"recent_runs": []},
+        processes={},
+        configured=True,
+    )
+
+    critical = payload["critical"]["binance_block_manager"]
+    assert critical["status"] == "recovered"
+    assert critical["latest_manager_status"] == "error"
+    assert critical["latest_manager_error_recovered"] is True
+
+    summary = finalize_ops_readiness_signals(
+        environment_signals={"blockers": [], "warnings": []},
+        trading_validation_status={"status": "ok", "summary": {"readiness": "clear"}},
+        runner_liveness={"warnings": [], "stale_processes": [], "missing_processes": []},
+        llm_operational=payload,
+        semantic_checks={"warnings": []},
+    )
+
+    assert "binance_block_manager_last_run_failed" not in summary["warnings"]
 
 
 def test_disk_space_status_lives_in_ops_payloads_not_main() -> None:
@@ -949,6 +1045,44 @@ def test_build_disk_space_status_uses_runtime_parent_and_thresholds(tmp_path) ->
     assert payload["free_pct"] == 8.0
     assert payload["warn_free_bytes"] == 2_000
     assert payload["critical_free_bytes"] == 1_000
+
+
+def test_build_runtime_storage_size_status_uses_four_and_six_gib_thresholds(
+    tmp_path,
+) -> None:
+    runtime_state_path = tmp_path / ".runtime" / "runtime.json"
+
+    warning = ops_payloads.build_runtime_storage_size_status(
+        runtime_state_path=str(runtime_state_path),
+        size_reader=lambda _path: 5 * 1024**3,
+    )
+    risk = ops_payloads.build_runtime_storage_size_status(
+        runtime_state_path=str(runtime_state_path),
+        size_reader=lambda _path: 7 * 1024**3,
+    )
+
+    assert warning["status"] == "warning"
+    assert warning["warn_bytes"] == 4 * 1024**3
+    assert risk["status"] == "risk"
+    assert risk["risk_bytes"] == 6 * 1024**3
+
+
+def test_ops_environment_signals_include_runtime_storage_pressure() -> None:
+    payload = build_ops_environment_signals(
+        admin_token_configured=True,
+        disk_space_status={
+            "status": "ok",
+            "runtime_storage": {"status": "risk", "total_bytes": 7 * 1024**3},
+        },
+        live_execution={},
+        readiness={},
+        kill_switch_enabled=False,
+        binance_kill_switch_enabled=False,
+        memory_status={"status": "ok"},
+        feature_enabled={},
+    )
+
+    assert "runtime_storage_risk" in payload["blockers"]
 
 
 def test_append_trading_validation_ops_signals_marks_blockers_and_venue_warnings() -> None:
@@ -1082,6 +1216,7 @@ def test_build_ops_remediation_actions_maps_signals_to_operator_actions() -> Non
             "memory_not_seeded",
             "llm_error_rate_high",
             "reports_db_stale",
+            "binance_activity_pressure_open",
             "trading_validation_lane_authority_reduced_kis",
             "market_pulse_runner_duplicated",
         ],
@@ -1099,9 +1234,109 @@ def test_build_ops_remediation_actions_maps_signals_to_operator_actions() -> Non
     assert by_id["review_llm_usage_errors"]["endpoint"] == "/api/llm/usage"
     assert by_id["cleanup_runtime_storage"]["severity"] == "blocker"
     assert by_id["refresh_research_pipeline"]["endpoint"] == "/api/reports/status"
+    assert by_id["review_binance_activity_pressure"]["endpoint"] == (
+        "/api/binance/blocks/status"
+    )
+    assert by_id["review_binance_activity_pressure"]["method"] == "GET"
+    assert by_id["refresh_binance_crypto_research_context"]["endpoint"] == (
+        "/api/crypto/research/run-once"
+    )
+    assert by_id["refresh_binance_crypto_research_context"]["method"] == "POST"
+    assert by_id["refresh_binance_crypto_research_context"]["severity"] == "warn"
+    assert by_id["refresh_binance_crypto_research_context"]["signals"] == [
+        "binance_activity_pressure_open"
+    ]
+    assert by_id["restart_binance_recovery_runners"]["endpoint"] == "/api/ops/restart"
+    assert by_id["restart_binance_recovery_runners"]["method"] == "POST"
+    assert by_id["restart_binance_recovery_runners"]["request_payload"] == {
+        "keys": ["binance_block_trader", "watchdog"]
+    }
+    assert by_id["restart_binance_recovery_runners"]["requires_confirmation"] is True
+    assert by_id["restart_binance_recovery_runners"]["follow_up_actions"] == [
+        {
+            "id": "check_binance_status_after_restart",
+            "label": "Binance 상태 재확인",
+            "endpoint": "/api/binance/blocks/status",
+            "method": "GET",
+        },
+        {
+            "id": "run_binance_manager_after_restart",
+            "label": "Binance 매니저 즉시 실행",
+            "endpoint": "/api/binance/blocks/manager/run-once",
+            "method": "POST",
+            "request_payload": {"confirm_live_manager_run": True},
+            "requires_confirmation": True,
+        },
+        {
+            "id": "run_binance_executor_after_manager",
+            "label": "Binance 실행 틱 확인 실행",
+            "endpoint": "/api/binance/blocks/executor/tick",
+            "method": "POST",
+            "request_payload": {"confirm_live_executor_tick": True},
+            "requires_confirmation": True,
+        },
+    ]
     assert by_id["review_lane_authority_reductions"]["endpoint"] == (
         "/api/trading/validation/status"
     )
+
+
+def test_ops_remediation_actions_include_binance_contract_replay_current_error() -> None:
+    actions = build_ops_remediation_actions(
+        blockers=[],
+        warnings=["binance_manager_contract_replay_current_error"],
+        stale_processes=[],
+        missing_processes=[],
+        duplicate_processes=[],
+    )
+
+    by_id = {row["id"]: row for row in actions}
+    assert by_id["review_binance_activity_pressure"]["signals"] == [
+        "binance_manager_contract_replay_current_error"
+    ]
+    assert by_id["restart_binance_recovery_runners"]["signals"] == [
+        "binance_manager_contract_replay_current_error"
+    ]
+    assert by_id["restart_binance_recovery_runners"]["request_payload"] == {
+        "keys": ["binance_block_trader", "watchdog"]
+    }
+
+
+def test_ops_remediation_actions_include_binance_contract_replay_recovered() -> None:
+    actions = build_ops_remediation_actions(
+        blockers=[],
+        warnings=["binance_manager_contract_replay_recovered"],
+        stale_processes=[],
+        missing_processes=[],
+        duplicate_processes=[],
+    )
+
+    by_id = {row["id"]: row for row in actions}
+    assert by_id["review_binance_activity_pressure"]["signals"] == [
+        "binance_manager_contract_replay_recovered"
+    ]
+    assert by_id["restart_binance_recovery_runners"]["signals"] == [
+        "binance_manager_contract_replay_recovered"
+    ]
+    assert by_id["restart_binance_recovery_runners"]["requires_confirmation"] is True
+    assert by_id["restart_binance_recovery_runners"]["follow_up_actions"][-2:] == [
+        {
+            "id": "run_binance_manager_after_restart",
+            "label": "Binance 매니저 즉시 실행",
+            "endpoint": "/api/binance/blocks/manager/run-once",
+            "method": "POST",
+            "request_payload": {"confirm_live_manager_run": True},
+            "requires_confirmation": True,
+        },
+        {
+            "id": "run_binance_executor_after_manager",
+            "label": "Binance 실행 틱 확인 실행",
+            "endpoint": "/api/binance/blocks/executor/tick",
+            "method": "POST",
+            "request_payload": {"confirm_live_executor_tick": True},
+            "requires_confirmation": True,
+        },
+    ]
 
 
 def test_ops_remediation_actions_include_jue_wiki_action_reference_gap_repair() -> None:
@@ -1252,6 +1487,10 @@ def test_finalize_ops_readiness_signals_merges_validation_llm_and_semantic_warni
                     "status": "error",
                     "stale_after_restart": False,
                 },
+                "binance_block_manager": {
+                    "status": "error",
+                    "stale_after_restart": False,
+                },
                 "market_judge": {
                     "status": "error",
                     "stale_after_restart": True,
@@ -1267,6 +1506,7 @@ def test_finalize_ops_readiness_signals_merges_validation_llm_and_semantic_warni
         "memory_not_seeded",
         "restart_required",
         "kis_block_manager_last_run_failed",
+        "binance_block_manager_last_run_failed",
         "semantic_check_pending",
     ]
     assert summary["advisories"] == [
@@ -1339,6 +1579,41 @@ def test_finalize_ops_readiness_keeps_strategy_validation_advisory_green() -> No
     )
     assert "19개 진단 fail" not in diagnostics["detail"]
     assert "진단 fail이 남아" in diagnostics["detail"]
+
+
+def test_finalize_ops_readiness_splits_operational_and_advisory_actions() -> None:
+    summary = finalize_ops_readiness_signals(
+        environment_signals={"blockers": [], "warnings": ["restart_required"]},
+        trading_validation_status={
+            "summary": {
+                "readiness": "probe",
+                "fail_count": 1,
+                "hard_fail_count": 0,
+                "diagnostic_fail_count": 1,
+            },
+            "payload": {"discipline_count": 19},
+        },
+        runner_liveness={
+            "warnings": [],
+            "stale_processes": ["jue_wiki"],
+            "missing_processes": [],
+            "duplicate_processes": [],
+        },
+        llm_operational={"critical": {}},
+        semantic_checks={"warnings": []},
+    )
+
+    assert summary["status"] == "yellow"
+    assert {row["id"] for row in summary["operational_remediation_actions"]} == {
+        "restart_stale_runners"
+    }
+    assert "review_trading_validation_diagnostics" in {
+        row["id"] for row in summary["advisory_actions"]
+    }
+    assert summary["remediation_actions"] == [
+        *summary["operational_remediation_actions"],
+        *summary["advisory_actions"],
+    ]
 
 
 def test_finalize_ops_readiness_keeps_strategy_validation_block_green() -> None:
@@ -1617,9 +1892,90 @@ def test_build_ops_jue_wiki_payload_exposes_phase2_readiness_signals() -> None:
         "jue_wiki_lint_findings_open",
         "jue_wiki_stale_pages_high",
         "jue_wiki_prompt_pressure_high",
-        "jue_wiki_repair_queue_open",
     ]
+    assert payload["advisories"] == ["jue_wiki_repair_queue_open"]
     assert payload["blockers"] == []
+
+
+def test_build_ops_jue_wiki_payload_keeps_progressing_queue_advisory() -> None:
+    payload = build_ops_jue_wiki_payload(
+        enabled=True,
+        status={
+            "status": "ok",
+            "page_count": 42,
+            "repair_queue": {
+                "open_count": 3,
+                "resolved_count": 12,
+                "repair_health": {
+                    "status": "progressing",
+                    "warning_signals": [],
+                    "advisory_signals": ["jue_wiki_repair_queue_open"],
+                    "progress_age_sec": 300,
+                },
+                "open_by_warning": {
+                    "requested_symbol_summary_missing": 2,
+                    "financials_missing": 1,
+                },
+            },
+            "latest_selection": {
+                "budget_report": {
+                    "requested_symbol_count": 2,
+                    "requested_symbol_missing_summary_count": 1,
+                    "requested_symbol_prompt_omitted_count": 1,
+                    "requested_symbol_degraded_summary_count": 1,
+                }
+            },
+        },
+        runner={"alive": True, "status": "running"},
+        state_path=".runtime/jue_wiki_runner.json",
+        interval_sec=1800,
+    )
+
+    assert payload["warnings"] == []
+    assert set(payload["advisories"]) == {
+        "jue_wiki_repair_queue_open",
+        "jue_wiki_requested_symbol_repair_pressure_open",
+        "jue_wiki_financials_repair_pressure_open",
+        "jue_wiki_requested_symbol_summaries_missing",
+        "jue_wiki_requested_symbol_summaries_prompt_omitted",
+        "jue_wiki_requested_symbol_summaries_degraded",
+    }
+
+
+def test_build_ops_jue_wiki_payload_keeps_non_integrity_growth_advisory() -> None:
+    payload = build_ops_jue_wiki_payload(
+        enabled=True,
+        status={
+            "status": "ok",
+            "repair_queue": {
+                "open_count": 30,
+                "repair_health": {
+                    "status": "idle",
+                    "warning_signals": [],
+                    "advisory_signals": [],
+                },
+                "by_lane": {
+                    "evidence": {
+                        "repair_health": {
+                            "warning_signals": ["jue_wiki_repair_queue_growing"]
+                        }
+                    },
+                    "strategy": {
+                        "repair_health": {
+                            "warning_signals": ["jue_wiki_repair_queue_stalled"]
+                        }
+                    },
+                },
+            },
+        },
+        runner={"alive": True, "status": "running"},
+        state_path=".runtime/jue_wiki_runner.json",
+        interval_sec=1800,
+    )
+
+    assert payload["warnings"] == []
+    assert "jue_wiki_evidence_repair_queue_growing" in payload["advisories"]
+    assert "jue_wiki_strategy_repair_queue_stalled" in payload["advisories"]
 
 
 def test_kis_block_trader_payload_warns_on_unresolved_wiki_action_reference_gap() -> None:
@@ -1706,6 +2062,467 @@ def test_binance_block_trader_payload_warns_on_unresolved_wiki_action_reference_
     assert "binance_jue_wiki_action_reference_gap_unresolved" in payload["warnings"]
 
 
+def test_binance_block_trader_payload_warns_on_stale_runner_restart() -> None:
+    payload = build_ops_binance_block_trader_payload(
+        enabled=True,
+        status={"status": "ok"},
+        runner={
+            "direct_alive": True,
+            "stale_process": True,
+            "stale_code_process": True,
+        },
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        spot_live=True,
+        futures_live=True,
+        upbit_live=True,
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0.0,
+        max_symbol_exposure_pct=25.0,
+        min_reward_risk=1.3,
+        next_manager_run_at="2026-07-08T08:00:00+09:00",
+    )
+
+    assert payload["runner"]["stale_process"] is True
+    assert "binance_runner_stale_restart_required" in payload["warnings"]
+
+
+def test_binance_block_trader_payload_exposes_current_activity_pressure() -> None:
+    payload = build_ops_binance_block_trader_payload(
+        enabled=True,
+        status={
+            "status": "ok",
+            "latest_decision_input": {
+                "current_replay_pressure_status": "action_required",
+                "current_replay_pressure_level": "high",
+                "current_replay_pressure_source": "binance_activity_gap",
+                "current_replay_zero_action_streak": 5,
+                "current_replay_binance_zero_action_streak": 5,
+                "current_replay_binance_activity_gap_status": "stale_binance_entries",
+                "current_replay_binance_entry_stale_hours": 73.5,
+                "current_replay_binance_candidate_symbols": ["ESPUSDT", "CHIPUSDT"],
+            },
+        },
+        runner={"direct_alive": True},
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        spot_live=True,
+        futures_live=True,
+        upbit_live=False,
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0.0,
+        max_symbol_exposure_pct=25.0,
+        min_reward_risk=1.3,
+        next_manager_run_at="2026-07-08T08:00:00+09:00",
+    )
+
+    assert payload["activity_pressure"] == {
+        "status": "action_required",
+        "level": "high",
+        "source": "binance_activity_gap",
+        "zero_action_streak": 5,
+        "binance_zero_action_streak": 5,
+        "activity_gap_status": "stale_binance_entries",
+        "entry_stale_hours": 73.5,
+        "candidate_symbols": ["ESPUSDT", "CHIPUSDT"],
+    }
+    assert "binance_activity_pressure_open" in payload["warnings"]
+
+
+def test_binance_block_trader_payload_exposes_activity_repair_actions_for_candidate_symbols() -> None:
+    payload = build_ops_binance_block_trader_payload(
+        enabled=True,
+        status={
+            "status": "ok",
+            "latest_decision_input": {
+                "current_replay_pressure_status": "action_required",
+                "current_replay_pressure_level": "high",
+                "current_replay_pressure_source": "binance_activity_gap",
+                "current_replay_binance_candidate_symbols": [
+                    "ESPUSDT",
+                    "CHIPUSDT",
+                    "",
+                    None,
+                ],
+            },
+        },
+        runner={"direct_alive": True},
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        spot_live=True,
+        futures_live=True,
+        upbit_live=False,
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0.0,
+        max_symbol_exposure_pct=25.0,
+        min_reward_risk=1.3,
+        next_manager_run_at="2026-07-08T08:00:00+09:00",
+    )
+
+    assert payload["activity_repair_actions"] == [
+        {
+            "id": "refresh_binance_crypto_research_context",
+            "label": "Binance 후보 리서치 갱신",
+            "detail": (
+                "활동 공백 후보의 최신 뉴스, 구조, 근거를 다시 수집해 "
+                "research_only/insufficient gate를 줄입니다."
+            ),
+            "severity": "warn",
+            "endpoint": "/api/crypto/research/run-once",
+            "method": "POST",
+            "signals": ["binance_activity_pressure_open"],
+            "request_payload": {"symbols": ["ESPUSDT", "CHIPUSDT"]},
+        },
+        {
+            "id": "collect_binance_market_structure",
+            "label": "Binance 시장 구조 수집",
+            "detail": (
+                "후보 심볼의 kline/market-structure 근거를 갱신해 "
+                "pattern prior와 live crosscheck 결손을 줄입니다."
+            ),
+            "severity": "warn",
+            "endpoint": "/api/crypto/research/collect",
+            "method": "POST",
+            "signals": ["binance_activity_pressure_open"],
+            "request_payload": {"symbols": ["ESPUSDT", "CHIPUSDT"]},
+        },
+        {
+            "id": "refresh_binance_alpha_context",
+            "label": "Binance 알파 컨텍스트 갱신",
+            "detail": (
+                "알파 컨텍스트를 새로 수집해 confidence/live-authority "
+                "판정에 최신 후보 근거를 반영합니다."
+            ),
+            "severity": "warn",
+            "endpoint": "/api/crypto/alpha/collect",
+            "method": "POST",
+            "signals": ["binance_activity_pressure_open"],
+        },
+    ]
+
+
+def test_binance_block_trader_payload_exposes_read_only_entry_activity() -> None:
+    payload = build_ops_binance_block_trader_payload(
+        enabled=True,
+        status={
+            "status": "ok",
+            "entry_activity": {
+                "version": "binance_entry_activity_v1",
+                "status": "stale_binance_entries",
+                "latest_binance_entry_at": "2026-07-05T00:00:00+00:00",
+                "latest_binance_entry_market": "futures",
+                "latest_upbit_entry_at": "2026-07-07T23:00:00+00:00",
+                "binance_entry_stale_hours": 73.5,
+                "binance_entry_count": 2,
+                "upbit_entry_count": 4,
+                "raw": "x" * 20_000,
+            },
+        },
+        runner={"direct_alive": True},
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        spot_live=True,
+        futures_live=True,
+        upbit_live=True,
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0.0,
+        max_symbol_exposure_pct=25.0,
+        min_reward_risk=1.3,
+        next_manager_run_at="2026-07-08T08:00:00+09:00",
+    )
+
+    assert payload["entry_activity"] == {
+        "version": "binance_entry_activity_v1",
+        "status": "stale_binance_entries",
+        "latest_binance_entry_at": "2026-07-05T00:00:00+00:00",
+        "latest_binance_entry_market": "futures",
+        "latest_upbit_entry_at": "2026-07-07T23:00:00+00:00",
+        "binance_entry_stale_hours": 73.5,
+        "binance_entry_count": 2,
+        "upbit_entry_count": 4,
+    }
+    assert "warnings" not in payload
+
+
+def test_binance_block_trader_payload_exposes_contract_replay_recovery() -> None:
+    payload = build_ops_binance_block_trader_payload(
+        enabled=True,
+        status={
+            "status": "ok",
+            "latest_decision_input": {
+                "contract_replay_status": "stored_error_resolved_by_current_contract",
+                "stored_error_message": "missing required field action_type",
+                "current_contract_error": "",
+                "action_count": 1,
+                "current_replay_action_count": 3,
+                "current_replay_auto_action_count": 2,
+                "current_replay_action_sections": [
+                    "create_blocks",
+                    "update_blocks",
+                ],
+                "current_replay_hold_summary": "stored failure now replays",
+                "current_replay_watch_symbols": ["BTCUSDT", "ETHUSDT"],
+                "current_replay_next_triggers": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "market": "futures",
+                        "condition": "pattern prior recovers",
+                        "price": 0.0,
+                        "reason": "pattern prior missing",
+                    }
+                ],
+                "current_replay_data_gaps": ["pattern prior missing"],
+                "current_replay_auto_create_preview": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "entry_style": "wait_for_price",
+                        "entry_trigger_price": 2475.0,
+                        "entry_trigger_operator": ">=",
+                        "entry_price": 2475.0,
+                        "target_price": 2300.0,
+                        "stop_price": 2525.0,
+                        "qty": 0.01,
+                        "quote_budget_usdt": 24.75,
+                        "min_executable_notional_usdt": 20.0,
+                        "min_executable_qty": 0.008081,
+                        "notional_estimate_usdt": 24.75,
+                        "auto_materialized_reason": (
+                            "manager_selected_probe_waiting_block_without_create_action"
+                        ),
+                        "raw": "drop me",
+                    }
+                ],
+                "raw_replay_payload": {"heavy": "drop me"},
+            },
+        },
+        runner={"direct_alive": True},
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        spot_live=True,
+        futures_live=True,
+        upbit_live=False,
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0.0,
+        max_symbol_exposure_pct=25.0,
+        min_reward_risk=1.3,
+        next_manager_run_at="2026-07-08T08:00:00+09:00",
+    )
+
+    assert payload["manager_contract_replay"] == {
+        "contract_replay_status": "stored_error_resolved_by_current_contract",
+        "stored_error_message": "missing required field action_type",
+        "action_count": 1,
+        "current_replay_action_count": 3,
+        "current_replay_auto_action_count": 2,
+        "current_replay_action_sections": ["create_blocks", "update_blocks"],
+        "current_replay_hold_summary": "stored failure now replays",
+        "current_replay_watch_symbols": ["BTCUSDT", "ETHUSDT"],
+        "current_replay_next_triggers": [
+            {
+                "symbol": "ETHUSDT",
+                "market": "futures",
+                "condition": "pattern prior recovers",
+                "price": 0.0,
+                "reason": "pattern prior missing",
+            }
+        ],
+        "current_replay_data_gaps": ["pattern prior missing"],
+        "current_replay_auto_create_preview": [
+            {
+                "symbol": "ETHUSDT",
+                "market": "futures",
+                "side": "short",
+                "entry_style": "wait_for_price",
+                "entry_trigger_price": 2475.0,
+                "entry_trigger_operator": ">=",
+                "entry_price": 2475.0,
+                "target_price": 2300.0,
+                "stop_price": 2525.0,
+                "qty": 0.01,
+                "quote_budget_usdt": 24.75,
+                "min_executable_notional_usdt": 20.0,
+                "min_executable_qty": 0.008081,
+                "notional_estimate_usdt": 24.75,
+                "auto_materialized_reason": (
+                    "manager_selected_probe_waiting_block_without_create_action"
+                ),
+            }
+        ],
+    }
+    assert "binance_manager_contract_replay_recovered" in payload["warnings"]
+
+
+def test_binance_block_trader_payload_exposes_current_contract_replay_error() -> None:
+    payload = build_ops_binance_block_trader_payload(
+        enabled=True,
+        status={
+            "status": "ok",
+            "latest_decision_input": {
+                "contract_replay_status": "current_contract_error",
+                "stored_error_message": "validation_repair_resolution_missing_from_model",
+                "current_contract_error": (
+                    "binance_activity_gap_resolution_missing_from_model"
+                ),
+                "action_count": 0,
+                "current_replay_action_count": 0,
+                "raw_replay_payload": {"heavy": "drop me"},
+            },
+        },
+        runner={"direct_alive": True},
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        spot_live=True,
+        futures_live=True,
+        upbit_live=False,
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0.0,
+        max_symbol_exposure_pct=25.0,
+        min_reward_risk=1.3,
+        next_manager_run_at="2026-07-08T08:00:00+09:00",
+    )
+
+    assert payload["manager_contract_replay"] == {
+        "contract_replay_status": "current_contract_error",
+        "stored_error_message": "validation_repair_resolution_missing_from_model",
+        "current_contract_error": (
+            "binance_activity_gap_resolution_missing_from_model"
+        ),
+        "action_count": 0,
+        "current_replay_action_count": 0,
+    }
+    assert "binance_manager_contract_replay_current_error" in payload["warnings"]
+
+
+def test_binance_block_trader_payload_warns_on_unresolved_manager_error() -> None:
+    payload = build_ops_binance_block_trader_payload(
+        enabled=True,
+        status={
+            "status": "ok",
+            "latest_manager_status": "error",
+            "latest_unresolved_manager_error": {
+                "run_at": "2026-07-08T00:00:00+00:00",
+                "status": "error",
+                "mode": "llm",
+                "error_message": "validation_repair_resolution_missing_from_model",
+            },
+            "latest_manager_error_recovered": False,
+        },
+        runner={"direct_alive": True},
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        spot_live=True,
+        futures_live=True,
+        upbit_live=True,
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0.0,
+        max_symbol_exposure_pct=25.0,
+        min_reward_risk=1.3,
+        next_manager_run_at="2026-07-08T08:00:00+09:00",
+    )
+
+    assert "binance_block_manager_last_run_failed" in payload["warnings"]
+
+
+def test_binance_block_trader_payload_suppresses_replay_recovered_manager_error() -> None:
+    payload = build_ops_binance_block_trader_payload(
+        enabled=True,
+        status={
+            "status": "ok",
+            "latest_manager_status": "error",
+            "latest_unresolved_manager_error": {
+                "run_at": "2026-07-08T00:00:00+00:00",
+                "status": "error",
+                "mode": "llm",
+                "error_message": "validation_repair_resolution_missing_from_model",
+            },
+            "latest_manager_error_recovered": False,
+            "latest_decision_input": {
+                "contract_replay_status": "stored_error_resolved_by_current_contract",
+                "stored_error_message": "validation_repair_resolution_missing_from_model",
+                "current_contract_error": "",
+                "action_count": 0,
+                "current_replay_action_count": 0,
+            },
+        },
+        runner={"direct_alive": True},
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        spot_live=True,
+        futures_live=True,
+        upbit_live=True,
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0.0,
+        max_symbol_exposure_pct=25.0,
+        min_reward_risk=1.3,
+        next_manager_run_at="2026-07-08T08:00:00+09:00",
+    )
+
+    assert "binance_block_manager_last_run_failed" not in payload.get("warnings", [])
+    assert payload["manager_contract_replay"]["contract_replay_status"] == (
+        "stored_error_resolved_by_current_contract"
+    )
+
+
+def test_binance_block_trader_payload_suppresses_stale_manager_error_after_restart() -> None:
+    payload = build_ops_binance_block_trader_payload(
+        enabled=True,
+        status={
+            "status": "ok",
+            "latest_manager_status": "error",
+            "latest_unresolved_manager_error": {
+                "run_at": "2026-07-08T00:00:00+00:00",
+                "status": "error",
+                "mode": "llm",
+                "error_message": "validation_repair_resolution_missing_from_model",
+            },
+            "latest_manager_error_recovered": False,
+        },
+        runner={
+            "direct_alive": True,
+            "started_at_epoch": datetime(
+                2026,
+                7,
+                8,
+                1,
+                0,
+                tzinfo=timezone.utc,
+            ).timestamp(),
+        },
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        spot_live=True,
+        futures_live=True,
+        upbit_live=True,
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0.0,
+        max_symbol_exposure_pct=25.0,
+        min_reward_risk=1.3,
+        next_manager_run_at="2026-07-08T08:00:00+09:00",
+    )
+
+    assert "binance_block_manager_last_run_failed" not in payload.get(
+        "warnings",
+        [],
+    )
+    assert payload["status"]["latest_manager_error_stale_after_restart"] is True
+    assert payload["status"]["latest_stale_manager_error"] == {
+        "run_at": "2026-07-08T00:00:00+00:00",
+        "status": "error",
+        "mode": "llm",
+        "error_message": "validation_repair_resolution_missing_from_model",
+    }
+    assert "latest_unresolved_manager_error" not in payload["status"]
+    assert "latest_manager_error" not in payload["status"]
+
+
+def test_main_wires_binance_status_into_llm_operational_payload() -> None:
+    main_source = (ROOT / "src/tradecraft/main.py").read_text()
+
+    assert "binance_block_status=binance_block_status" in main_source
+
+
 def test_build_ops_jue_wiki_payload_exposes_phase3_application_fields() -> None:
     payload = build_ops_jue_wiki_payload(
         enabled=True,
@@ -1769,7 +2586,10 @@ def test_build_ops_jue_wiki_payload_exposes_requested_symbol_coverage_gaps() -> 
         "prompt_omitted_symbols": ["178920"],
     }
     assert "jue_wiki_requested_symbol_summaries_missing" in payload["warnings"]
-    assert "jue_wiki_requested_symbol_summaries_prompt_omitted" in payload["warnings"]
+    assert (
+        "jue_wiki_requested_symbol_summaries_prompt_omitted"
+        in payload["advisories"]
+    )
 
 
 def test_build_ops_jue_wiki_payload_exposes_degraded_requested_symbol_summaries() -> None:
@@ -1817,7 +2637,7 @@ def test_build_ops_jue_wiki_payload_exposes_degraded_requested_symbol_summaries(
             "quality_warnings": ["valuation_stale_gt_30d"],
         }
     ]
-    assert "jue_wiki_requested_symbol_summaries_degraded" in payload["warnings"]
+    assert "jue_wiki_requested_symbol_summaries_degraded" in payload["advisories"]
 
 
 def test_build_ops_jue_wiki_payload_exposes_repair_pressure_summary() -> None:
@@ -1860,8 +2680,10 @@ def test_build_ops_jue_wiki_payload_exposes_repair_pressure_summary() -> None:
             "financials_missing": 1,
         },
     }
-    assert "jue_wiki_requested_symbol_repair_pressure_open" in payload["warnings"]
-    assert "jue_wiki_financials_repair_pressure_open" in payload["warnings"]
+    assert (
+        "jue_wiki_requested_symbol_repair_pressure_open" in payload["advisories"]
+    )
+    assert "jue_wiki_financials_repair_pressure_open" in payload["advisories"]
 
 
 def test_build_ops_jue_wiki_payload_warns_for_degraded_summary_repair_pressure() -> None:
@@ -1889,7 +2711,9 @@ def test_build_ops_jue_wiki_payload_warns_for_degraded_summary_repair_pressure()
     assert payload["repair_pressure"]["primary_warning"] == (
         "requested_symbol_summary_degraded"
     )
-    assert "jue_wiki_requested_symbol_repair_pressure_open" in payload["warnings"]
+    assert (
+        "jue_wiki_requested_symbol_repair_pressure_open" in payload["advisories"]
+    )
 
 
 def test_build_ops_jue_wiki_payload_does_not_warn_for_mixed_effectiveness_pool() -> None:
@@ -1952,6 +2776,26 @@ def test_merge_section_readiness_signals_promotes_jue_wiki_top_level_warnings() 
     assert payload["status"] == "red"
     assert payload["warnings"] == ["jue_wiki_prompt_pressure_high"]
     assert payload["blockers"] == ["jue_wiki_unavailable"]
+
+
+def test_merge_section_readiness_signals_keeps_advisory_remediation_actions() -> None:
+    payload = merge_section_readiness_signals(
+        {
+            "status": "green",
+            "blockers": [],
+            "warnings": [],
+            "advisories": ["trading_validation_lane_authority_reduced_binance"],
+            "stale_processes": [],
+            "missing_processes": [],
+            "duplicate_processes": [],
+            "remediation_actions": [],
+        },
+        {"warnings": ["trading_validation_stale_binance"]},
+    )
+
+    action_ids = [row["id"] for row in payload["remediation_actions"]]
+    assert "review_lane_authority_reductions" in action_ids
+    assert "refresh_trading_validation" in action_ids
 
 
 def test_build_ops_market_trader_crypto_payloads_preserve_endpoint_contracts() -> None:
@@ -2363,3 +3207,200 @@ def test_build_ops_binance_block_trader_payload_separates_recovered_manager_erro
     }
     assert payload["status"]["latest_manager_error_recovered"] is True
     assert "latest_unresolved_manager_error" not in payload["status"]
+
+
+def test_build_ops_jue_wiki_payload_exposes_stored_v3_health_and_eligibility(
+    monkeypatch,
+) -> None:
+    from tradecraft.services.jue_wiki import JueWikiService
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("ops readiness must consume stored Wiki state only")
+
+    monkeypatch.setattr(JueWikiService, "project_status_snapshot", fail_if_called)
+    monkeypatch.setattr(JueWikiService, "repair_once", fail_if_called)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    stored_v3 = {
+        "active_read_mode": "required",
+        "publication_age_sec": 901,
+        "published_by_scope": {
+            "kis": "snapshot:kis:stored",
+            "binance": "snapshot:binance:stored",
+        },
+        "stale_count": 2,
+        "conflicted_count": 1,
+        "orphan_page_count": 1,
+        "repair_backlog_count": 3,
+        "last_compile_status": "error",
+        "last_publish_status": "ok",
+        "last_projection_status": "warning",
+        "index_rebuild": {"status": "missing", "scope": "kis"},
+        "by_scope": {
+            "kis": {
+                "snapshot_id": "snapshot:kis:stored",
+                "snapshot_created_at": now_iso,
+                "last_ingest_status": "ok",
+                "last_compile_status": "error",
+                "last_lint_status": "ok",
+                "last_publish_status": "ok",
+                "last_projection_status": "warning",
+                "index_rebuild": {"status": "missing"},
+                "stale_count": 2,
+                "conflicted_count": 1,
+                "orphan_page_count": 1,
+                "repair_backlog_count": 3,
+            },
+            "binance": {
+                "snapshot_id": "snapshot:binance:stored",
+                "snapshot_created_at": now_iso,
+                "last_ingest_status": "ok",
+                "last_compile_status": "ok",
+                "last_lint_status": "ok",
+                "last_publish_status": "ok",
+                "last_projection_status": "ok",
+                "index_rebuild": {"status": "ok"},
+                "stale_count": 0,
+                "conflicted_count": 0,
+                "orphan_page_count": 0,
+                "repair_backlog_count": 0,
+            },
+        },
+        "mode_eligibility": {
+            "kis": {
+                "version": "wiki_shadow_eligibility_v1",
+                "venue": "kis",
+                "complete_sample_count": 500,
+                "required_eligible": False,
+                "blockers": ["safety_gate_divergence"],
+                "evaluated_at": now_iso,
+                "evaluated_through": now_iso,
+            },
+            "binance": {
+                "version": "wiki_shadow_eligibility_v1",
+                "venue": "binance",
+                "complete_sample_count": 520,
+                "required_eligible": True,
+                "blockers": [],
+                "evaluated_at": now_iso,
+                "evaluated_through": now_iso,
+            },
+        },
+    }
+
+    payload = build_ops_jue_wiki_payload(
+        enabled=True,
+        status={"status": "ok", "v3": stored_v3},
+        runner={"alive": True, "status": "running"},
+        state_path=".runtime/jue_wiki_runner.json",
+        interval_sec=1800,
+    )
+
+    assert payload["v3"] == stored_v3
+    assert payload["active_read_mode"] == "required"
+    assert payload["publication_age_sec"] == 901
+    assert payload["comparison_count_by_venue"] == {"kis": 500, "binance": 520}
+    assert payload["eligibility_by_venue"]["kis"]["required_eligible"] is False
+    assert payload["eligibility_by_venue"]["binance"]["required_eligible"] is True
+    assert "jue_wiki_required_knowledge_degraded" in payload["warnings"]
+    assert "jue_wiki_required_kis_compile_error" in payload["blockers"]
+    assert "jue_wiki_required_kis_index_missing" in payload["blockers"]
+    assert (
+        "jue_wiki_required_kis_eligibility_safety_gate_divergence"
+        in payload["blockers"]
+    )
+
+
+def test_build_ops_jue_wiki_payload_keeps_prefer_degradation_advisory() -> None:
+    payload = build_ops_jue_wiki_payload(
+        enabled=True,
+        status={
+            "status": "ok",
+            "v3": {
+                "active_read_mode": "prefer",
+                "stale_count": 1,
+                "conflicted_count": 0,
+                "orphan_page_count": 0,
+                "repair_backlog_count": 0,
+                "last_compile_status": "ok",
+                "index_rebuild": {"status": "ok"},
+                "mode_eligibility": {
+                    "kis": {
+                        "complete_sample_count": 499,
+                        "required_eligible": False,
+                        "blockers": ["insufficient_complete_comparisons"],
+                    }
+                },
+            },
+        },
+        runner={"alive": True, "status": "running"},
+        state_path=".runtime/jue_wiki_runner.json",
+        interval_sec=1800,
+    )
+
+    assert payload["active_read_mode"] == "prefer"
+    assert "jue_wiki_prefer_knowledge_degraded" in payload["warnings"]
+    assert not any(
+        signal.startswith("jue_wiki_required_") for signal in payload["blockers"]
+    )
+
+
+def test_stored_wiki_required_unavailable_status_is_red() -> None:
+    payload = ops_payloads.build_stored_jue_wiki_readiness_status(
+        {"status": "unavailable", "reason": "ops_snapshot_missing"},
+        configured_read_mode="required",
+        now=datetime(2026, 7, 12, 0, 5, tzinfo=timezone.utc),
+    )
+
+    assert payload["configured_read_mode"] == "required"
+    assert payload["stored_read_mode"] == ""
+    assert payload["read_mode_mismatch"] is True
+    assert "jue_wiki_required_status_unavailable" in payload["blockers"]
+    assert "jue_wiki_required_v3_missing" in payload["blockers"]
+
+
+def test_stored_wiki_required_uses_scope_health_and_validates_eligibility() -> None:
+    now = datetime(2026, 7, 12, 0, 5, tzinfo=timezone.utc)
+    payload = ops_payloads.build_stored_jue_wiki_readiness_status(
+        {
+            "status": "ok",
+            "v3": {
+                "active_read_mode": "required",
+                "by_scope": {
+                    "kis": {
+                        "snapshot_id": "snapshot:kis:1",
+                        "snapshot_created_at": "2026-07-12T00:00:00+00:00",
+                        "last_ingest_status": "ok",
+                        "last_compile_status": "warning",
+                        "last_lint_status": "ok",
+                        "last_publish_status": "ok",
+                        "last_projection_status": "warning",
+                        "projection_warning_reason": "cleanup_only",
+                        "index_rebuild": {"status": "ok"},
+                        "stale_count": 0,
+                        "conflicted_count": 0,
+                        "orphan_page_count": 0,
+                        "repair_backlog_count": 0,
+                    }
+                },
+                "mode_eligibility": {
+                    "kis": {
+                        "version": "wiki_shadow_eligibility_v1",
+                        "venue": "kis",
+                        "required_eligible": True,
+                        "complete_sample_count": True,
+                        "blockers": [],
+                        "evaluated_at": "2026-07-12T00:00:00+00:00",
+                        "evaluated_through": "2026-07-11T23:59:00+00:00",
+                    }
+                },
+            },
+        },
+        configured_read_mode="required",
+        now=now,
+    )
+
+    assert "jue_wiki_required_kis_compile_warning" in payload["blockers"]
+    assert "jue_wiki_required_binance_scope_missing" in payload["blockers"]
+    assert "jue_wiki_required_kis_eligibility_sample_invalid" in payload["blockers"]
+    assert "jue_wiki_required_binance_eligibility_missing" in payload["blockers"]
+    assert "jue_wiki_required_kis_projection_warning" not in payload["blockers"]

@@ -67,6 +67,45 @@ def test_binance_blocks_router_status_adds_validation_and_readiness() -> None:
     }
 
 
+def test_binance_blocks_router_status_promotes_activity_pressure() -> None:
+    activity_pressure = {
+        "status": "action_required",
+        "level": "high",
+        "source": "binance_activity_gap",
+        "candidate_symbols": ["ESPUSDT"],
+    }
+    app = _app(
+        BinanceBlockRouteDeps(
+            require_admin_auth=lambda: None,
+            blocks_snapshot=lambda compact=False: {
+                "status": "ok",
+                "compact": compact,
+                "blocks": [],
+            },
+            validation_repair_ops_summary=lambda target_scope, limit: {},
+            build_readiness=lambda payload: {
+                "status": payload["status"],
+                "activity_pressure": activity_pressure,
+                "warnings": ["binance_activity_pressure_open"],
+            },
+            quant_signals=lambda symbols, limit: {},
+            pattern_context=lambda symbols, limit: {},
+            manager_run_once=lambda: {},
+            spot_adoption_once=lambda: {},
+            upbit_adoption_once=None,
+            executor_tick=lambda: {},
+            set_kill_switch=lambda enabled, reason: {},
+        )
+    )
+
+    response = TestClient(app).get("/api/binance/blocks/status?compact=1")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["activity_pressure"] == activity_pressure
+    assert payload["readiness"]["warnings"] == ["binance_activity_pressure_open"]
+
+
 def test_binance_blocks_router_status_uses_short_operational_history() -> None:
     app = _app(
         BinanceBlockRouteDeps(
@@ -744,6 +783,96 @@ def test_binance_blocks_router_awaits_manager_actions() -> None:
     assert manager_response.json() == {"status": "manager-ok"}
     assert tick_response.json() == {"status": "tick-ok"}
     assert calls == ["manager", "tick"]
+
+
+def test_binance_blocks_manager_run_requires_confirmation_when_live() -> None:
+    calls: list[str] = []
+
+    async def manager() -> dict[str, Any]:
+        calls.append("manager")
+        return {"status": "manager-ok"}
+
+    app = _app(
+        BinanceBlockRouteDeps(
+            require_admin_auth=lambda: None,
+            blocks_snapshot=lambda compact=False: {},
+            validation_repair_ops_summary=lambda target_scope, limit: {},
+            build_readiness=lambda payload: {
+                "execution": {
+                    "spot_mode": "live",
+                    "futures_mode": "paper",
+                    "upbit_spot_mode": "paper",
+                }
+            },
+            quant_signals=lambda symbols, limit: {},
+            pattern_context=lambda symbols, limit: {},
+            manager_run_once=manager,
+            spot_adoption_once=lambda: {"status": "spot-ok"},
+            upbit_adoption_once=None,
+            executor_tick=lambda: {"status": "tick-ok"},
+            set_kill_switch=lambda enabled, reason: {},
+        )
+    )
+    client = TestClient(app)
+
+    blocked = client.post("/api/binance/blocks/manager/run-once")
+    confirmed = client.post(
+        "/api/binance/blocks/manager/run-once",
+        json={"confirm_live_manager_run": True},
+    )
+
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == (
+        "binance manager run requires confirmation while live crypto execution is enabled"
+    )
+    assert confirmed.status_code == 200
+    assert confirmed.json() == {"status": "manager-ok"}
+    assert calls == ["manager"]
+
+
+def test_binance_blocks_executor_tick_requires_confirmation_when_live() -> None:
+    calls: list[str] = []
+
+    async def tick() -> dict[str, Any]:
+        calls.append("tick")
+        return {"status": "tick-ok"}
+
+    app = _app(
+        BinanceBlockRouteDeps(
+            require_admin_auth=lambda: None,
+            blocks_snapshot=lambda compact=False: {},
+            validation_repair_ops_summary=lambda target_scope, limit: {},
+            build_readiness=lambda payload: {
+                "execution": {
+                    "spot_mode": "paper",
+                    "futures_mode": "live",
+                    "upbit_spot_mode": "paper",
+                }
+            },
+            quant_signals=lambda symbols, limit: {},
+            pattern_context=lambda symbols, limit: {},
+            manager_run_once=lambda: {"status": "manager-ok"},
+            spot_adoption_once=lambda: {"status": "spot-ok"},
+            upbit_adoption_once=None,
+            executor_tick=tick,
+            set_kill_switch=lambda enabled, reason: {},
+        )
+    )
+    client = TestClient(app)
+
+    blocked = client.post("/api/binance/blocks/executor/tick")
+    confirmed = client.post(
+        "/api/binance/blocks/executor/tick",
+        json={"confirm_live_executor_tick": True},
+    )
+
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == (
+        "binance executor tick requires confirmation while live crypto execution is enabled"
+    )
+    assert confirmed.status_code == 200
+    assert confirmed.json() == {"status": "tick-ok"}
+    assert calls == ["tick"]
 
 
 def test_binance_blocks_router_parses_quant_symbols_and_limit() -> None:

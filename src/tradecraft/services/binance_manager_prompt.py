@@ -10,7 +10,11 @@ from tradecraft.services.binance_lane import (
     normalize_binance_display_lane,
     normalize_binance_horizon,
 )
-from tradecraft.services.binance_symbol import normalize_market, normalize_position_side
+from tradecraft.services.binance_symbol import (
+    explicit_market_scope,
+    normalize_market,
+    normalize_position_side,
+)
 from tradecraft.services.jue_decision_packet import (
     build_canonical_decision_prompt_bundle,
 )
@@ -19,6 +23,7 @@ from tradecraft.services.jue_wiki_prompt_quality import (
     canonical_jue_wiki_evidence_quality,
     jue_wiki_quality_status_from_evidence,
 )
+from tradecraft.services.jue_wiki_contract import WIKI_GATE_IDENTITY_MAX_CHARS
 from tradecraft.services.manager_prompt_budget import (
     attach_prompt_budget as build_attach_prompt_budget,
     format_prompt_budget_alert_message as build_format_prompt_budget_alert_message,
@@ -33,6 +38,7 @@ BINANCE_MANAGER_ACTION_SECTIONS = (
     "close_blocks",
     "pause_blocks",
 )
+FUTURES_POSITION_MIN_MANAGEABLE_NOTIONAL_USDT = 5.0
 
 
 def _json_dumps(value: Any) -> str:
@@ -420,11 +426,16 @@ def is_meaningful_futures_risk_row(row: dict[str, Any]) -> bool:
 
 
 def compact_futures_risk_row(row: dict[str, Any]) -> dict[str, Any]:
-    return {
+    position_amt = _safe_float(row.get("position_amt") or row.get("positionAmt"))
+    entry_price = _safe_float(row.get("entry_price") or row.get("entryPrice"))
+    mark_price = _safe_float(row.get("mark_price") or row.get("markPrice"))
+    reference_price = mark_price if mark_price > 0 else entry_price
+    position_notional = abs(position_amt) * reference_price if reference_price > 0 else 0.0
+    compact = {
         "symbol": _clean_text(row.get("symbol"), limit=32).upper(),
-        "position_amt": _safe_float(row.get("position_amt") or row.get("positionAmt")),
-        "entry_price": _safe_float(row.get("entry_price") or row.get("entryPrice")),
-        "mark_price": _safe_float(row.get("mark_price") or row.get("markPrice")),
+        "position_amt": position_amt,
+        "entry_price": entry_price,
+        "mark_price": mark_price,
         "liquidation_price": _safe_float(
             row.get("liquidation_price") or row.get("liquidationPrice")
         ),
@@ -435,7 +446,18 @@ def compact_futures_risk_row(row: dict[str, Any]) -> dict[str, Any]:
             or row.get("unRealizedProfit")
             or row.get("unrealizedProfit")
         ),
+        "position_notional_usdt": round(position_notional, 8),
+        "management_status": (
+            "dust_below_min_notional"
+            if 0 < position_notional < FUTURES_POSITION_MIN_MANAGEABLE_NOTIONAL_USDT
+            else "open_position"
+        ),
     }
+    if compact["management_status"] == "dust_below_min_notional":
+        compact["min_manageable_notional_usdt"] = (
+            FUTURES_POSITION_MIN_MANAGEABLE_NOTIONAL_USDT
+        )
+    return compact
 
 
 def compact_manager_account_for_prompt(account: dict[str, Any]) -> dict[str, Any]:
@@ -447,6 +469,11 @@ def compact_manager_account_for_prompt(account: dict[str, Any]) -> dict[str, Any
         for row in futures_risk
         if is_meaningful_futures_risk_row(row)
     ][:20]
+    dust_count = sum(
+        1
+        for row in visible_risk
+        if row.get("management_status") == "dust_below_min_notional"
+    )
     errors = [
         {
             "source": _clean_text(row.get("source"), limit=80),
@@ -484,6 +511,7 @@ def compact_manager_account_for_prompt(account: dict[str, Any]) -> dict[str, Any
             "omitted_zero_count": sum(
                 1 for row in futures_risk if not is_meaningful_futures_risk_row(row)
             ),
+            "dust_count": dust_count,
         },
     }
     if errors:
@@ -797,6 +825,40 @@ def compact_binance_memory_for_prompt(
     if not isinstance(compact, dict):
         compact = {}
 
+    bounded_string_limit = max(min(int(string_limit), 120), 48)
+    bounded_list_limit = max(min(int(list_limit), 4), 1)
+    bounded_dict_limit = max(min(int(list_limit) * 2, 12), 4)
+    for key in (
+        "policy_rule_evaluation",
+        "validation_repair_backlog",
+        "block_design_constraints",
+        "next_block_design_playbook",
+    ):
+        if key not in scoped_value:
+            continue
+        compact[key] = compact_prompt_value_bounded(
+            scoped_value.get(key),
+            string_limit=bounded_string_limit,
+            list_limit=bounded_list_limit,
+            dict_limit=bounded_dict_limit,
+        )
+    for key in (
+        "policy_rules",
+        "policy_scorecards",
+        "active_policies",
+        "policy_revisions",
+        "policy_outcomes",
+        "active_insights",
+    ):
+        if key not in scoped_value:
+            continue
+        compact[key] = compact_prompt_value_bounded(
+            scoped_value.get(key),
+            string_limit=bounded_string_limit,
+            list_limit=bounded_list_limit,
+            dict_limit=bounded_dict_limit,
+        )
+
     recovery = (
         scoped_value.get("validation_recovery_summary")
         if isinstance(scoped_value.get("validation_recovery_summary"), dict)
@@ -1035,6 +1097,9 @@ _PROMPT_BOUNDED_PRIORITY_KEYS = (
     "live_grade",
     "max_budget_multiplier",
     "budget_multiplier",
+    "risk_budget_multiplier",
+    "min_reward_risk",
+    "max_stop_risk_pct",
     "requires_waiting_entry",
     "scale_up_allowed",
     "pattern_live_crosscheck",
@@ -2447,6 +2512,28 @@ def manager_action_candidate_keys(actions: Any) -> set[tuple[str, str, str, str]
     return keys
 
 
+def _manager_prompt_priority_candidate_keys(
+    prompt: dict[str, Any],
+    existing: set[tuple[str, str, str, str]] | None = None,
+) -> set[tuple[str, str, str, str]]:
+    keys = set(existing or set())
+    if not isinstance(prompt, dict):
+        return keys
+    pressure = prompt.get("proactive_decision_pressure")
+    pressure = pressure if isinstance(pressure, dict) else {}
+    top_candidates = pressure.get("top_candidates")
+    if isinstance(top_candidates, dict) and isinstance(
+        top_candidates.get("items"),
+        list,
+    ):
+        top_candidates = top_candidates.get("items")
+    for row in _as_list(top_candidates):
+        key = manager_candidate_identity_from_payload(row)
+        if key:
+            keys.add(key)
+    return keys
+
+
 def prioritize_manager_candidate_rows(
     rows: Any,
     priority_candidate_keys: set[tuple[str, str, str, str]],
@@ -2490,7 +2577,8 @@ def _candidate_compaction_lane(row: Any) -> str:
         lane = str(row.get("lane") or "").strip().lower()
         if lane:
             return lane
-        market = normalize_market(row.get("market") or row.get("venue"))
+        raw_market = row.get("market") or row.get("venue")
+        market = normalize_market(raw_market) if raw_market not in (None, "") else ""
         side = normalize_position_side(row.get("side") or row.get("stance"))
         return f"{market}:{side}"
     return "unknown"
@@ -2711,6 +2799,29 @@ def build_binance_manager_prompt_payload(
                     "causes the run to fail and no trade action will be applied."
                 ),
             },
+            "create_blocks_candidate_visibility": {
+                "required": True,
+                "error": "manager_create_candidate_not_visible",
+                "instruction": (
+                    "New create_blocks must use symbols and markets visible in "
+                    "candidates/candidates.items. market_universe is a research and "
+                    "quote scope, not permission to invent a new block. If a "
+                    "market_universe symbol looks attractive but is absent from visible "
+                    "candidates, put it in hold_decision.watch_symbols/data_gaps or "
+                    "wait for candidate generation to surface it."
+                ),
+            },
+            "waiting_entry_gate_hint": {
+                "instruction": (
+                    "When candidates[].waiting_entry_gate_hint.status is "
+                    "waiting_entry_base_gate_available, the candidate is below the "
+                    "immediate entry gate but still meets the small waiting-entry "
+                    "base gate. Do not reject solely on immediate min_confidence; "
+                    "either create/update the small wait_for_price block if live "
+                    "spread, depth, funding, pattern, venue, and risk gates pass, "
+                    "or reject with the current gate that blocks execution."
+                )
+            },
             "validation_repair_resolution": {
                 "required_when_validation_repair_present": True,
                 "accepted_resolutions": [
@@ -2724,6 +2835,59 @@ def build_binance_manager_prompt_payload(
                     "repair discipline or degraded wiki page addressed",
                     "next executable trigger or precise data gap recorded",
                 ],
+                "action_required_for_resolutions": {
+                    "resolutions": [
+                        "probe_waiting_block",
+                        "small_waiting_block",
+                        "one_share_probe",
+                        "create or update a smaller waiting/probe block",
+                    ],
+                    "required_action_sections": ["create_blocks", "update_blocks"],
+                    "error": (
+                        "validation_repair_action_missing_from_model: executable "
+                        "validation_repair_resolution rows such as probe_waiting_block, "
+                        "small_waiting_block, one_share_probe, or create/update "
+                        "waiting probe must include a matching "
+                        "create_blocks or update_blocks action for the same symbol and "
+                        "market. Use candidate_rejected or safety_gate_defer when no "
+                        "action is selected."
+                    ),
+                },
+                "repairable_probe_design": {
+                    "required_when_present": (
+                        "proactive_decision_pressure.top_candidates[]."
+                        "validation_repair_probe_design"
+                    ),
+                    "allowed_rejection_evidence": [
+                        "spread/depth/orderbook/liquidity gate",
+                        "funding or derivatives venue gate",
+                        "confidence or safety gate",
+                    ],
+                    "error": (
+                        "validation_repair_probe_design_ignored_from_model: when a "
+                        "top candidate contains validation_repair_probe_design, do "
+                        "not reject it solely because the original stop was wider "
+                        "than validation_repair. Either create/update the matching "
+                        "waiting probe from the provided design, or reject with a "
+                        "current live execution gate such as spread, depth, funding, "
+                        "liquidity, confidence, venue availability, or safety gate "
+                        "inside evidence_gap/reason. next_trigger alone does not "
+                        "satisfy this rejection evidence; it is only the future "
+                        "unlock condition. pattern prior, research_only, "
+                        "immediate_block_allowed=false, and original stop/RR "
+                        "defects are not sufficient rejection evidence when the "
+                        "provided validation_repair_probe_design already repairs "
+                        "the executable waiting-entry geometry."
+                    ),
+                    "min_executable_qty_error": (
+                        "validation_repair_min_executable_qty_missing_from_model: "
+                        "when validation_repair_probe_design includes "
+                        "min_executable_qty, matching create_blocks/update_blocks "
+                        "actions must use qty at or above that value, or reject the "
+                        "candidate with a current live execution gate instead of "
+                        "creating an unexecutable dust probe."
+                    ),
+                },
                 "instruction": (
                     "validation_repair, jue_wiki_repair_contract, "
                     "jue_wiki_validation_repair_contract, and "
@@ -3262,7 +3426,10 @@ def build_binance_manager_prompt_payload(
             ],
             "create_blocks": [
                 {
-                    "symbol": "BTCUSDT",
+                    "symbol": (
+                        "BTCUSDT; must match one of the visible candidates for the "
+                        "same market"
+                    ),
                     "market": "spot|futures|upbit_spot (venue alias accepted)",
                     "side": "long|short",
                     "horizon": (
@@ -3282,7 +3449,11 @@ def build_binance_manager_prompt_payload(
                     "stop_price": "required number; stop_price_usdt alias accepted",
                     "leverage": "futures integer <= max_futures_leverage",
                     "margin_type": "isolated for futures",
-                    "liquidation_price": "required for futures live readiness",
+                    "liquidation_price": (
+                        "required for active futures live entry/open blocks; "
+                        "optional for proposed wait_for_price futures probes, but "
+                        "must be supplied or refreshed before the trigger can open"
+                    ),
                     "calculated_price_plan": "copy from candidate.calculated",
                     "pattern_live_crosscheck": (
                         "copy from candidate.calculated.pattern_live_crosscheck when present"
@@ -3465,7 +3636,8 @@ def build_binance_manager_prompt_payload(
                 "blanket_hold_allowed": False,
             },
         },
-        "native_thread_mode": "ephemeral",
+        "native_thread_mode": "daily",
+        "native_thread_key": "binance:block_manager:{date}",
     }
     payload["native_output_schema"] = payload["output_schema"]
     return payload
@@ -3766,14 +3938,23 @@ def _compact_prompt_storage_sequence_section(
         priority_candidate_keys=priority_candidate_keys or set(),
         lane_diverse=lane_diverse,
     )
+    item_list_limit = bounded_limit if lane_diverse else max(min(bounded_limit, 4), 1)
     return {
         "item_count": item_count,
         "items": compact_value(
             rows,
             string_limit=string_limit,
-            list_limit=max(min(bounded_limit, 4), 1),
+            list_limit=item_list_limit,
         ),
     }
+
+
+def _runtime_prompt_sequence_items(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, dict) and isinstance(value.get("items"), list):
+        return list(value.get("items") or [])
+    return []
 
 
 def _compact_prompt_storage_mapping_section(
@@ -3842,6 +4023,8 @@ def _compact_manager_prompt_emergency_section(
             string_limit=string_limit,
             list_limit=list_limit,
         )
+    if key == "proactive_decision_pressure":
+        return compact_proactive_decision_pressure_for_latency(value)
     if key == "validation_repair":
         return compact_validation_repair_for_storage(
             value,
@@ -3884,6 +4067,86 @@ def _binance_memory_has_manager_contract_recovery(value: Any) -> bool:
         else {}
     )
     return bool(_as_list(recovery.get("manager_contract_recovered")))
+
+
+def _bounded_wiki_identity(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value[:WIKI_GATE_IDENTITY_MAX_CHARS]
+
+
+def compact_wiki_gate_storage_contracts(value: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    gate = value.get("jue_wiki_decision_gate")
+    if isinstance(gate, dict):
+        compact_gate: dict[str, Any] = {}
+        for key in ("allow_new_risk", "allow_exit_actions"):
+            if type(gate.get(key)) is bool:
+                compact_gate[key] = gate[key]
+        for key in ("reason", "snapshot_id"):
+            if gate.get(key) not in (None, ""):
+                compact_gate[key] = _bounded_wiki_identity(gate.get(key))
+        for key, limit in (("read_mode", 16), ("version", 40)):
+            if gate.get(key) not in (None, ""):
+                compact_gate[key] = _clean_text(gate.get(key), limit=limit)
+        out["jue_wiki_decision_gate"] = compact_gate
+    policy = value.get("jue_wiki_decision_gate_policy")
+    if isinstance(policy, dict):
+        out["jue_wiki_decision_gate_policy"] = {
+            "instruction": _clean_text(policy.get("instruction"), limit=120)
+        }
+    strip_audit = value.get("jue_wiki_raw_rag_strip_audit")
+    if isinstance(strip_audit, dict):
+        out["jue_wiki_raw_rag_strip_audit"] = {
+            "read_mode": _clean_text(strip_audit.get("read_mode"), limit=16),
+            "snapshot_id": _bounded_wiki_identity(strip_audit.get("snapshot_id")),
+            "removed_path_count": _safe_int(strip_audit.get("removed_path_count")),
+            "removed_paths": [
+                _clean_text(path, limit=48)
+                for path in _as_list(strip_audit.get("removed_paths"))[:2]
+            ],
+        }
+    suppression = value.get("jue_wiki_suppression_audit")
+    if isinstance(suppression, dict):
+        rows: list[dict[str, Any]] = []
+        for row in _as_list(suppression.get("suppressed_actions"))[:1]:
+            if not isinstance(row, dict):
+                continue
+            rows.append(
+                {
+                    key: _clean_text(row.get(key), limit=80)
+                    for key in (
+                        "action_kind",
+                        "symbol",
+                        "block_id",
+                    )
+                    if row.get(key) not in (None, "")
+                }
+            )
+        out["jue_wiki_suppression_audit"] = {
+            "venue": _clean_text(suppression.get("venue"), limit=16),
+            "snapshot_id": _bounded_wiki_identity(suppression.get("snapshot_id")),
+            "read_mode": _clean_text(suppression.get("read_mode"), limit=16),
+            "reason": _bounded_wiki_identity(suppression.get("reason")),
+            "original_action_count": _safe_int(
+                suppression.get("original_action_count")
+            ),
+            "filtered_action_count": _safe_int(
+                suppression.get("filtered_action_count")
+            ),
+            "suppressed_new_risk_count": _safe_int(
+                suppression.get("suppressed_new_risk_count")
+            ),
+            "suppressed_actions": rows,
+        }
+    return out
+
+
+def preserve_wiki_gate_storage_contracts(
+    compact: dict[str, Any],
+    original: dict[str, Any],
+) -> None:
+    compact.update(compact_wiki_gate_storage_contracts(original))
 
 
 def _fit_binance_manager_prompt_emergency_payload(
@@ -3994,6 +4257,10 @@ def manager_prompt_storage_emergency_payload(
     compact_value: Callable[..., Any],
     priority_candidate_keys: set[tuple[str, str, str, str]] | None = None,
 ) -> dict[str, Any]:
+    priority_candidate_keys = _manager_prompt_priority_candidate_keys(
+        value,
+        priority_candidate_keys,
+    )
     manager_output_schema = compact_manager_output_schema_for_prompt(
         value.get("native_output_schema") or value.get("output_schema") or {}
     )
@@ -4063,6 +4330,7 @@ def manager_prompt_storage_emergency_payload(
         )
     compact["output_schema"] = manager_output_schema
     compact["native_output_schema"] = manager_output_schema
+    preserve_wiki_gate_storage_contracts(compact, value)
     if prompt_chars(compact) <= limit:
         return compact
     prioritize_memory_recovery = _binance_memory_has_manager_contract_recovery(value)
@@ -4135,11 +4403,8 @@ def manager_prompt_storage_emergency_payload(
             string_limit=120,
             list_limit=6,
         ),
-        "proactive_decision_pressure": _compact_prompt_storage_section(
-            value.get("proactive_decision_pressure") or {},
-            compact_value=compact_value,
-            string_limit=120,
-            list_limit=6,
+        "proactive_decision_pressure": compact_proactive_decision_pressure_for_latency(
+            value.get("proactive_decision_pressure")
         ),
         "validation_repair": compact_validation_repair_for_storage(
             value.get("validation_repair") or {},
@@ -4264,6 +4529,7 @@ def manager_prompt_storage_emergency_payload(
         emergency_payload["native_thread_mode"] = str(value.get("native_thread_mode"))
     if value.get("native_thread_key") not in (None, ""):
         emergency_payload["native_thread_key"] = str(value.get("native_thread_key"))
+    preserve_wiki_gate_storage_contracts(emergency_payload, value)
     if not prioritize_memory_recovery:
         return emergency_payload
     return _fit_binance_manager_prompt_emergency_payload(
@@ -4430,6 +4696,7 @@ def compact_manager_storage_payload(
     )
     if not isinstance(compact, dict):
         compact = {}
+    preserve_wiki_gate_storage_contracts(compact, value)
     if isinstance(value.get("prompt_budget"), dict):
         compact["prompt_budget"] = value["prompt_budget"]
     if isinstance(value.get("diagnostics"), dict):
@@ -4481,6 +4748,7 @@ def compact_manager_storage_payload(
         )
         if not isinstance(compact, dict):
             compact = {}
+        preserve_wiki_gate_storage_contracts(compact, value)
         if isinstance(value.get("prompt_budget"), dict):
             compact["prompt_budget"] = value["prompt_budget"]
         if isinstance(value.get("diagnostics"), dict):
@@ -4526,7 +4794,7 @@ def compact_manager_storage_payload(
             compact_value=compact_fn,
             priority_candidate_keys=priority_candidate_keys,
         )
-    return {
+    emergency = {
         "_storage_compaction": manager_storage_compaction_meta(
             label=label,
             original_chars=original_chars,
@@ -4557,6 +4825,8 @@ def compact_manager_storage_payload(
             120,
         ),
     }
+    preserve_wiki_gate_storage_contracts(emergency, value)
+    return emergency
 
 
 def compact_prompt_candidate_minimal(
@@ -4593,6 +4863,14 @@ def compact_prompt_candidate_minimal(
         )
         if calculated.get(key) not in ({}, [], "", None)
     }
+    market_inputs = calculated.get("market_inputs")
+    if isinstance(market_inputs, dict):
+        compact_calculated["market_inputs"] = compact_prompt_value_bounded(
+            market_inputs,
+            string_limit=80,
+            list_limit=3,
+            dict_limit=16,
+        )
     compact_metadata = {
         key: metadata.get(key)
         for key in (
@@ -4673,6 +4951,42 @@ def compact_prompt_candidates_minimal(
         )
         for row in value
     ]
+
+
+def _compact_prompt_candidates_lane_diverse_section(
+    value: Any,
+    *,
+    compact_value: Callable[..., Any],
+    clean_text: Callable[[Any, int], str],
+    list_limit: int,
+    string_limit: int,
+    priority_candidate_keys: set[tuple[str, str, str, str]] | None = None,
+) -> Any:
+    input_was_list = isinstance(value, list)
+    if isinstance(value, dict) and isinstance(value.get("items"), list):
+        minimal_value = {
+            **value,
+            "items": compact_prompt_candidates_minimal(
+                value.get("items"),
+                compact_value=compact_value,
+                clean_text=clean_text,
+            ),
+        }
+    else:
+        minimal_value = compact_prompt_candidates_minimal(
+            value,
+            compact_value=compact_value,
+            clean_text=clean_text,
+        )
+    compacted = _compact_prompt_storage_sequence_section(
+        minimal_value,
+        compact_value=compact_value,
+        string_limit=string_limit,
+        list_limit=list_limit,
+        priority_candidate_keys=priority_candidate_keys or set(),
+        lane_diverse=True,
+    )
+    return compacted.get("items", []) if input_was_list else compacted
 
 
 def compact_manager_candidate_for_prompt(
@@ -5352,6 +5666,49 @@ def compact_candidate_policy_impacts_for_latency(
                 string_limit=90,
                 dict_limit=6,
             )
+    return compact
+
+
+def compact_proactive_decision_pressure_for_latency(value: Any) -> Any:
+    compact = compact_prompt_value_bounded(
+        value or {},
+        list_limit=1,
+        string_limit=50,
+        dict_limit=8,
+    )
+    if not isinstance(value, dict) or not isinstance(compact, dict):
+        return compact
+    for key in (
+        "version",
+        "status",
+        "pressure_level",
+        "zero_action_streak",
+        "previous_error_streak",
+        "binance_zero_action_streak",
+        "binance_previous_error_streak",
+        "effective_zero_action_streak",
+        "pressure_source",
+        "candidate_count",
+        "strong_candidate_count",
+        "growth_governor_mode",
+        "growth_governor_allows_new_blocks",
+        "live_grade",
+    ):
+        if key in value:
+            compact[key] = value[key]
+    gap = (
+        value.get("binance_market_activity_gap")
+        if isinstance(value.get("binance_market_activity_gap"), dict)
+        else {}
+    )
+    if gap:
+        compact["binance_market_activity_gap"] = compact_prompt_value_bounded(
+            gap,
+            list_limit=4,
+            string_limit=90,
+            dict_limit=12,
+            placeholder_strings=False,
+        )
     return compact
 
 
@@ -6427,6 +6784,7 @@ def enforce_prompt_budget(
 ) -> None:
     configured_max = max(int(max_chars), 10_000)
     effective_max = max(configured_max - 2_500, 10_000)
+    priority_candidate_keys = _manager_prompt_priority_candidate_keys(prompt)
     compacted: list[dict[str, Any]] = []
     for section, list_limit, string_limit in (
         ("critical_response_contract", 6, 120),
@@ -6552,10 +6910,13 @@ def enforce_prompt_budget(
                 )
     if prompt_chars(prompt) > effective_max and "candidates" in prompt:
         before = prompt_chars({"candidates": prompt.get("candidates")})
-        prompt["candidates"] = compact_prompt_candidates_minimal(
+        prompt["candidates"] = _compact_prompt_candidates_lane_diverse_section(
             prompt.get("candidates"),
             compact_value=compact_prompt_value,
             clean_text=lambda raw, text_limit: _clean_text(raw, limit=text_limit),
+            list_limit=30,
+            string_limit=160,
+            priority_candidate_keys=priority_candidate_keys,
         )
         after = prompt_chars({"candidates": prompt.get("candidates")})
         if after < before:
@@ -6568,10 +6929,13 @@ def enforce_prompt_budget(
             )
     if prompt_chars(prompt) > effective_max and "candidates" in prompt:
         before = prompt_chars({"candidates": prompt.get("candidates")})
-        prompt["candidates"] = compact_prompt_value(
+        prompt["candidates"] = _compact_prompt_candidates_lane_diverse_section(
             prompt.get("candidates"),
+            compact_value=compact_prompt_value,
+            clean_text=lambda raw, text_limit: _clean_text(raw, limit=text_limit),
             list_limit=24,
             string_limit=120,
+            priority_candidate_keys=priority_candidate_keys,
         )
         after = prompt_chars({"candidates": prompt.get("candidates")})
         if after < before:
@@ -6584,10 +6948,13 @@ def enforce_prompt_budget(
             )
     if prompt_chars(prompt) > effective_max and "candidates" in prompt:
         before = prompt_chars({"candidates": prompt.get("candidates")})
-        prompt["candidates"] = compact_prompt_value(
+        prompt["candidates"] = _compact_prompt_candidates_lane_diverse_section(
             prompt.get("candidates"),
+            compact_value=compact_prompt_value,
+            clean_text=lambda raw, text_limit: _clean_text(raw, limit=text_limit),
             list_limit=12,
             string_limit=90,
+            priority_candidate_keys=priority_candidate_keys,
         )
         after = prompt_chars({"candidates": prompt.get("candidates")})
         if after < before:
@@ -6681,15 +7048,84 @@ def compact_manager_sections_for_final_budget(
     prompt: dict[str, Any],
     *,
     target_chars: int,
+    priority_candidate_keys: set[tuple[str, str, str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     compacted: list[dict[str, Any]] = []
     target = max(int(target_chars), 10_000)
+    priority_candidate_keys = _manager_prompt_priority_candidate_keys(
+        prompt,
+        priority_candidate_keys,
+    )
+
+    def final_compact_section(
+        section: str,
+        value: Any,
+        *,
+        list_limit: int,
+        string_limit: int,
+    ) -> Any:
+        if section == "critical_response_contract":
+            return compact_prompt_value_bounded(
+                value,
+                list_limit=list_limit,
+                string_limit=string_limit,
+                dict_limit=16,
+            )
+        if section == "jue_wiki_application":
+            out = compact_prompt_value_bounded(
+                value,
+                list_limit=list_limit,
+                string_limit=string_limit,
+                dict_limit=16,
+            )
+            if not isinstance(out, dict):
+                return out
+            source = value if isinstance(value, dict) else {}
+            for key in ("validation_repair_effectiveness", "wiki_application_coverage"):
+                if key not in source:
+                    continue
+                out[key] = compact_prompt_value_bounded(
+                    source.get(key),
+                    list_limit=list_limit,
+                    string_limit=string_limit,
+                    dict_limit=8,
+                )
+            return out
+        if section in {
+            "candidate_generation",
+            "entry_gate_policy",
+            "live_authority",
+            "diagnostics",
+            "crypto_market_pulse",
+            "validation_repair",
+            "jue_wiki_requested_symbol_coverage",
+        }:
+            return compact_prompt_value_bounded(
+                value,
+                list_limit=list_limit,
+                string_limit=string_limit,
+                dict_limit=12,
+            )
+        if section == "proactive_decision_pressure":
+            return compact_proactive_decision_pressure_for_latency(value)
+        return compact_prompt_section(
+            section,
+            value,
+            list_limit=list_limit,
+            string_limit=string_limit,
+        )
+
     for section, list_limit, string_limit in (
         ("critical_response_contract", 4, 90),
         ("blocks", 6, 70),
         ("candidates", 18, 80),
         ("candidate_policy_impacts", 12, 80),
         ("validation_repair", 4, 80),
+        ("jue_wiki_application", 2, 60),
+        ("jue_wiki_repair_contract", 4, 80),
+        ("jue_wiki_requested_symbol_coverage", 2, 60),
+        ("proactive_decision_pressure", 2, 60),
+        ("diagnostics", 2, 60),
         ("recent_performance", 4, 80),
         ("memory", 2, 70),
         ("jue_wiki", 4, 180),
@@ -6712,9 +7148,9 @@ def compact_manager_sections_for_final_budget(
             continue
         before = prompt_chars({section: prompt.get(section)})
         if section == "candidates":
-            prompt[section] = _compact_prompt_storage_sequence_section(
+            prompt[section] = _compact_prompt_candidates_lane_diverse_section(
                 compact_prompt_candidates_minimal(
-                    prompt.get(section),
+                    _runtime_prompt_sequence_items(prompt.get(section)),
                     compact_value=compact_prompt_value,
                     clean_text=lambda raw, text_limit: _clean_text(
                         raw,
@@ -6722,12 +7158,16 @@ def compact_manager_sections_for_final_budget(
                     ),
                 ),
                 compact_value=compact_prompt_value,
+                clean_text=lambda raw, text_limit: _clean_text(
+                    raw,
+                    limit=text_limit,
+                ),
                 list_limit=list_limit,
                 string_limit=string_limit,
-                lane_diverse=True,
+                priority_candidate_keys=priority_candidate_keys,
             )
         else:
-            prompt[section] = compact_prompt_section(
+            prompt[section] = final_compact_section(
                 section,
                 prompt.get(section),
                 list_limit=list_limit,
@@ -6809,20 +7249,186 @@ def compact_manager_sections_for_final_budget(
     return compacted
 
 
+def _compact_jue_wiki_application_for_warn_budget(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return {}
+    out = compact_prompt_value_bounded(
+        value,
+        list_limit=2,
+        string_limit=50,
+        dict_limit=12,
+    )
+    if not isinstance(out, dict):
+        return out
+    trust_profile = _compact_jue_wiki_trust_profile_for_storage(
+        value.get("trust_profile"),
+        string_limit=50,
+        list_limit=2,
+    )
+    if trust_profile:
+        out["trust_profile"] = trust_profile
+    for key in ("validation_repair_effectiveness", "wiki_application_coverage"):
+        if key not in value:
+            continue
+        out[key] = compact_prompt_value_bounded(
+            value.get(key),
+            list_limit=1,
+            string_limit=50,
+            dict_limit=4,
+        )
+    return out
+
+
+def _manager_warn_budget_recovery_is_needed(
+    prompt: dict[str, Any],
+    *,
+    warn_chars: int,
+) -> bool:
+    if prompt_chars(prompt) <= warn_chars:
+        return False
+    severe_total = prompt_chars(prompt) >= max(int(warn_chars) + 35_000, int(warn_chars * 1.6))
+    if not severe_total:
+        return False
+    memory_chars = prompt_chars({"memory": prompt.get("memory")})
+    wiki_application_chars = prompt_chars(
+        {"jue_wiki_application": prompt.get("jue_wiki_application")}
+    )
+    return memory_chars >= 25_000 or wiki_application_chars >= 18_000
+
+
+def compact_manager_sections_for_warn_budget(
+    prompt: dict[str, Any],
+    *,
+    warn_chars: int,
+) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    target = max(int(warn_chars) - 2_000, 10_000)
+    for section, compact_fn in (
+        (
+            "memory",
+            lambda value: compact_prompt_section(
+                "memory",
+                value,
+                list_limit=2,
+                string_limit=70,
+            ),
+        ),
+        ("jue_wiki_application", _compact_jue_wiki_application_for_warn_budget),
+        (
+            "validation_repair",
+            lambda value: compact_prompt_value_bounded(
+                value,
+                list_limit=2,
+                string_limit=60,
+                dict_limit=12,
+            ),
+        ),
+        (
+            "jue_wiki_requested_symbol_coverage",
+            lambda value: compact_prompt_value_bounded(
+                value,
+                list_limit=2,
+                string_limit=60,
+                dict_limit=12,
+            ),
+        ),
+        (
+            "proactive_decision_pressure",
+            compact_proactive_decision_pressure_for_latency,
+        ),
+        (
+            "diagnostics",
+            lambda value: compact_prompt_value_bounded(
+                value,
+                list_limit=2,
+                string_limit=60,
+                dict_limit=12,
+            ),
+        ),
+        (
+            "candidate_generation",
+            lambda value: compact_prompt_value_bounded(
+                value,
+                list_limit=2,
+                string_limit=60,
+                dict_limit=12,
+            ),
+        ),
+        (
+            "jue_wiki_repair_contract",
+            lambda value: compact_prompt_section(
+                "jue_wiki_repair_contract",
+                value,
+                list_limit=4,
+                string_limit=70,
+            ),
+        ),
+        (
+            "crypto_market_pulse",
+            lambda value: compact_prompt_value_bounded(
+                value,
+                list_limit=2,
+                string_limit=60,
+                dict_limit=12,
+            ),
+        ),
+        (
+            "entry_gate_policy",
+            lambda value: compact_prompt_value_bounded(
+                value,
+                list_limit=2,
+                string_limit=60,
+                dict_limit=12,
+            ),
+        ),
+    ):
+        if prompt_chars(prompt) <= target:
+            break
+        if section not in prompt:
+            continue
+        before = prompt_chars({section: prompt.get(section)})
+        prompt[section] = compact_fn(prompt.get(section))
+        after = prompt_chars({section: prompt.get(section)})
+        if after < before:
+            compacted.append(
+                {
+                    "section": f"{section}:warn_recovery",
+                    "before_chars": before,
+                    "after_chars": after,
+                }
+            )
+    return compacted
+
+
 def latency_recovery_core_prompt(
     prompt: dict[str, Any],
     *,
     latency_guard: dict[str, Any],
     original_chars: int,
     label: str,
+    priority_candidate_keys: set[tuple[str, str, str, str]] | None = None,
 ) -> dict[str, Any]:
     output_schema = compact_manager_output_schema_for_prompt(
         prompt.get("native_output_schema") or prompt.get("output_schema") or {}
+    )
+    priority_candidate_keys = _manager_prompt_priority_candidate_keys(
+        prompt,
+        priority_candidate_keys,
     )
     priority_symbols = _prompt_priority_symbols(prompt, limit=6)
     return {
         "native_thread_mode": prompt.get("native_thread_mode"),
         "native_thread_key": prompt.get("native_thread_key"),
+        "decision_inputs": compact_prompt_value(
+            prompt.get("decision_inputs") or [],
+            list_limit=32,
+            string_limit=100,
+        ),
+        "universe": compact_prompt_value(
+            prompt.get("universe") or [],
+            list_limit=12,
+            string_limit=80,
+        ),
         "_storage_compaction": manager_storage_compaction_meta(
             label=label,
             original_chars=original_chars,
@@ -6887,11 +7493,8 @@ def latency_recovery_core_prompt(
             list_limit=1,
             string_limit=60,
         ),
-        "proactive_decision_pressure": compact_prompt_value_bounded(
-            prompt.get("proactive_decision_pressure") or {},
-            list_limit=1,
-            string_limit=50,
-            dict_limit=8,
+        "proactive_decision_pressure": compact_proactive_decision_pressure_for_latency(
+            prompt.get("proactive_decision_pressure")
         ),
         "candidate_generation": compact_prompt_value_bounded(
             prompt.get("candidate_generation") or {},
@@ -6904,16 +7507,17 @@ def latency_recovery_core_prompt(
             priority_symbols=priority_symbols,
             symbol_limit=4,
         ),
-        "candidates": _compact_prompt_storage_sequence_section(
+        "candidates": _compact_prompt_candidates_lane_diverse_section(
             compact_prompt_candidates_minimal(
-                prompt.get("candidates"),
+                _runtime_prompt_sequence_items(prompt.get("candidates")),
                 compact_value=compact_prompt_value,
                 clean_text=lambda raw, text_limit: _clean_text(raw, limit=text_limit),
             ),
             compact_value=compact_prompt_value,
+            clean_text=lambda raw, text_limit: _clean_text(raw, limit=text_limit),
             list_limit=5,
             string_limit=50,
-            lane_diverse=True,
+            priority_candidate_keys=priority_candidate_keys,
         ),
         "blocks": compact_prompt_section(
             "blocks",
@@ -6968,6 +7572,7 @@ def apply_manager_latency_guard(
     policy_symbol_limit = 10 if timeout_count >= 3 else 14 if timeout_count >= 2 else 18
     candidate_limit = 16 if timeout_count >= 3 else 22 if timeout_count >= 2 else 28
     priority_symbols = _prompt_priority_symbols(prompt, limit=priority_limit)
+    priority_candidate_keys = _manager_prompt_priority_candidate_keys(prompt)
 
     if "candidate_policy_impacts" in prompt:
         before = prompt_chars(
@@ -6992,10 +7597,13 @@ def apply_manager_latency_guard(
 
     if prompt_chars(prompt) > configured_target and "candidates" in prompt:
         before = prompt_chars({"candidates": prompt.get("candidates")})
-        prompt["candidates"] = compact_prompt_value(
+        prompt["candidates"] = _compact_prompt_candidates_lane_diverse_section(
             prompt.get("candidates"),
+            compact_value=compact_prompt_value,
+            clean_text=lambda raw, text_limit: _clean_text(raw, limit=text_limit),
             list_limit=candidate_limit,
             string_limit=90 if timeout_count >= 2 else 110,
+            priority_candidate_keys=priority_candidate_keys,
         )
         after = prompt_chars({"candidates": prompt.get("candidates")})
         if after < before:
@@ -7060,7 +7668,7 @@ def apply_manager_latency_guard(
 def compact_manager_response_payload(response: dict[str, Any]) -> dict[str, Any]:
     payload = response.get("payload")
     if not isinstance(payload, dict):
-        return {}
+        payload = {}
     keys = (
         "decision",
         "symbol",
@@ -7080,11 +7688,13 @@ def compact_manager_response_payload(response: dict[str, Any]) -> dict[str, Any]
         "data_gaps",
         "evidence_refs",
     )
-    return {
+    compact = {
         key: compact_prompt_value(payload.get(key), string_limit=280, list_limit=8)
         for key in keys
         if payload.get(key) not in (None, "", [])
     }
+    preserve_wiki_gate_storage_contracts(compact, response)
+    return compact
 
 
 def _manager_action_item_count(actions: dict[str, Any]) -> int:
@@ -7097,11 +7707,85 @@ def _manager_action_item_count(actions: dict[str, Any]) -> int:
     )
 
 
+def _manager_entry_repair_action_item_count(actions: dict[str, Any]) -> int:
+    if not isinstance(actions, dict):
+        return 0
+    return sum(
+        len(actions.get(key) or [])
+        for key in ("create_blocks", "update_blocks")
+        if isinstance(actions.get(key), list)
+    )
+
+
 def _manager_actions_have_wiki_attention_resolution(actions: dict[str, Any]) -> bool:
     return _manager_actions_have_wiki_repair_metadata(
         actions,
         metadata_keys=("jue_wiki_repair_attention",),
     )
+
+
+def _manager_validation_repair_resolution_note_applies_constraints(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    source = str(value.get("source") or "").strip().lower()
+    if source != "validation_repair_resolution":
+        return False
+    resolution = (
+        value.get("resolution") if isinstance(value.get("resolution"), dict) else {}
+    )
+    kind = str(resolution.get("resolution") or "").strip().lower()
+    if kind not in {
+        "probe_waiting_block",
+        "small_waiting_block",
+        "one_share_probe",
+        "updated_price_geometry",
+        "candidate_rejected",
+        "safety_gate_defer",
+    }:
+        return False
+    if not _as_list(value.get("degraded_wiki_page_ids")):
+        return False
+    applied_note = resolution.get("memory_contract_resolution")
+    next_trigger = resolution.get("next_trigger")
+    return _manager_repair_note_is_concrete(
+        {
+            "resolution": kind,
+            "memory_contract_resolution": applied_note,
+            "next_trigger": next_trigger,
+        }
+    )
+
+
+def _manager_action_repair_metadata_note_is_negative(value: Any) -> bool:
+    ignored_keys = {
+        "evidence_gap",
+        "evidence_gaps",
+        "data_gap",
+        "data_gaps",
+        "missing_evidence",
+        "unresolved_evidence",
+    }
+
+    def without_gap_fields(raw: Any) -> Any:
+        if isinstance(raw, dict):
+            return {
+                key: without_gap_fields(child)
+                for key, child in raw.items()
+                if str(key or "").strip().lower() not in ignored_keys
+            }
+        if isinstance(raw, list):
+            return [without_gap_fields(child) for child in raw]
+        if isinstance(raw, tuple):
+            return tuple(without_gap_fields(child) for child in raw)
+        if isinstance(raw, set):
+            return {without_gap_fields(child) for child in raw}
+        return raw
+
+    if isinstance(value, dict):
+        if _manager_validation_repair_resolution_note_applies_constraints(value):
+            return False
+        return _manager_repair_note_is_negative(without_gap_fields(value))
+    return _manager_repair_note_is_negative(value)
 
 
 def _manager_actions_have_wiki_repair_metadata(
@@ -7126,7 +7810,7 @@ def _manager_actions_have_wiki_repair_metadata(
                 repair_note = metadata.get(metadata_key)
                 if repair_note in (None, "", [], {}):
                     repair_note = row.get(metadata_key)
-                if _manager_repair_note_is_negative(repair_note):
+                if _manager_action_repair_metadata_note_is_negative(repair_note):
                     continue
                 if _manager_repair_note_is_concrete(repair_note):
                     return True
@@ -7161,10 +7845,12 @@ def _manager_repair_note_is_concrete(value: Any) -> bool:
         return False
     concrete_terms = (
         "repair:",
+        "cite_memory_and_apply",
         "source_id",
         "resolution",
         "action_metadata",
         "metadata_records",
+        "memory contract",
         "repair_attention",
         "wiki_attention",
         "stale",
@@ -7185,6 +7871,12 @@ def _manager_repair_note_is_concrete(value: Any) -> bool:
         "cross",
         "sizing",
         "confidence",
+        "entry",
+        "target",
+        "stop",
+        "rr>=",
+        "rr >=",
+        "reward/risk",
         "trigger",
         "waiting",
         "probe",
@@ -7201,6 +7893,17 @@ def _manager_repair_note_is_concrete(value: Any) -> bool:
         "근거",
         "위험",
         "리스크",
+        "진입",
+        "재진입",
+        "기각",
+        "재검토",
+        "손절",
+        "목표",
+        "가격 구조",
+        "가격구조",
+        "메모리 계약",
+        "신규 블록",
+        "저신뢰",
     )
     return any(term in text for term in concrete_terms)
 
@@ -7213,6 +7916,7 @@ def _manager_repair_note_is_negative(value: Any) -> bool:
     text = str(value or "").strip().lower()
     if not text:
         return False
+    text = re.sub(r"\b[a-z0-9_]*missing_from_model\b", " ", text)
     compact = (
         text.replace("_", " ")
         .replace("-", " ")
@@ -8464,6 +9168,104 @@ def _manager_prompt_has_action_pressure(prompt: dict[str, Any]) -> bool:
     return str(pressure.get("status") or "").strip().lower() == "action_required"
 
 
+def _manager_prompt_has_binance_activity_gap_pressure(prompt: dict[str, Any]) -> bool:
+    pressure = _manager_scoped_proactive_decision_pressure(prompt)
+    if str(pressure.get("status") or "").strip().lower() != "action_required":
+        return False
+    gap = (
+        pressure.get("binance_market_activity_gap")
+        if isinstance(pressure.get("binance_market_activity_gap"), dict)
+        else {}
+    )
+    status = str(gap.get("status") or "").strip().lower()
+    return status in {"no_binance_entries", "stale_binance_entries"}
+
+
+def _manager_binance_activity_gap_target_symbols(prompt: dict[str, Any]) -> set[str]:
+    pressure = _manager_scoped_proactive_decision_pressure(prompt)
+    gap = (
+        pressure.get("binance_market_activity_gap")
+        if isinstance(pressure.get("binance_market_activity_gap"), dict)
+        else {}
+    )
+    symbols: set[str] = {
+        str(symbol or "").upper().strip()
+        for symbol in _as_list(gap.get("candidate_symbols"))
+        if str(symbol or "").strip()
+    }
+    for row in _as_list(gap.get("candidate_snapshots")):
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if symbol:
+            symbols.add(symbol)
+    for row in _as_list(pressure.get("top_candidates")):
+        if not isinstance(row, dict):
+            continue
+        market = normalize_market(row.get("market") or row.get("venue"))
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if market in {"spot", "futures"} and symbol:
+            symbols.add(symbol)
+    return symbols
+
+
+def _manager_action_resolves_binance_activity_gap(
+    *,
+    prompt: dict[str, Any],
+    actions: dict[str, Any],
+) -> bool:
+    target_symbols = _manager_binance_activity_gap_target_symbols(prompt)
+    block_symbols_by_id, block_pairs_by_id, _block_by_id = (
+        _manager_prompt_block_identity_context(prompt)
+    )
+    for section in ("adopt_existing_blocks", "create_blocks", "update_blocks"):
+        for row in _as_list(actions.get(section)):
+            if not isinstance(row, dict):
+                continue
+            raw_market = row.get("market") or row.get("venue")
+            explicit_market = explicit_market_scope(raw_market)
+            if str(raw_market or "").strip() and explicit_market not in {
+                "spot",
+                "futures",
+            }:
+                continue
+            for symbol, market in _manager_action_symbol_market_identities(
+                row,
+                block_symbols_by_id=block_symbols_by_id,
+                block_pairs_by_id=block_pairs_by_id,
+            ):
+                symbol = str(symbol or "").upper().strip()
+                if not symbol or symbol.startswith("KRW-"):
+                    continue
+                if target_symbols and symbol not in target_symbols:
+                    continue
+                if explicit_market in {"spot", "futures"}:
+                    return True
+                if market in {"spot", "futures"}:
+                    return True
+                if not market and symbol.endswith("USDT"):
+                    return True
+    return False
+
+
+def _manager_response_resolves_binance_activity_gap(
+    *,
+    prompt: dict[str, Any],
+    response: dict[str, Any],
+    hold_decision: dict[str, Any],
+) -> bool:
+    target_symbols = _manager_binance_activity_gap_target_symbols(prompt)
+    if not _manager_response_has_concrete_repair_resolution(
+        response,
+        target_symbols=target_symbols,
+    ):
+        return False
+    return _manager_hold_has_concrete_next_step_for_symbols(
+        hold_decision,
+        target_symbols,
+    )
+
+
 def _manager_prompt_has_wiki_action_pressure(prompt: dict[str, Any]) -> bool:
     contract = _manager_scoped_jue_wiki_action_pressure_contract(prompt)
     if str(contract.get("status") or "").strip().lower() == "active":
@@ -8522,9 +9324,11 @@ def _manager_response_has_concrete_repair_resolution(
         "reject a candidate with exact missing price/depth/funding/risk evidence": (
             "candidate_rejected"
         ),
+        "explicit_reject_with_price_reason": "candidate_rejected",
         "defer only because an explicit server safety gate blocks execution": (
             "safety_gate_defer"
         ),
+        "defer_due_to_safety_gate": "safety_gate_defer",
         "stage_concrete_next_trigger": "safety_gate_defer",
     }
 
@@ -8583,6 +9387,454 @@ def _manager_response_has_concrete_repair_resolution(
             continue
         if next_trigger:
             return True
+    return False
+
+
+def _manager_executable_repair_resolution_missing_action(
+    *,
+    prompt: dict[str, Any],
+    response: dict[str, Any],
+    actions: dict[str, Any],
+) -> bool:
+    resolution = (
+        response.get("validation_repair_resolution")
+        if isinstance(response, dict)
+        else {}
+    )
+    resolution = resolution if isinstance(resolution, dict) else {}
+    executable_kinds = {
+        "probe_waiting_block",
+        "small_waiting_block",
+        "one_share_probe",
+        "updated_price_geometry",
+        "create or update a smaller waiting/probe block",
+    }
+    (
+        block_symbols_by_id,
+        block_pairs_by_id,
+        _block_by_id,
+    ) = _manager_prompt_block_identity_context(prompt)
+    existing_block_symbols = {
+        symbol
+        for symbols in block_symbols_by_id.values()
+        for symbol in symbols
+    }
+    existing_block_pairs = {
+        pair
+        for pairs in block_pairs_by_id.values()
+        for pair in pairs
+    }
+    action_pairs: set[tuple[str, str]] = set()
+    action_symbols: set[str] = set()
+    for section in ("create_blocks", "update_blocks"):
+        for action in _as_list(actions.get(section)):
+            if not isinstance(action, dict):
+                continue
+            for symbol, market in _manager_action_symbol_market_identities(
+                action,
+                block_symbols_by_id=block_symbols_by_id,
+                block_pairs_by_id=block_pairs_by_id,
+            ):
+                action_symbols.add(symbol)
+                if market:
+                    action_pairs.add((symbol, market))
+    for row in _as_list(resolution.get("resolved_candidates")):
+        if not isinstance(row, dict):
+            continue
+        kind = str(row.get("resolution") or "").strip().lower()
+        if kind not in executable_kinds:
+            continue
+        symbol = str(
+            row.get("symbol")
+            or row.get("code")
+            or row.get("ticker")
+            or ""
+        ).upper().strip()
+        if not symbol:
+            continue
+        raw_market = row.get("market") or row.get("venue")
+        market = normalize_market(raw_market) if raw_market not in (None, "") else ""
+        if kind == "updated_price_geometry":
+            if market and (symbol, market) not in existing_block_pairs:
+                continue
+            if not market and symbol not in existing_block_symbols:
+                continue
+        if market:
+            if (symbol, market) not in action_pairs:
+                return True
+            continue
+        if symbol not in action_symbols:
+            return True
+    return False
+
+
+def _manager_repairable_probe_design_rejection_ignores_design(
+    prompt: dict[str, Any],
+    response: dict[str, Any],
+    actions: dict[str, Any],
+) -> bool:
+    repairable_pairs: set[tuple[str, str]] = set()
+    repairable_symbols: set[str] = set()
+    repairable_pairs_by_symbol: dict[str, set[tuple[str, str]]] = {}
+    for row in _manager_repairable_probe_design_rows(prompt):
+        if not isinstance(row, dict):
+            continue
+        design = row.get("validation_repair_probe_design")
+        if not isinstance(design, dict) or not design:
+            continue
+        symbol = str(
+            row.get("symbol")
+            or row.get("code")
+            or row.get("ticker")
+            or ""
+        ).upper().strip()
+        if not symbol:
+            continue
+        repairable_symbols.add(symbol)
+        market = normalize_market(row.get("market") or row.get("venue"))
+        if market:
+            pair = (symbol, market)
+            repairable_pairs.add(pair)
+            repairable_pairs_by_symbol.setdefault(symbol, set()).add(pair)
+    if not repairable_symbols:
+        return False
+    (
+        block_symbols_by_id,
+        block_pairs_by_id,
+        _block_by_id,
+    ) = _manager_prompt_block_identity_context(prompt)
+    repair_action_pairs: set[tuple[str, str]] = set()
+    repair_action_symbols: set[str] = set()
+
+    def action_has_repair_probe_geometry(action: dict[str, Any]) -> bool:
+        return any(
+            _safe_float(action.get(key)) > 0
+            for key in (
+                "entry_price",
+                "entry_trigger_price",
+                "target_price",
+                "stop_price",
+                "qty",
+                "quote_budget_usdt",
+                "quote_budget_krw",
+                "quantity_or_quote_budget",
+            )
+        )
+
+    for section in ("create_blocks", "update_blocks", "close_blocks", "pause_blocks"):
+        for action in _as_list(actions.get(section)):
+            if not isinstance(action, dict):
+                continue
+            if section not in {"create_blocks", "update_blocks"}:
+                continue
+            if not action_has_repair_probe_geometry(action):
+                continue
+            for symbol, market in _manager_action_symbol_market_identities(
+                action,
+                block_symbols_by_id=block_symbols_by_id,
+                block_pairs_by_id=block_pairs_by_id,
+            ):
+                repair_action_symbols.add(symbol)
+                if market:
+                    repair_action_pairs.add((symbol, market))
+    if repair_action_pairs.intersection(repairable_pairs):
+        return False
+    if not repairable_pairs and repairable_symbols.intersection(repair_action_symbols):
+        return False
+    resolution = (
+        response.get("validation_repair_resolution")
+        if isinstance(response, dict)
+        else {}
+    )
+    resolution = resolution if isinstance(resolution, dict) else {}
+    executable_probe_resolutions = {
+        "probe_waiting_block",
+        "small_waiting_block",
+        "one_share_probe",
+        "create or update a smaller waiting/probe block",
+    }
+    for item in _as_list(resolution.get("resolved_candidates")):
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("resolution") or "").strip().lower()
+        if kind not in executable_probe_resolutions:
+            continue
+        symbol = str(
+            item.get("symbol")
+            or item.get("code")
+            or item.get("ticker")
+            or ""
+        ).upper().strip()
+        if not symbol:
+            continue
+        raw_market = item.get("market") or item.get("venue")
+        market = normalize_market(raw_market) if raw_market not in (None, "") else ""
+        if market and (symbol, market) in repair_action_pairs:
+            return False
+        if not market and symbol in repair_action_symbols:
+            return False
+    for item in _as_list(resolution.get("resolved_candidates")):
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("resolution") or "").strip().lower()
+        if kind not in {"candidate_rejected", "safety_gate_defer"}:
+            continue
+        symbol = str(
+            item.get("symbol")
+            or item.get("code")
+            or item.get("ticker")
+            or ""
+        ).upper().strip()
+        if not symbol or symbol not in repairable_symbols:
+            continue
+        raw_market = item.get("market") or item.get("venue")
+        market = normalize_market(raw_market) if raw_market not in (None, "") else ""
+        if market and repairable_pairs and (symbol, market) not in repairable_pairs:
+            continue
+        if _manager_probe_rejection_cites_current_execution_gate(item):
+            continue
+        if market and (symbol, market) in repair_action_pairs:
+            continue
+        symbol_repairable_pairs = repairable_pairs_by_symbol.get(symbol, set())
+        if not market and symbol_repairable_pairs:
+            if repair_action_pairs.intersection(symbol_repairable_pairs):
+                continue
+        elif not market and symbol in repair_action_symbols:
+            continue
+        return True
+    return False
+
+
+def _manager_repairable_probe_design_rows(prompt: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    pressure = _manager_scoped_proactive_decision_pressure(prompt)
+    for row in _as_list(pressure.get("top_candidates")):
+        if isinstance(row, dict):
+            rows.append(row)
+    for row in _manager_prompt_candidate_rows(prompt):
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _manager_probe_rejection_cites_current_execution_gate(value: Any) -> bool:
+    current_gate_terms = (
+        "spread",
+        "depth",
+        "orderbook",
+        "order book",
+        "funding",
+        "liquidity",
+        "slippage",
+        "confidence",
+        "live gate",
+        "live_authority",
+        "live authority",
+        "validation_probe",
+        "validation probe",
+        "execution gate",
+        "safety gate",
+        "cooldown",
+        "derivatives unavailable",
+        "venue unavailable",
+        "호가",
+        "스프레드",
+        "깊이",
+        "유동성",
+        "펀딩",
+        "신뢰도",
+        "쿨다운",
+        "권한",
+        "실행 게이트",
+        "안전 게이트",
+    )
+    if isinstance(value, dict):
+        evidence_fields = (
+            "evidence_gap",
+            "evidence_gaps",
+            "reason",
+            "reasons",
+            "risk_note",
+            "risk_notes",
+            "data_gap",
+            "data_gaps",
+            "execution_gate",
+            "execution_gates",
+            "gate",
+            "gate_reason",
+            "safety_gate",
+            "live_gate",
+        )
+        text = json.dumps(
+            {
+                key: value.get(key)
+                for key in evidence_fields
+                if value.get(key) not in (None, "", [], {})
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).lower()
+    else:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True).lower()
+    return any(term in text for term in current_gate_terms)
+
+
+def _manager_repair_probe_action_below_min_executable_qty(
+    prompt: dict[str, Any],
+    actions: dict[str, Any],
+) -> bool:
+    min_qty_by_pair: dict[tuple[str, str], float] = {}
+    min_qty_by_symbol: dict[str, float] = {}
+    min_notional_by_pair: dict[tuple[str, str], float] = {}
+    min_notional_by_symbol: dict[str, float] = {}
+    for row in _manager_repairable_probe_design_rows(prompt):
+        if not isinstance(row, dict):
+            continue
+        design = row.get("validation_repair_probe_design")
+        if not isinstance(design, dict):
+            continue
+        min_qty = _safe_float(design.get("min_executable_qty"))
+        min_notional = max(
+            _safe_float(design.get("min_executable_notional_usdt")),
+            _safe_float(design.get("min_executable_notional_krw")),
+        )
+        if min_qty <= 0 and min_notional <= 0:
+            continue
+        symbol = str(
+            row.get("symbol")
+            or row.get("code")
+            or row.get("ticker")
+            or ""
+        ).upper().strip()
+        if not symbol:
+            continue
+        market = normalize_market(row.get("market") or row.get("venue"))
+        if min_qty > 0:
+            min_qty_by_symbol[symbol] = max(
+                min_qty_by_symbol.get(symbol, 0.0),
+                min_qty,
+            )
+        if min_notional > 0:
+            min_notional_by_symbol[symbol] = max(
+                min_notional_by_symbol.get(symbol, 0.0),
+                min_notional,
+            )
+        if market:
+            if min_qty > 0:
+                min_qty_by_pair[(symbol, market)] = max(
+                    min_qty_by_pair.get((symbol, market), 0.0),
+                    min_qty,
+                )
+            if min_notional > 0:
+                min_notional_by_pair[(symbol, market)] = max(
+                    min_notional_by_pair.get((symbol, market), 0.0),
+                    min_notional,
+                )
+    if not min_qty_by_symbol and not min_notional_by_symbol:
+        return False
+
+    symbols_with_market_floor = {
+        symbol
+        for symbol, _market in {
+            *min_qty_by_pair.keys(),
+            *min_notional_by_pair.keys(),
+        }
+    }
+    (
+        block_symbols_by_id,
+        block_pairs_by_id,
+        block_by_id,
+    ) = _manager_prompt_block_identity_context(prompt)
+
+    for section in ("create_blocks", "update_blocks"):
+        for action in _as_list(actions.get(section)):
+            if not isinstance(action, dict):
+                continue
+            identities = _manager_action_symbol_market_identities(
+                action,
+                block_symbols_by_id=block_symbols_by_id,
+                block_pairs_by_id=block_pairs_by_id,
+            )
+            if not identities:
+                continue
+            for symbol, identity_market in identities:
+                if identity_market:
+                    min_qty = min_qty_by_pair.get((symbol, identity_market))
+                    min_notional = min_notional_by_pair.get(
+                        (symbol, identity_market)
+                    )
+                    if (
+                        min_qty is None
+                        and min_notional is None
+                        and symbol in symbols_with_market_floor
+                    ):
+                        continue
+                    if min_qty is None:
+                        min_qty = min_qty_by_symbol.get(symbol, 0.0)
+                    if min_notional is None:
+                        min_notional = min_notional_by_symbol.get(symbol, 0.0)
+                else:
+                    min_qty = min_qty_by_symbol.get(symbol, 0.0)
+                    min_notional = min_notional_by_symbol.get(symbol, 0.0)
+                if min_qty <= 0 and min_notional <= 0:
+                    continue
+                explicit_notional = max(
+                    _safe_float(action.get("quote_budget_usdt")),
+                    _safe_float(action.get("quote_budget_krw")),
+                    _safe_float(action.get("quote_budget")),
+                    _safe_float(action.get("notional_usdt")),
+                    _safe_float(action.get("notional_krw")),
+                    _safe_float(action.get("notional")),
+                    _safe_float(action.get("max_notional_usdt")),
+                    _safe_float(action.get("target_block_value_usdt")),
+                )
+                if min_notional > 0 and explicit_notional >= min_notional - 1e-12:
+                    continue
+                qty = _safe_float(
+                    action.get("qty")
+                    or action.get("quantity")
+                    or action.get("qty_initial")
+                )
+                entry = _safe_float(
+                    action.get("entry_trigger_price")
+                    or action.get("entry_price")
+                    or action.get("entry_price_usdt")
+                    or action.get("entry_price_krw")
+                )
+                if section == "update_blocks" and (
+                    qty <= 0 or (min_notional > 0 and entry <= 0)
+                ):
+                    for block_id in _manager_action_identity_block_ids(action):
+                        block = block_by_id.get(block_id)
+                        if not isinstance(block, dict):
+                            continue
+                        block_qty = max(
+                            _safe_float(block.get("qty")),
+                            _safe_float(block.get("quantity")),
+                            _safe_float(block.get("qty_initial")),
+                            _safe_float(block.get("qty_open")),
+                        )
+                        block_entry = _safe_float(
+                            block.get("entry_trigger_price")
+                            or block.get("entry_price")
+                            or block.get("entry_price_usdt")
+                            or block.get("entry_price_krw")
+                        )
+                        if qty <= 0 and block_qty > 0:
+                            qty = block_qty
+                        if entry <= 0 and block_entry > 0:
+                            entry = block_entry
+                if qty > 0 and min_qty > 0 and qty + 1e-12 >= min_qty:
+                    continue
+                if min_notional > 0:
+                    if qty > 0 and entry > 0 and qty * entry >= min_notional - 1e-12:
+                        continue
+                    if 0 < explicit_notional + 1e-12 < min_notional:
+                        return True
+                if min_qty > 0 and 0 < qty + 1e-12 < min_qty:
+                    return True
+                if min_qty > 0 and qty <= 0 and explicit_notional <= 0:
+                    return True
     return False
 
 
@@ -9219,7 +10471,7 @@ def _manager_actions_have_prompt_linked_wiki_repair_metadata(
                 repair_note = metadata.get(metadata_key)
                 if repair_note in (None, "", [], {}):
                     repair_note = row.get(metadata_key)
-                if _manager_repair_note_is_negative(repair_note):
+                if _manager_action_repair_metadata_note_is_negative(repair_note):
                     continue
                 if not _manager_repair_note_is_concrete(repair_note):
                     continue
@@ -9237,6 +10489,11 @@ def _manager_response_has_prompt_linked_repair_resolution(
 ) -> bool:
     if not _manager_response_has_concrete_repair_resolution(response):
         return False
+    if _manager_response_rejects_all_visible_candidates_with_repair_evidence(
+        prompt,
+        response,
+    ):
+        return True
     terms = _manager_wiki_repair_reference_terms(prompt)
     if not terms:
         return True
@@ -9244,6 +10501,66 @@ def _manager_response_has_prompt_linked_repair_resolution(
         response.get("validation_repair_resolution"),
         terms,
     )
+
+
+def _manager_response_rejects_all_visible_candidates_with_repair_evidence(
+    prompt: dict[str, Any],
+    response: dict[str, Any],
+) -> bool:
+    candidate_rows = _manager_prompt_candidate_rows(prompt)
+    if not candidate_rows:
+        return False
+    expected_pairs: set[tuple[str, str]] = set()
+    expected_unscoped_symbols: set[str] = set()
+    for row in candidate_rows:
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        raw_market = row.get("market") or row.get("venue")
+        if raw_market in (None, ""):
+            expected_unscoped_symbols.add(symbol)
+        else:
+            expected_pairs.add((symbol, normalize_market(raw_market)))
+    if not expected_pairs and not expected_unscoped_symbols:
+        return False
+
+    resolution = response.get("validation_repair_resolution")
+    resolution = resolution if isinstance(resolution, dict) else {}
+    covered_pairs: set[tuple[str, str]] = set()
+    covered_symbols: set[str] = set()
+    for item in _as_list(resolution.get("resolved_candidates")):
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        outcome = str(item.get("resolution") or "").strip().lower()
+        if outcome not in {
+            "candidate_rejected",
+            "safety_gate_defer",
+            "wait_until_memory_refresh",
+            "updated_price_geometry",
+        }:
+            continue
+        evidence_gap = item.get("evidence_gap")
+        next_trigger = item.get("next_trigger")
+        memory_resolution = item.get("memory_contract_resolution")
+        if (
+            _manager_repair_note_is_negative(item)
+            or not _manager_repair_note_is_concrete(evidence_gap)
+            or not _manager_repair_note_is_concrete(next_trigger)
+            or not _manager_repair_note_is_concrete(memory_resolution)
+        ):
+            continue
+        market = normalize_market(item.get("market") or item.get("venue"))
+        if market:
+            covered_pairs.add((symbol, market))
+        covered_symbols.add(symbol)
+
+    for symbol, market in expected_pairs:
+        if (symbol, market) not in covered_pairs and symbol not in covered_symbols:
+            return False
+    return expected_unscoped_symbols.issubset(covered_symbols)
 
 
 def _manager_memory_contract_repair_terms(prompt: dict[str, Any]) -> list[str]:
@@ -9798,6 +11115,104 @@ def _manager_requested_symbol_coverage_note_is_negative(value: Any) -> bool:
         "아직 없음",
     )
     return any(phrase in compact for phrase in negative_phrases)
+
+
+def _manager_requested_symbol_coverage_blocks_actions(
+    *,
+    prompt: dict[str, Any],
+    actions: dict[str, Any],
+) -> bool:
+    coverage = _manager_scoped_requested_symbol_coverage(prompt)
+    if bool(coverage.get("hard_blocker")):
+        return True
+    terms = _manager_requested_symbol_coverage_terms(prompt)
+    if not terms:
+        return True
+    for key in BINANCE_MANAGER_ACTION_SECTIONS:
+        for row in _as_list(actions.get(key)):
+            if _manager_payload_mentions_any_term(row, terms):
+                return True
+    return False
+
+
+def _manager_requested_symbol_coverage_resolution_state(
+    *,
+    prompt: dict[str, Any],
+    response: dict[str, Any] | None = None,
+    actions: dict[str, Any],
+    hold_decision: dict[str, Any],
+    action_count: int | None = None,
+) -> dict[str, bool]:
+    gap = _manager_prompt_has_requested_symbol_coverage_gap(prompt)
+    coverage = _manager_scoped_requested_symbol_coverage(prompt)
+    hard_blocker = bool(coverage.get("hard_blocker"))
+    blocks_actions = (
+        gap
+        and _manager_requested_symbol_coverage_blocks_actions(
+            prompt=prompt,
+            actions=actions,
+        )
+    )
+    resolved_by_action = (
+        blocks_actions
+        and _manager_actions_resolve_requested_symbol_coverage(
+            prompt=prompt,
+            actions=actions,
+        )
+    )
+    resolved_by_hold = (
+        gap
+        and _manager_hold_resolves_requested_symbol_coverage(
+            prompt,
+            hold_decision,
+        )
+    )
+    if action_count is None:
+        action_count = _manager_action_item_count(actions)
+    resolved_by_response = (
+        gap
+        and not hard_blocker
+        and action_count <= 0
+        and _manager_prompt_has_active_validation_repair(prompt)
+        and (
+            _manager_response_has_prompt_linked_repair_resolution(
+                prompt,
+                response or {},
+            )
+            or _manager_response_rejects_all_visible_candidates_with_repair_evidence(
+                prompt,
+                response or {},
+            )
+        )
+    )
+    resolved = (
+        gap
+        and (
+            (
+                blocks_actions
+                and (
+                    resolved_by_action
+                    or resolved_by_hold
+                )
+            )
+            or (
+                not blocks_actions
+                and (
+                    resolved_by_hold
+                    or resolved_by_response
+                    or action_count > 0
+                )
+            )
+        )
+    )
+    return {
+        "gap": bool(gap),
+        "blocks_actions": bool(blocks_actions),
+        "resolved_by_action": bool(resolved_by_action),
+        "resolved_by_hold": bool(resolved_by_hold),
+        "resolved_by_response": bool(resolved_by_response),
+        "resolved": bool(resolved),
+    }
 
 
 def _manager_hold_resolves_requested_symbol_coverage(
@@ -10382,9 +11797,24 @@ def _manager_prompt_wiki_reference_symbol_page_ids(
 
 
 def _manager_prompt_block_symbol_map(prompt: dict[str, Any]) -> dict[str, set[str]]:
+    block_symbol_map, _block_pair_map, _block_by_id = (
+        _manager_prompt_block_identity_context(prompt)
+    )
+    return block_symbol_map
+
+
+def _manager_prompt_block_identity_context(
+    prompt: dict[str, Any],
+) -> tuple[
+    dict[str, set[str]],
+    dict[str, set[tuple[str, str]]],
+    dict[str, dict[str, Any]],
+]:
     block_symbol_map: dict[str, set[str]] = {}
+    block_pair_map: dict[str, set[tuple[str, str]]] = {}
+    block_by_id: dict[str, dict[str, Any]] = {}
     if not isinstance(prompt, dict):
-        return block_symbol_map
+        return block_symbol_map, block_pair_map, block_by_id
     for section in ("blocks", "open_blocks", "active_blocks"):
         for row in _as_list(prompt.get(section)):
             if not isinstance(row, dict):
@@ -10392,9 +11822,50 @@ def _manager_prompt_block_symbol_map(prompt: dict[str, Any]) -> dict[str, set[st
             symbols = _manager_action_identity_symbols(row)
             if not symbols:
                 continue
+            raw_market = row.get("market") or row.get("venue")
+            market = (
+                normalize_market(raw_market)
+                if raw_market not in (None, "")
+                else ""
+            )
             for block_id in _manager_action_identity_block_ids(row):
                 block_symbol_map.setdefault(block_id, set()).update(symbols)
-    return block_symbol_map
+                block_by_id.setdefault(block_id, row)
+                if market:
+                    block_pair_map.setdefault(block_id, set()).update(
+                        (symbol, market) for symbol in symbols
+                    )
+    return block_symbol_map, block_pair_map, block_by_id
+
+
+def _manager_action_symbol_market_identities(
+    row: dict[str, Any],
+    *,
+    block_symbols_by_id: dict[str, set[str]] | None = None,
+    block_pairs_by_id: dict[str, set[tuple[str, str]]] | None = None,
+) -> list[tuple[str, str]]:
+    raw_market = row.get("market") or row.get("venue")
+    market = normalize_market(raw_market) if raw_market not in (None, "") else ""
+    identities: list[tuple[str, str]] = [
+        (symbol, market)
+        for symbol in sorted(_manager_action_identity_symbols(row))
+    ]
+    block_symbols_by_id = block_symbols_by_id or {}
+    block_pairs_by_id = block_pairs_by_id or {}
+    for block_id in _manager_action_identity_block_ids(row):
+        block_pairs = sorted(block_pairs_by_id.get(block_id, set()))
+        identities.extend(block_pairs)
+        if market:
+            identities.extend(
+                (symbol, market)
+                for symbol in sorted(block_symbols_by_id.get(block_id, set()))
+            )
+        elif not block_pairs:
+            identities.extend(
+                (symbol, "")
+                for symbol in sorted(block_symbols_by_id.get(block_id, set()))
+            )
+    return list(dict.fromkeys(identities))
 
 
 def _manager_wiki_reference_has_traceable_id(value: Any) -> bool:
@@ -11498,6 +12969,86 @@ def _manager_memory_card_quality_resolution_has_specific_evidence(
     return False
 
 
+def _manager_prompt_candidate_rows(prompt: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates = prompt.get("candidates") if isinstance(prompt, dict) else None
+    if isinstance(candidates, dict):
+        rows = candidates.get("items")
+    else:
+        rows = candidates
+    return [row for row in _as_list(rows) if isinstance(row, dict)]
+
+
+def _manager_prompt_create_visible_candidate_rows(
+    prompt: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows = list(_manager_prompt_candidate_rows(prompt))
+    if not isinstance(prompt, dict):
+        return rows
+    pressure = prompt.get("proactive_decision_pressure")
+    pressure = pressure if isinstance(pressure, dict) else {}
+    pressure_rows = pressure.get("top_candidates")
+    if isinstance(pressure_rows, dict) and isinstance(
+        pressure_rows.get("items"),
+        list,
+    ):
+        pressure_rows = pressure_rows.get("items")
+    seen: set[tuple[str, str]] = {
+        (
+            str(row.get("symbol") or "").upper().strip(),
+            normalize_market(row.get("market") or row.get("venue")),
+        )
+        for row in rows
+        if isinstance(row, dict)
+    }
+    for row in _as_list(pressure_rows):
+        if not isinstance(row, dict):
+            continue
+        key = (
+            str(row.get("symbol") or "").upper().strip(),
+            normalize_market(row.get("market") or row.get("venue")),
+        )
+        if not key[0] or key in seen:
+            continue
+        rows.append(row)
+        seen.add(key)
+    return rows
+
+
+def _manager_create_actions_use_visible_candidates(
+    prompt: dict[str, Any],
+    actions: dict[str, Any],
+) -> bool:
+    candidate_rows = _manager_prompt_create_visible_candidate_rows(prompt)
+    if not candidate_rows:
+        return True
+    visible_pairs: set[tuple[str, str]] = set()
+    unscoped_symbols: set[str] = set()
+    for row in candidate_rows:
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        raw_market = row.get("market") or row.get("venue")
+        if raw_market in (None, ""):
+            unscoped_symbols.add(symbol)
+        else:
+            visible_pairs.add((symbol, normalize_market(raw_market)))
+    if not visible_pairs and not unscoped_symbols:
+        return True
+    for row in _as_list(actions.get("create_blocks")):
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        market = normalize_market(row.get("market") or row.get("venue"))
+        if symbol in unscoped_symbols:
+            continue
+        if (symbol, market) in visible_pairs:
+            continue
+        return False
+    return True
+
+
 def manager_response_contract_error(
     *,
     prompt: dict[str, Any],
@@ -11510,6 +13061,7 @@ def manager_response_contract_error(
     if _manager_execution_gate_blocks_contract(prompt):
         return ""
     action_count = _manager_action_item_count(actions)
+    entry_repair_action_count = _manager_entry_repair_action_item_count(actions)
     if _manager_candidate_memory_hint_resolution_missing(
         prompt=prompt,
         response=response,
@@ -11517,8 +13069,33 @@ def manager_response_contract_error(
         hold_decision=hold_decision,
     ):
         return "candidate_memory_hint_resolution_missing_from_model"
+    if not _manager_create_actions_use_visible_candidates(prompt, actions):
+        return "manager_create_candidate_not_visible"
+    binance_activity_gap_pressure = _manager_prompt_has_binance_activity_gap_pressure(
+        prompt
+    )
+    binance_activity_gap_action_resolved = (
+        binance_activity_gap_pressure
+        and _manager_action_resolves_binance_activity_gap(
+            prompt=prompt,
+            actions=actions,
+        )
+    )
+    binance_activity_gap_response_resolved = (
+        binance_activity_gap_pressure
+        and _manager_response_resolves_binance_activity_gap(
+            prompt=prompt,
+            response=response,
+            hold_decision=hold_decision,
+        )
+    )
+    binance_activity_gap_resolved = (
+        binance_activity_gap_action_resolved
+        or binance_activity_gap_response_resolved
+    )
+    active_validation_repair = _manager_prompt_has_active_validation_repair(prompt)
     active_repair = (
-        _manager_prompt_has_active_validation_repair(prompt)
+        active_validation_repair
         or _manager_prompt_has_jue_wiki_validation_repair_contract(prompt)
         or _manager_prompt_has_wiki_repair_priorities(prompt)
         or _manager_prompt_has_wiki_attention_response_contract(prompt)
@@ -11530,24 +13107,30 @@ def manager_response_contract_error(
         or _manager_prompt_has_unavailable_wiki_context(prompt)
         or _manager_prompt_has_wiki_action_reference_memory(prompt)
     )
+    validation_repair_action_missing = (
+        active_validation_repair
+        and _manager_executable_repair_resolution_missing_action(
+            prompt=prompt,
+            response=response,
+            actions=actions,
+        )
+    )
     wiki_attention = _manager_prompt_has_wiki_attention_response_contract(prompt)
     requested_symbol_coverage_gap = _manager_prompt_has_requested_symbol_coverage_gap(
         prompt
     )
-    requested_symbol_coverage_action_resolved = (
-        requested_symbol_coverage_gap
-        and _manager_actions_resolve_requested_symbol_coverage(
+    requested_symbol_coverage_resolution = (
+        _manager_requested_symbol_coverage_resolution_state(
             prompt=prompt,
+            response=response,
             actions=actions,
+            hold_decision=hold_decision,
+            action_count=action_count,
         )
     )
-    requested_symbol_coverage_hold_resolved = (
-        requested_symbol_coverage_gap
-        and _manager_hold_resolves_requested_symbol_coverage(
-            prompt,
-            hold_decision,
-        )
-    )
+    requested_symbol_coverage_resolved = requested_symbol_coverage_resolution[
+        "resolved"
+    ]
     memory_card_quality_gap = _manager_prompt_has_memory_card_quality_gap(prompt)
     attention_action_resolved = (
         wiki_attention
@@ -11639,13 +13222,22 @@ def manager_response_contract_error(
     )
     degraded_wiki_effectiveness_action_resolved = (
         degraded_wiki_effectiveness_gap
-        and _manager_actions_have_prompt_linked_wiki_repair_metadata(
-            prompt,
-            actions,
-            metadata_keys=(
-                "jue_wiki_repair_pressure",
-                "jue_wiki_repair_resolution",
-            ),
+        and (
+            _manager_actions_have_prompt_linked_wiki_repair_metadata(
+                prompt,
+                actions,
+                metadata_keys=(
+                    "jue_wiki_repair_pressure",
+                    "jue_wiki_repair_resolution",
+                ),
+            )
+            or (
+                entry_repair_action_count <= 0
+                and _manager_response_has_prompt_linked_repair_resolution(
+                    prompt,
+                    response,
+                )
+            )
         )
     )
     repair_resolved = (
@@ -11668,11 +13260,7 @@ def manager_response_contract_error(
             )
         )
         or (
-            requested_symbol_coverage_gap
-            and (
-                requested_symbol_coverage_action_resolved
-                or requested_symbol_coverage_hold_resolved
-            )
+            requested_symbol_coverage_resolved
         )
         or memory_card_quality_resolved
         or wiki_decision_adjustment_resolved
@@ -11685,10 +13273,7 @@ def manager_response_contract_error(
     )
     if memory_card_quality_gap and not memory_card_quality_resolved:
         repair_resolved = False
-    if requested_symbol_coverage_gap and not (
-        requested_symbol_coverage_action_resolved
-        or requested_symbol_coverage_hold_resolved
-    ):
+    if requested_symbol_coverage_gap and not requested_symbol_coverage_resolved:
         repair_resolved = False
     if wiki_decision_adjustment_gap and not wiki_decision_adjustment_resolved:
         repair_resolved = False
@@ -11727,25 +13312,52 @@ def manager_response_contract_error(
             return "validation_repair_resolution_missing_from_model"
         if memory_contract_repair_required and not memory_contract_repair_resolved:
             return "memory_contract_resolution_missing_from_model"
-        if requested_symbol_coverage_gap and not (
-            requested_symbol_coverage_action_resolved
-            or requested_symbol_coverage_hold_resolved
-        ):
+        if requested_symbol_coverage_gap and not requested_symbol_coverage_resolved:
             return "validation_repair_resolution_missing_from_model"
         if (
             degraded_wiki_effectiveness_gap
             and not degraded_wiki_effectiveness_action_resolved
         ):
             return "validation_repair_resolution_missing_from_model"
+        if validation_repair_action_missing:
+            return "validation_repair_action_missing_from_model"
+        if _manager_repair_probe_action_below_min_executable_qty(prompt, actions):
+            return "validation_repair_min_executable_qty_missing_from_model"
+        if _manager_repairable_probe_design_rejection_ignores_design(
+            prompt,
+            response,
+            actions,
+        ):
+            return "validation_repair_probe_design_ignored_from_model"
         if active_repair and not repair_resolved:
             return "validation_repair_resolution_missing_from_model"
+        if binance_activity_gap_pressure and not binance_activity_gap_resolved:
+            return "binance_activity_gap_resolution_missing_from_model"
         return ""
+    if binance_activity_gap_pressure and not binance_activity_gap_response_resolved:
+        return "binance_activity_gap_resolution_missing_from_model"
     if memory_contract_repair_required and not memory_contract_repair_resolved:
         return "memory_contract_resolution_missing_from_model"
     if unavailable_wiki_context_gap and not unavailable_wiki_context_hold_resolved:
         return "wiki_context_gap_resolution_missing_from_model"
     if wiki_action_reference_gap and not wiki_action_reference_hold_resolved:
         return "wiki_action_reference_resolution_missing_from_model"
+    if memory_card_quality_gap and not memory_card_quality_resolved:
+        return "validation_repair_resolution_missing_from_model"
+    if requested_symbol_coverage_gap and not requested_symbol_coverage_resolved:
+        return "validation_repair_resolution_missing_from_model"
+    if wiki_decision_adjustment_gap and not wiki_decision_adjustment_resolved:
+        return "validation_repair_resolution_missing_from_model"
+    if wiki_selection_guidance_gap and not wiki_selection_guidance_hold_resolved:
+        return "validation_repair_resolution_missing_from_model"
+    if validation_repair_action_missing:
+        return "validation_repair_action_missing_from_model"
+    if _manager_repairable_probe_design_rejection_ignores_design(
+        prompt,
+        response,
+        actions,
+    ):
+        return "validation_repair_probe_design_ignored_from_model"
     if active_repair and not repair_resolved:
         return "validation_repair_resolution_missing_from_model"
     if (
@@ -11820,6 +13432,7 @@ def manager_run_diagnostics(
         for key in BINANCE_MANAGER_ACTION_SECTIONS
         if isinstance(actions.get(key), list)
     )
+    entry_repair_action_count = _manager_entry_repair_action_item_count(actions)
     prompt_budget = prompt.get("prompt_budget")
     prompt_budget = prompt_budget if isinstance(prompt_budget, dict) else {}
     growth_governor = _manager_scoped_operational_prompt_section(
@@ -11967,27 +13580,19 @@ def manager_run_diagnostics(
     requested_symbol_coverage_gap = _manager_prompt_has_requested_symbol_coverage_gap(
         prompt
     )
-    requested_symbol_coverage_resolved_by_action = (
-        requested_symbol_coverage_gap
-        and _manager_actions_resolve_requested_symbol_coverage(
+    requested_symbol_coverage_resolution = (
+        _manager_requested_symbol_coverage_resolution_state(
             prompt=prompt,
+            response=response,
             actions=actions,
+            hold_decision=hold_decision,
+            action_count=action_count,
         )
     )
-    requested_symbol_coverage_resolved_by_hold = (
-        requested_symbol_coverage_gap
-        and _manager_hold_resolves_requested_symbol_coverage(
-            prompt,
-            hold_decision,
-        )
-    )
-    if (
-        requested_symbol_coverage_gap
-        and not (
-            requested_symbol_coverage_resolved_by_action
-            or requested_symbol_coverage_resolved_by_hold
-        )
-    ):
+    requested_symbol_coverage_resolved = requested_symbol_coverage_resolution[
+        "resolved"
+    ]
+    if requested_symbol_coverage_gap and not requested_symbol_coverage_resolved:
         add("unresolved_jue_wiki_requested_symbol_coverage", 2)
     memory_card_quality_gap = _manager_prompt_has_memory_card_quality_gap(prompt)
     memory_card_quality_terms = _manager_memory_card_quality_required_terms(prompt)
@@ -12101,16 +13706,22 @@ def manager_run_diagnostics(
     )
     if degraded_effectiveness_resolved_by_action:
         degraded_effectiveness_resolution_status = "action_metadata"
-    elif action_count <= 0 and degraded_effectiveness_resolved_by_hold:
+    elif entry_repair_action_count <= 0 and degraded_effectiveness_resolved_by_hold:
         degraded_effectiveness_resolution_status = "hold_trigger"
-    elif action_count <= 0 and degraded_effectiveness_resolved_by_response:
+    elif entry_repair_action_count <= 0 and degraded_effectiveness_resolved_by_response:
         degraded_effectiveness_resolution_status = "response_resolution"
     else:
         degraded_effectiveness_resolution_status = "unresolved"
     if degraded_effectiveness_items and not (
         degraded_effectiveness_resolved_by_action
-        or (action_count <= 0 and degraded_effectiveness_resolved_by_hold)
-        or (action_count <= 0 and degraded_effectiveness_resolved_by_response)
+        or (
+            entry_repair_action_count <= 0
+            and degraded_effectiveness_resolved_by_hold
+        )
+        or (
+            entry_repair_action_count <= 0
+            and degraded_effectiveness_resolved_by_response
+        )
     ):
         add("unresolved_degraded_jue_wiki_effectiveness", 3)
     wiki_selection_guidance_gap = _manager_prompt_has_wiki_selection_guidance(prompt)
@@ -12544,6 +14155,17 @@ def manager_run_diagnostics(
         "jue_wiki_requested_symbol_coverage_status": requested_symbol_coverage.get(
             "status"
         ),
+        "jue_wiki_requested_symbol_coverage_resolution_status": (
+            "action_metadata"
+            if requested_symbol_coverage_resolution["resolved_by_action"]
+            else "hold_trigger"
+            if requested_symbol_coverage_resolution["resolved_by_hold"]
+            else "response_resolution"
+            if requested_symbol_coverage_resolution["resolved_by_response"]
+            else "unresolved"
+            if requested_symbol_coverage_resolution["gap"]
+            else "inactive"
+        ),
         "jue_wiki_missing_summary_symbols": _as_list(
             requested_symbol_coverage.get("missing_summary_symbols")
         )[:12],
@@ -12822,7 +14444,7 @@ def compact_manager_prompt_context(
     return {key: item for key, item in context.items() if item not in (None, "", [], {})}
 
 
-def finalize_prompt_budget(
+def _finalize_prompt_budget_impl(
     prompt: dict[str, Any],
     *,
     target_chars: int,
@@ -12852,6 +14474,30 @@ def finalize_prompt_budget(
         )
     prompt.pop("prompt_budget", None)
     enforce_prompt_budget(prompt, max_chars=configured_max)
+    attach_prompt_budget(
+        prompt,
+        target_chars=effective_target_chars,
+        warn_chars=effective_warn_chars,
+        max_chars=configured_max,
+    )
+    if (
+        not latency_active
+        and _manager_warn_budget_recovery_is_needed(
+            prompt,
+            warn_chars=effective_warn_chars,
+        )
+    ):
+        prompt.pop("prompt_budget", None)
+        sections = compact_manager_sections_for_warn_budget(
+            prompt,
+            warn_chars=effective_warn_chars,
+        )
+        extend_prompt_compaction(
+            prompt,
+            max_chars=configured_max,
+            effective_max_chars=effective_warn_chars,
+            sections=sections,
+        )
     attach_prompt_budget(
         prompt,
         target_chars=effective_target_chars,
@@ -12921,9 +14567,7 @@ def finalize_prompt_budget(
                 warn_chars=effective_warn_chars,
                 max_chars=configured_max,
             )
-    if not prompt_budget_error(prompt) and (
-        not latency_active or prompt_chars(prompt) <= effective_warn_chars
-    ):
+    if not prompt_budget_error(prompt) and prompt_chars(prompt) <= effective_warn_chars:
         return
 
     original_chars = prompt_chars(prompt)
@@ -13067,6 +14711,255 @@ def finalize_prompt_budget(
         warn_chars=effective_warn_chars,
         max_chars=configured_max,
     )
+
+
+def finalize_prompt_budget(
+    prompt: dict[str, Any],
+    *,
+    target_chars: int,
+    warn_chars: int,
+    max_chars: int,
+) -> None:
+    original_latency_guard = (
+        dict(prompt.get("latency_guard"))
+        if isinstance(prompt.get("latency_guard"), dict)
+        else {}
+    )
+    latency_active = bool(original_latency_guard.get("active"))
+    effective_target_chars = (
+        max(
+            int(original_latency_guard.get("target_chars") or target_chars),
+            10_000,
+        )
+        if latency_active
+        else max(int(target_chars), 10_000)
+    )
+    effective_warn_chars = (
+        max(effective_target_chars + 2_500, effective_target_chars)
+        if latency_active
+        else max(int(warn_chars), effective_target_chars)
+    )
+    configured_max_chars = max(int(max_chars), 10_000)
+    original_sequences = {
+        key: list(value)
+        for key in ("decision_inputs", "candidates", "blocks", "universe")
+        if isinstance((value := prompt.get(key)), list)
+    }
+    original_thread = {
+        key: prompt.get(key)
+        for key in ("native_thread_mode", "native_thread_key")
+        if prompt.get(key) not in (None, "")
+    }
+    original_contract_sections = {
+        key: prompt.get(key)
+        for key in (
+            "candidate_generation",
+            "candidate_memory_hint_policy",
+            "canonical_decision_packet",
+            "decision_packet_policy",
+            "horizon_action_authority",
+            "horizon_policy",
+            "jue_wiki_application_coverage",
+            "jue_wiki_budget_report",
+            "jue_wiki_primary_context_policy",
+            "jue_wiki_selection_observation",
+            "jue_wiki_validation_repair_effectiveness",
+            "lane_balance",
+            "language_policy",
+            "market_universe",
+            "output_language_policy",
+            "policy",
+            "proactive_decision_pressure",
+            "recent_performance",
+            "validation_repair",
+        )
+        if prompt.get(key) not in (None, "", [], {})
+    }
+
+    _finalize_prompt_budget_impl(
+        prompt,
+        target_chars=target_chars,
+        warn_chars=warn_chars,
+        max_chars=max_chars,
+    )
+
+    runtime_candidate_limit = 30 if configured_max_chars >= 60_000 else 8
+    compaction_sections: dict[str, dict[str, int]] = {}
+    for key, original in original_sequences.items():
+        if key == "candidates":
+            rows = select_manager_candidate_rows_for_compaction(
+                original,
+                limit=runtime_candidate_limit,
+                priority_candidate_keys=_manager_prompt_priority_candidate_keys(
+                    {"candidates": original}
+                ),
+                lane_diverse=True,
+            )
+            compacted = compact_prompt_value(
+                rows,
+                list_limit=runtime_candidate_limit,
+                string_limit=180,
+            )
+        elif key == "blocks":
+            compacted = compact_prompt_section(
+                "blocks",
+                original,
+                list_limit=6,
+                string_limit=110,
+            )
+        else:
+            compacted = compact_prompt_value(
+                original,
+                list_limit=32 if key == "decision_inputs" else 12,
+                string_limit=100,
+            )
+        retained = compacted if isinstance(compacted, list) else []
+        prompt[key] = retained
+        compaction_sections[key] = {
+            "item_count": len(original),
+            "retained_item_count": len(retained),
+            "omitted_item_count": max(len(original) - len(retained), 0),
+        }
+
+    for key, original in original_contract_sections.items():
+        if key == "policy":
+            prompt[key] = (
+                compact_prompt_section(
+                    "policy",
+                    original,
+                    list_limit=8,
+                    string_limit=240,
+                )
+                if configured_max_chars >= 60_000
+                else compact_prompt_value_bounded(
+                    original,
+                    list_limit=8,
+                    string_limit=140,
+                    dict_limit=40,
+                )
+            )
+            continue
+        if key in {
+            "candidate_generation",
+            "horizon_action_authority",
+            "horizon_policy",
+            "lane_balance",
+            "language_policy",
+            "market_universe",
+            "output_language_policy",
+            "proactive_decision_pressure",
+            "validation_repair",
+        }:
+            prompt[key] = compact_prompt_value(
+                original,
+                list_limit=(
+                    40
+                    if key in {"language_policy", "output_language_policy"}
+                    else 30
+                    if key == "market_universe"
+                    else 12
+                ),
+                string_limit=240,
+            )
+            continue
+        if key in prompt:
+            continue
+        prompt[key] = compact_prompt_value(
+            original,
+            list_limit=8,
+            string_limit=180,
+        )
+
+    prompt.update(original_thread)
+    prompt["compaction_meta"] = {
+        "version": "manager_prompt_compaction_meta_v1",
+        "sections": compaction_sections,
+    }
+    prompt.pop("prompt_budget", None)
+    attach_prompt_budget(
+        prompt,
+        target_chars=effective_target_chars,
+        warn_chars=effective_warn_chars,
+        max_chars=configured_max_chars,
+    )
+    needs_final_recovery = bool(prompt_budget_error(prompt)) or (
+        latency_active and prompt_chars(prompt) > effective_target_chars
+    )
+    if needs_final_recovery:
+        prompt.pop("prompt_budget", None)
+        final_target = (
+            max(effective_target_chars - 3_500, 10_000)
+            if latency_active
+            else max(configured_max_chars - 12_000, 10_000)
+        )
+        sections = compact_manager_sections_for_final_budget(
+            prompt,
+            target_chars=final_target,
+        )
+        if (
+            latency_active
+            and prompt_chars(prompt) > final_target
+            and prompt.get("output_schema") == prompt.get("native_output_schema")
+        ):
+            before = prompt_chars({"output_schema": prompt.get("output_schema")})
+            prompt.pop("output_schema", None)
+            sections.append(
+                {
+                    "section": "output_schema:latency_duplicate_removed",
+                    "before_chars": before,
+                    "after_chars": 0,
+                }
+            )
+        if (
+            latency_active
+            and prompt_chars(prompt) > final_target
+            and isinstance(prompt.get("candidates"), list)
+        ):
+            before = prompt_chars({"candidates": prompt.get("candidates")})
+            prompt["candidates"] = _compact_prompt_candidates_lane_diverse_section(
+                prompt.get("candidates"),
+                compact_value=compact_prompt_value,
+                clean_text=lambda raw, text_limit: _clean_text(
+                    raw,
+                    limit=text_limit,
+                ),
+                list_limit=12,
+                string_limit=80,
+                priority_candidate_keys=_manager_prompt_priority_candidate_keys(prompt),
+            )
+            after = prompt_chars({"candidates": prompt.get("candidates")})
+            if after < before:
+                sections.append(
+                    {
+                        "section": "candidates:latency_final",
+                        "before_chars": before,
+                        "after_chars": after,
+                    }
+                )
+        extend_prompt_compaction(
+            prompt,
+            max_chars=configured_max_chars,
+            effective_max_chars=final_target,
+            sections=sections,
+        )
+        for key, original in original_sequences.items():
+            retained = prompt.get(key)
+            retained_count = len(retained) if isinstance(retained, list) else 0
+            compaction_sections[key] = {
+                "item_count": len(original),
+                "retained_item_count": retained_count,
+                "omitted_item_count": max(len(original) - retained_count, 0),
+            }
+        prompt["compaction_meta"] = {
+            "version": "manager_prompt_compaction_meta_v1",
+            "sections": compaction_sections,
+        }
+        attach_prompt_budget(
+            prompt,
+            target_chars=effective_target_chars,
+            warn_chars=effective_warn_chars,
+            max_chars=configured_max_chars,
+        )
 
 
 def compact_validation_repair_prompt(

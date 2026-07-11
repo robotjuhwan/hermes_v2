@@ -39,6 +39,11 @@ from tradecraft.services.jue_wiki_selector import (
     compact_jue_wiki_validation_repair_effectiveness_for_prompt,
 )
 from tradecraft.services.manager_prompt_budget import attach_jue_wiki_budget_report
+from tradecraft.services.manager_prompt_contract import ManagerPromptContractViolation
+from tradecraft.services.market_judge_prompt import (
+    compact_market_judge_audit_prompt,
+    finalize_market_judge_prompt,
+)
 
 logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
@@ -142,6 +147,9 @@ class MarketJudgmentConfig:
     query: str = "장중 현재 움직임과 내 국장1 계좌를 반영해 관심/보류 판단을 정리해줘"
     request_timeout_sec: float = 8.0
     quote_concurrency: int = 4
+    prompt_target_chars: int = 120_000
+    prompt_warn_chars: int = 150_000
+    prompt_max_chars: int = 190_000
 
 
 def _jue_wiki_prompt_mode(jue_wiki: dict[str, Any] | None) -> str:
@@ -3712,6 +3720,9 @@ class MarketJudgmentEngine:
                 "max_symbols": int(self.config.max_symbols),
                 "llm_max_symbols": int(self.config.llm_max_symbols),
                 "use_naver_fallback": bool(self.config.use_naver_fallback),
+                "prompt_target_chars": int(self.config.prompt_target_chars),
+                "prompt_warn_chars": int(self.config.prompt_warn_chars),
+                "prompt_max_chars": int(self.config.prompt_max_chars),
             },
         }
 
@@ -3810,6 +3821,8 @@ class MarketJudgmentEngine:
             quotes=quotes,
         )
         prompt: dict[str, Any] = {}
+        audit_prompt: dict[str, Any] = {}
+        prompt_budget_error = ""
         if use_llm:
             market_pulse = self._market_pulse_context(
                 symbols=focus_symbols,
@@ -3828,7 +3841,7 @@ class MarketJudgmentEngine:
                 symbols=focus_symbols,
                 horizons=[_market_session_wiki_horizon(clock)],
             )
-            prompt = self._build_prompt(
+            raw_prompt = self._build_prompt(
                 clock=clock,
                 account=account,
                 strategy_payload=strategy_payload,
@@ -3839,6 +3852,19 @@ class MarketJudgmentEngine:
                 investment_memory=investment_memory,
                 jue_wiki=jue_wiki,
             )
+            audit_prompt = compact_market_judge_audit_prompt(raw_prompt)
+            try:
+                prompt_bundle = finalize_market_judge_prompt(
+                    raw_prompt,
+                    target_chars=self.config.prompt_target_chars,
+                    warn_chars=self.config.prompt_warn_chars,
+                    max_chars=self.config.prompt_max_chars,
+                )
+                prompt = prompt_bundle.runtime_prompt
+                audit_prompt = prompt_bundle.audit_prompt
+            except ManagerPromptContractViolation as exc:
+                prompt = raw_prompt
+                prompt_budget_error = str(exc)
         response_payload: dict[str, Any] = {}
         mode = "error" if use_llm else "quote_only"
         status = "error" if use_llm else "quotes_only"
@@ -3851,6 +3877,8 @@ class MarketJudgmentEngine:
             error_message = f"account_fetch_failed:{account.get('error_message') or ''}"
         elif not focus_symbols:
             error_message = "no_focus_symbols"
+        elif prompt_budget_error:
+            error_message = prompt_budget_error
         elif not getattr(self.codex_runtime, "ready", False):
             error_message = "codex_runtime_unavailable"
         else:
@@ -3894,7 +3922,7 @@ class MarketJudgmentEngine:
             "model": self.codex_runtime.resolved_model,
             "query": self.config.query,
             "error_message": error_message,
-            "prompt": prompt,
+            "prompt": audit_prompt if use_llm else prompt,
             "response": response_payload,
             "source_snapshot": {
                 "clock": clock,

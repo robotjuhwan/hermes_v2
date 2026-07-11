@@ -1,12 +1,135 @@
 from __future__ import annotations
 
 import json
+import gzip
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import tradecraft.services.jue_wiki_application as jue_wiki_application_module
 from tradecraft.services.jue_wiki import JueWikiConfig, JueWikiService
 from tradecraft.services.jue_wiki_application import JueWikiApplicationService
+
+
+class _ShadowEligibilityReader:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def eligibility(self, venue: str) -> dict[str, object]:
+        self.calls.append(venue)
+        now = datetime.now(timezone.utc).isoformat()
+        if venue == "kis":
+            return {
+                "version": "wiki_shadow_eligibility_v1",
+                "venue": "kis",
+                "required_eligible": True,
+                "complete_sample_count": 500,
+                "blockers": [],
+                "reason": "required_acceptance_gates_passed",
+                "evaluated_at": now,
+                "evaluated_through": now,
+            }
+        return {
+            "version": "wiki_shadow_eligibility_v1",
+            "venue": "binance",
+            "required_eligible": False,
+            "complete_sample_count": 120,
+            "blockers": ["insufficient_complete_comparisons"],
+            "reason": "insufficient_complete_comparisons",
+            "evaluated_at": now,
+            "evaluated_through": now,
+        }
+
+
+def test_shadow_mode_recommendations_are_read_only_and_per_venue() -> None:
+    class _NoWriteWiki:
+        def initialize(self) -> None:
+            raise AssertionError("read-only recommendations must not initialize Wiki")
+
+    reader = _ShadowEligibilityReader()
+    service = JueWikiApplicationService(  # type: ignore[arg-type]
+        _NoWriteWiki(),
+        shadow_eligibility_reader=reader,
+    )
+
+    result = service.project_wiki_mode_recommendations()
+
+    assert reader.calls == ["binance", "kis"]
+    assert result["status"] == "ok"
+    assert result["read_only"] is True
+    by_venue = {row["venue"]: row for row in result["recommendations"]}
+    assert by_venue["kis"]["recommended_mode"] == "required_eligible"
+    assert by_venue["kis"]["sample_count"] == 500
+    assert by_venue["binance"]["recommended_mode"] == "prefer"
+    assert by_venue["binance"]["blockers"] == ["insufficient_complete_comparisons"]
+
+
+def test_wiki_mode_recommendation_malformed_reader_fails_closed() -> None:
+    class _Malformed:
+        def eligibility(self, venue: str) -> dict[str, object]:
+            return {
+                "version": "wiki_shadow_eligibility_v1",
+                "venue": venue,
+                "required_eligible": True,
+                "complete_sample_count": "not-an-int",
+                "blockers": [],
+            }
+
+    service = JueWikiApplicationService(  # type: ignore[arg-type]
+        object(),
+        shadow_eligibility_reader=_Malformed(),
+    )
+
+    result = service.project_wiki_mode_recommendations()
+
+    assert all(row["required_eligible"] is False for row in result["recommendations"])
+    assert all("eligibility_invalid" in row["blockers"] for row in result["recommendations"])
+
+
+def test_wiki_mode_recommendation_requires_signed_contract_identity() -> None:
+    class _MissingVersion:
+        def eligibility(self, venue: str) -> dict[str, object]:
+            now = datetime.now(timezone.utc).isoformat()
+            return {
+                "venue": venue,
+                "required_eligible": True,
+                "complete_sample_count": 500,
+                "blockers": [],
+                "evaluated_at": now,
+                "evaluated_through": now,
+            }
+
+    result = JueWikiApplicationService(  # type: ignore[arg-type]
+        object(),
+        shadow_eligibility_reader=_MissingVersion(),
+    ).project_wiki_mode_recommendations()
+
+    assert all(row["required_eligible"] is False for row in result["recommendations"])
+    assert all("eligibility_version_invalid" in row["blockers"] for row in result["recommendations"])
+
+
+def test_wiki_mode_recommendation_stale_reader_has_stale_blocker() -> None:
+    class _Stale:
+        def eligibility(self, venue: str) -> dict[str, object]:
+            return {
+                "version": "wiki_shadow_eligibility_v1",
+                "venue": venue,
+                "required_eligible": True,
+                "complete_sample_count": 500,
+                "blockers": [],
+                "evaluated_at": "2026-07-01T00:00:00+00:00",
+                "evaluated_through": "2026-07-01T00:00:00+00:00",
+            }
+
+    service = JueWikiApplicationService(  # type: ignore[arg-type]
+        object(), shadow_eligibility_reader=_Stale()
+    )
+
+    result = service.project_wiki_mode_recommendations()
+
+    assert all(row["required_eligible"] is False for row in result["recommendations"])
+    assert all("eligibility_stale" in row["blockers"] for row in result["recommendations"])
+    assert all(row["reason"] == row["blockers"][0] for row in result["recommendations"])
 
 
 def _service(tmp_path: Path) -> JueWikiApplicationService:
@@ -25,6 +148,131 @@ def _kis_mid_effectiveness_metric(metric: dict[str, object]) -> dict[str, object
         "venue": "kis",
         "horizon": "mid",
     }
+
+
+def test_status_without_ops_snapshot_is_read_only(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    db_path = service.wiki.config.db_path
+
+    status = service.status()
+
+    assert status == {
+        "status": "unavailable",
+        "snapshot_version": "ops_section_snapshot_v1",
+        "snapshot_section": "jue_wiki_application",
+        "reason": "ops_snapshot_missing",
+    }
+    assert not db_path.exists()
+
+
+def test_status_reads_persisted_ops_snapshot_without_projection_or_writes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service = _service(tmp_path)
+    projected = service.project_status_snapshot()
+    db_path = service.wiki.config.db_path
+    before_bytes = db_path.read_bytes()
+    before_mtime_ns = db_path.stat().st_mtime_ns
+
+    def fail_projection(*_args, **_kwargs):
+        raise AssertionError("status read path must not project or repair")
+
+    for method_name in (
+        "project_page_effectiveness",
+        "project_mode_recommendations",
+        "project_prompt_mode_effectiveness",
+        "project_trust_profile_effectiveness",
+        "project_repair_priority_effectiveness",
+        "project_validation_repair_effectiveness",
+    ):
+        monkeypatch.setattr(service, method_name, fail_projection)
+
+    status = service.status()
+
+    assert status == projected
+    assert db_path.read_bytes() == before_bytes
+    assert db_path.stat().st_mtime_ns == before_mtime_ns
+
+
+def test_old_raw_outcomes_move_to_compressed_archive_after_projection(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    service.wiki.initialize()
+    with service.wiki._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_selection_outcomes (
+                outcome_id, link_id, selection_run_id, page_id, decision_scope,
+                outcome_kind, outcome_status, evidence_json, computed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "old-outcome",
+                "link-old",
+                "selection-old",
+                "page-old",
+                "kis",
+                "closed_block",
+                "win",
+                '{"audit":"keep"}',
+                "2026-05-01T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_selection_outcomes (
+                outcome_id, link_id, selection_run_id, page_id, decision_scope,
+                outcome_kind, outcome_status, evidence_json, computed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "recent-outcome",
+                "link-recent",
+                "selection-recent",
+                "page-recent",
+                "binance",
+                "closed_block",
+                "loss",
+                "{}",
+                "2026-06-20T00:00:00+00:00",
+            ),
+        )
+
+    dry_run = service.archive_selection_outcomes(
+        retention_days=30,
+        now_iso="2026-07-01T00:00:00+00:00",
+        dry_run=True,
+    )
+    result = service.archive_selection_outcomes(
+        retention_days=30,
+        now_iso="2026-07-01T00:00:00+00:00",
+        dry_run=False,
+    )
+
+    assert dry_run["candidate_count"] == 1
+    assert dry_run["archived_count"] == 0
+    assert result["archived_count"] == 1
+    with service.wiki._connect() as conn:
+        active_ids = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT outcome_id FROM wiki_selection_outcomes"
+            ).fetchall()
+        }
+        archived = conn.execute(
+            """
+            SELECT outcome_id, evidence_gzip, evidence_sha256
+            FROM wiki_selection_outcomes_archive
+            """
+        ).fetchone()
+    assert active_ids == {"recent-outcome"}
+    assert archived["outcome_id"] == "old-outcome"
+    assert gzip.decompress(archived["evidence_gzip"]).decode("utf-8") == (
+        '{"audit":"keep"}'
+    )
+    assert len(str(archived["evidence_sha256"])) == 64
 
 
 def test_compact_prompt_string_list_drops_none_null_strings() -> None:
@@ -2782,7 +3030,7 @@ def test_status_includes_prompt_mode_effectiveness_summary(
         evidence={"block_id": "status-primary-block"},
     )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     mode_effectiveness = status["prompt_mode_effectiveness"]
     assert mode_effectiveness["decision_sample_count"] == 1
@@ -2853,7 +3101,7 @@ def test_status_summarizes_degraded_decision_adjustment_audit_metrics(
             evidence={"block_id": f"status-audit-{idx}"},
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     audit_status = status["decision_adjustment_audit_status"]
     assert audit_status["status"] == "repair_required"
@@ -2934,7 +3182,7 @@ def test_status_summarizes_repair_priority_effectiveness(tmp_path: Path) -> None
             },
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     repair_effectiveness = status["repair_priority_effectiveness"]
     assert repair_effectiveness["status"] == "repair_required"
@@ -3256,7 +3504,7 @@ def test_status_summarizes_validation_repair_effectiveness(tmp_path: Path) -> No
             },
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     validation = status["validation_repair_effectiveness"]
     assert validation["status"] == "repair_required"
@@ -3351,7 +3599,9 @@ def test_status_preserves_explicit_zero_validation_repair_metrics(
             },
         )
 
-    validation = service.status()["validation_repair_effectiveness"]
+    validation = service.project_status_snapshot()[
+        "validation_repair_effectiveness"
+    ]
 
     assert validation["top_degraded"][0]["sample_count"] == 3
     assert validation["top_degraded"][0]["missed_count"] == 3
@@ -8649,7 +8899,7 @@ def test_status_summarizes_quality_warning_effectiveness(tmp_path: Path) -> None
         }
     )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert status["effectiveness_count"] == 3
     assert status["quality_warning_effectiveness_count"] == 1
@@ -8740,7 +8990,7 @@ def test_status_summarizes_active_quality_warning_sources(tmp_path: Path) -> Non
         }
     )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert status["quality_warning_source_active_count"] == 1
     assert status["top_active_quality_warning_sources"] == [
@@ -8967,7 +9217,7 @@ def test_status_summarizes_wiki_application_coverage(tmp_path: Path) -> None:
         return_pct=0.7,
     )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert status["wiki_application_coverage"] == {
         "decision_link_count": 2,
@@ -9073,7 +9323,7 @@ def test_status_counts_only_attributable_selected_outcomes(
             ),
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
     kis_status = next(
         item
         for item in status["wiki_application_scopes"]
@@ -9156,7 +9406,7 @@ def test_status_counts_playbook_outcomes_as_attributable_even_with_symbol_contex
             ),
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
     kis_status = next(
         item
         for item in status["wiki_application_scopes"]
@@ -9229,7 +9479,7 @@ def test_status_flags_closed_block_outcomes_without_horizon(
             ),
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
     kis_status = next(
         item
         for item in status["wiki_application_scopes"]
@@ -9328,7 +9578,7 @@ def test_status_prunes_stale_misattributed_effectiveness_metrics(
             ),
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
     metric = service.page_effectiveness(
         page_id="kis.symbol.005930",
         decision_scope="kis",
@@ -9439,7 +9689,7 @@ def test_status_supersedes_stale_latest_mode_recommendation_after_cleanup(
             ),
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert status["effectiveness_cleanup"]["stale_effectiveness_removed_count"] == 1
     assert status["latest_recommendation"]["recommendation_id"] != (
@@ -9486,7 +9736,7 @@ def test_status_flags_wiki_application_coverage_gaps(tmp_path: Path) -> None:
         },
     )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert status["wiki_application_health"] == "warning"
     assert status["wiki_application_alerts"] == [
@@ -10891,7 +11141,7 @@ def test_status_recomputes_mode_recommendation_from_remaining_valid_metrics(
             ),
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert status["effectiveness_cleanup"]["stale_effectiveness_removed_count"] == 1
     assert status["latest_recommendation"]["recommended_mode"] == "primary"
@@ -10944,7 +11194,7 @@ def test_status_exposes_latest_mode_recommendation_by_scope(
             ),
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     by_scope = status["mode_recommendations_by_scope"]
     assert by_scope["kis"]["recommendation_id"] == "wiki-mode:kis-latest"

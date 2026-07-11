@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 .env
 .runtime/
+.runtime-cold-archive/
 node_modules/
 playwright-report/
 test-results/
@@ -19,4 +20,5 @@ output/
 .omx/
 .playwright-cli/
 .lazyweb/
+.verification/
 COMMAND.ini

@@ -52,6 +52,10 @@ def _ui_live_authority_js() -> str:
     return (ROOT / "src/tradecraft/web/static/ui_live_authority.js").read_text()
 
 
+def _ui_shell_js() -> str:
+    return (ROOT / "src/tradecraft/web/static/ui_shell.js").read_text()
+
+
 def _live_authority_panel_body() -> str:
     live_js = _ui_live_authority_js()
     start = live_js.index("function renderLiveAuthorityPanel")
@@ -468,7 +472,6 @@ def test_static_ui_renders_ops_advisory_details() -> None:
     assert "function renderOpsAdvisoryDetails(" in ops_js
     assert "renderOpsAdvisoryDetails," in ops_js
     assert "renderOpsAdvisoryDetails," in ops_destructuring
-    assert "renderOpsAdvisoryDetails(readiness.advisory_details" in js
     assert "renderOpsAdvisoryDetails(ops.advisory_details" in js
     assert "ops-advisory-detail" in ops_js
     assert "row.top_bottlenecks" in ops_js
@@ -638,7 +641,7 @@ def test_static_ui_auth_save_refreshes_active_helper_tab() -> None:
     assert "ensureHelperTabData(state.activeHelperTab);" in token_save_handler
 
 
-def test_static_ui_helper_page_keeps_kis_quick_strip_visible() -> None:
+def test_static_ui_kis_helper_page_keeps_kis_quick_strip_visible() -> None:
     html = _html()
     js = _js()
 
@@ -646,7 +649,9 @@ def test_static_ui_helper_page_keeps_kis_quick_strip_visible() -> None:
     assert 'class="kis-quick-strip helper-kis-strip"' in html
     assert '"helperKisQuickStrip"' in js
     assert '["kisQuickStrip", "helperKisQuickStrip"]' in js
-    assert 'targets.forEach((target)' in js
+    assert 'state.activeHelperTab === "kis_trader"' in js
+    assert 'state.activeHelperTab === "kis_memory"' in js
+    assert 'target.hidden = id === "helperKisQuickStrip" && !showHelperKisStrip' in js
 
 
 def test_kis_quick_strip_preserves_auth_required_message_on_both_surfaces() -> None:
@@ -663,6 +668,8 @@ const slots = {{
 }};
 const qs = (id) => slots[id] || null;
 const state = {{
+  activePage: "helper",
+  activeHelperTab: "kis_trader",
   auth: {{
     required: true,
     message: "운영 토큰을 입력하면 국장/블록/운영 데이터를 불러옵니다.",
@@ -892,7 +899,7 @@ def test_kis_block_tab_paints_core_payload_before_auxiliary_loads() -> None:
     assert "} else if (shouldPreloadVisibleHelperTab) {\n    ensureHelperTabData();\n  }" in js
     assert "const kisQuickPreload = hasAdminToken() && !prioritizeKisBlocks" in js
     assert "await refreshDashboard({ skipKisBlocks: prioritizeKisBlocks || Boolean(kisQuickPreload) });" in js
-    assert "20260701_kis_auth_session_hint_v1" in html
+    assert "20260710_operator_shell_v3" in html
 
 
 def test_helper_tab_data_does_not_call_protected_loaders_without_admin_token() -> None:
@@ -1331,6 +1338,10 @@ def test_static_ui_loads_shared_label_registry_before_main_app() -> None:
     assert "window.HERMES_UI_SHARED" in shared_js
     assert "opsSignalLabels" in shared_js
     assert "validationGateLabels" in shared_js
+    assert (
+        "binance_block_manager_last_run_failed: "
+        '"Binance 쥬 최근 판단 실패"' in shared_js
+    )
     assert "const OPS_SIGNAL_LABELS =" not in js
     assert "const VALIDATION_GATE_LABELS =" not in js
     assert "window.HERMES_UI_SHARED" in js
@@ -2925,8 +2936,26 @@ def test_ops_readiness_surfaces_remediation_actions() -> None:
     assert "remediation_actions" in js
     assert "다음 조치" in ops_js
     assert "data-ops-action-endpoint" in ops_js
-    assert "renderOpsRemediationActions(readiness.remediation_actions" in banner_body
+    assert (
+        "renderOpsRemediationActions(readiness.operational_remediation_actions"
+        in banner_body
+    )
     assert "renderOpsRemediationActions(ops.remediation_actions" in block_body
+
+
+def test_static_ui_binance_manual_actions_send_live_confirmation_payloads() -> None:
+    js = _js()
+    helper_start = js.index("function binanceLiveExecutionEnabled")
+    load_start = js.index("async function loadBinanceBlocks")
+    load_end = js.index("async function loadCryptoResearch", load_start)
+    body = js[helper_start:load_end]
+
+    assert "function confirmBinanceLiveManualAction" in body
+    assert "window.confirm" in body
+    assert "confirm_live_manager_run: true" in body
+    assert "confirm_live_executor_tick: true" in body
+    assert 'getJSON("/binance/blocks/manager/run-once"' in body
+    assert 'getJSON("/binance/blocks/executor/tick"' in body
 
 
 def test_ops_readiness_surfaces_trading_validation_bottlenecks() -> None:
@@ -2953,30 +2982,29 @@ def test_ops_readiness_surfaces_trading_validation_bottlenecks() -> None:
     assert "비용 역전" in ops_js
     assert "19검증 병목" in ops_js
     assert "최우선 복구" in ops_js
-    assert "renderTradingValidationBottleneckSummary(readiness.trading_validation" in banner_body
+    assert "renderTradingValidationBottleneckSummary" not in banner_body
     assert "renderTradingValidationBottleneckSummary(ops.trading_validation" in block_body
 
 
-def test_ops_banner_stays_visible_for_green_strategy_advisories() -> None:
+def test_ops_banner_hides_when_only_strategy_advisories_remain() -> None:
     js = _js()
     banner_start = js.index("function renderOpsBanner")
     banner_end = js.index("function metricTone", banner_start)
     banner_body = js[banner_start:banner_end]
 
     assert (
-        'banner.hidden = status === "green" && blockers.length === 0 '
-        '&& warnings.length === 0 && advisories.length === 0;'
+        "banner.hidden = blockers.length === 0 && warnings.length === 0;"
     ) in banner_body
 
 
-def test_ops_banner_labels_green_advisories_as_improvement_queue() -> None:
+def test_ops_banner_does_not_label_advisories_as_global_operations() -> None:
     js = _js()
     banner_start = js.index("function renderOpsBanner")
     banner_end = js.index("function metricTone", banner_start)
     banner_body = js[banner_start:banner_end]
 
-    assert "const hasOnlyAdvisories =" in banner_body
-    assert "쥬 운영 정상 · 전략 개선 큐" in banner_body
+    assert "const hasOnlyAdvisories =" not in banner_body
+    assert "쥬 운영 정상 · 전략 개선 큐" not in banner_body
     assert "운영 차단" in banner_body
     assert "운영 점검 필요" in banner_body
 
@@ -3045,7 +3073,7 @@ def test_memory_tabs_are_split_between_kis_and_binance_scopes() -> None:
     assert "memoryScopeForTab(" in js
     assert 'return `/memory/today?scope=${encodeURIComponent(scope)}&compact=true`;' in js
     assert "getJSON(memoryTodayPath(scope))" in js
-    assert "20260621_split_memory_tabs_v1" in html
+    assert "20260710_operator_shell_v3" in html
 
 
 def test_investment_memory_loader_has_inflight_guard() -> None:
@@ -3280,3 +3308,234 @@ def test_initial_prioritized_kis_helper_load_skips_duplicate_ops_readiness() -> 
 
     assert "const prioritizeKisBlocks =" in init_source
     assert "includeOpsReadiness: false" in init_source
+
+
+def test_operator_navigation_is_grouped_and_mobile_dock_stays_compact() -> None:
+    html = _html()
+    tabs_js = _tabs_js()
+
+    assert "navigationGroups" in tabs_js
+    for group in ("운용", "판단·리서치", "학습", "시스템"):
+        assert group in tabs_js
+    assert "mobileNavItems" in tabs_js
+    for item in ("홈", "국장", "크립토", "리서치", "더보기"):
+        assert item in tabs_js
+    assert 'id="mobileNavDock"' in html
+    assert 'aria-label="모바일 주요 내비게이션"' in html
+    assert 'id="mobileNavMoreBtn"' in html
+    assert 'aria-controls="primaryNavRail"' in html
+    assert 'id="primaryNavRail"' in html
+
+
+def test_operator_shell_assets_share_current_cache_version() -> None:
+    html = _html()
+    version = "20260710_operator_shell_v3"
+
+    assert f"/static/style.css?v={version}" in html
+    assert f"/static/tabs.js?v={version}" in html
+    assert f"/static/ui_shell.js?v={version}" in html
+    assert f"/static/kis_trader_tab.js?v={version}" in html
+    assert f"/static/binance_tab.js?v={version}" in html
+    assert f"/static/app.js?v={version}" in html
+
+
+def test_ui_shell_contract_builds_safety_summary_and_resource_states() -> None:
+    html = _html()
+    js = _js()
+    shell_js = _ui_shell_js()
+
+    assert "/static/ui_shell.js" in html
+    assert html.index("/static/ui_shell.js") < html.index("/static/app.js")
+    assert "window.HERMES_UI_SHELL" in shell_js
+    assert "function normalizeResourceState(" in shell_js
+    assert "function buildSafetySummary(" in shell_js
+    assert "function renderHomeOpsSummaryHtml(" in shell_js
+    assert "const UI_SHELL = window.HERMES_UI_SHELL || {};" in js
+    assert "UI_SHELL.buildSafetySummary(" in js
+    assert "UI_SHELL.renderHomeOpsSummaryHtml(" in js
+
+    shell_path = ROOT / "src/tradecraft/web/static/ui_shell.js"
+    script = f"""
+global.window = {{}};
+require({json.dumps(str(shell_path))});
+const shell = window.HERMES_UI_SHELL;
+const summary = shell.buildSafetySummary({{
+  readiness: {{status: "red", blockers: ["kill"], warnings: ["stale"], live_trading_enabled: true}},
+  kisStatus: {{execution_mode: "paper", kill_switch: {{enabled: false}}, blocks: [{{status: "active"}}]}},
+  binanceStatus: {{execution_mode: "live", kill_switch: {{enabled: true}}, blocks: [{{status: "failed_entry"}}]}},
+  authRequired: false,
+  hasAdminToken: true,
+}});
+const resource = shell.normalizeResourceState({{status: "stale", updated_at: "2026-07-10T01:02:03Z"}});
+console.log(JSON.stringify({{summary, resource}}));
+"""
+    result = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+
+    assert payload["summary"]["tone"] == "bad"
+    assert payload["summary"]["mode"] == "LIVE"
+    assert payload["summary"]["blockerCount"] == 1
+    assert payload["summary"]["kis"]["mode"] == "PAPER"
+    assert payload["summary"]["binance"]["killSwitch"] is True
+    assert payload["summary"]["binance"]["failedCount"] == 1
+    assert payload["resource"]["kind"] == "stale"
+
+
+def test_ui_shell_reads_nested_venue_execution_and_kill_switch_state() -> None:
+    shell_path = ROOT / "src/tradecraft/web/static/ui_shell.js"
+    script = f"""
+global.window = {{}};
+require({json.dumps(str(shell_path))});
+const summary = window.HERMES_UI_SHELL.buildSafetySummary({{
+  readiness: {{status: "green", blockers: [], warnings: []}},
+  kisStatus: {{execution_mode: "paper", summary: {{kill_switch: {{enabled: true}}}}}},
+  binanceStatus: {{execution: {{spot_mode: "live", futures_mode: "paper"}}}},
+  hasAdminToken: true,
+}});
+console.log(JSON.stringify(summary));
+"""
+    result = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    summary = json.loads(result.stdout)
+
+    assert summary["mode"] == "LIVE"
+    assert summary["kis"]["killSwitch"] is True
+    assert summary["binance"]["mode"] == "LIVE"
+    assert summary["tone"] == "bad"
+
+
+def test_kis_and_binance_block_cards_expose_fill_and_adoption_provenance() -> None:
+    kis_path = ROOT / "src/tradecraft/web/static/kis_trader_tab.js"
+    binance_path = ROOT / "src/tradecraft/web/static/binance_tab.js"
+    script = f"""
+global.window = {{}};
+require({json.dumps(str(kis_path))});
+require({json.dumps(str(binance_path))});
+const kis = window.HERMES_KIS_TRADER_TAB.renderBlockCard({{
+  block_id: "kis-1",
+  symbol: "005930",
+  status: "open",
+  created_by: "existing_position",
+  metadata: {{fill_provenance: "exchange_fill"}},
+}});
+const binance = window.HERMES_BINANCE_TAB.renderBlockCard({{
+  block_id: "bn-1",
+  symbol: "BTCUSDT",
+  status: "failed_entry",
+  created_by: "wallet_adoption",
+  metadata: {{fill_provenance: "paper_fill"}},
+}});
+console.log(JSON.stringify({{kis, binance}}));
+"""
+    result = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+
+    assert "기존 보유 채택 · 쥬 진입 성과 제외" in payload["kis"]
+    assert "거래소 체결" in payload["kis"]
+    assert "Wallet 채택 · 쥬 진입 성과 제외" in payload["binance"]
+    assert "Paper 체결" in payload["binance"]
+    assert "진입 실패 · 체결 없음" in payload["binance"]
+
+
+def test_venue_workspaces_separate_overview_active_and_history_surfaces() -> None:
+    js = _js()
+    shell_js = _ui_shell_js()
+
+    assert "function renderWorkspaceJumpNav(" in shell_js
+    assert "renderWorkspaceJumpNav," in shell_js
+    assert 'UI_SHELL.renderWorkspaceJumpNav("kis"' in js
+    assert 'UI_SHELL.renderWorkspaceJumpNav("binance"' in js
+    for marker in (
+        'id="kis-workspace-overview"',
+        'id="kis-workspace-active"',
+        'id="kis-workspace-history"',
+        'id="binance-workspace-overview"',
+        'id="binance-workspace-active"',
+        'id="binance-workspace-history"',
+    ):
+        assert marker in js
+    assert "data-workspace-jump" in shell_js
+    assert 'target.closest("[data-workspace-jump]")' in js
+    assert "scrollIntoView" in js
+
+
+def test_auth_prompt_is_compact_until_operator_expands_token_form() -> None:
+    html = _html()
+    js = _js()
+    css = _css()
+
+    assert 'id="authBannerToggleBtn"' in html
+    assert 'aria-controls="authTokenControls"' in html
+    assert 'id="authTokenControls"' in html
+    assert "function setAuthPromptExpanded(" in js
+    assert 'bindEvent("authBannerToggleBtn", "click"' in js
+    assert ".auth-banner:not(.expanded) .auth-token-controls" in css
+    assert ".auth-banner.expanded .auth-token-controls" in css
+
+
+def test_auth_required_helper_copy_is_scoped_to_active_venue() -> None:
+    js = _js()
+    start = js.index("function renderAuthRequiredHelperPanel")
+    end = js.index("function renderOpsBanner", start)
+    body = js[start:end]
+
+    assert "activeHelperTab" in body
+    assert 'activeHelperTab === "binance_trader"' in body
+    assert "Binance 계좌·블록·실행 정보" in body
+    assert "KIS 국장 계좌·블록·장중 판단 정보" in body
+    assert "data-auth-scope" in body
+
+
+def test_kis_quick_strip_is_not_rendered_in_binance_workspace() -> None:
+    js = _js()
+    start = js.index("function renderKisQuickStrip")
+    end = js.index("function renderKisAccountHoldingsPanel", start)
+    body = js[start:end]
+
+    assert "showHelperKisStrip" in body
+    assert 'state.activeHelperTab === "kis_trader"' in body
+    assert 'state.activeHelperTab === "kis_memory"' in body
+    assert "target.hidden = id === \"helperKisQuickStrip\" && !showHelperKisStrip" in body
+
+
+def test_static_shell_exposes_keyboard_and_motion_accessibility_contracts() -> None:
+    html = _html()
+    js = _js()
+    css = _css()
+
+    assert 'class="skip-link"' in html
+    assert 'id="mainWorkspace"' in html
+    assert 'aria-current="page"' in html
+    assert 'aria-expanded="false"' in html
+    assert "setAttribute(\"aria-current\"" in js
+    assert "setAttribute(\"aria-expanded\"" in js
+    assert ":focus-visible" in css
+    assert "prefers-reduced-motion: reduce" in css
+
+
+def test_mobile_operator_header_keeps_status_and_venue_cards_compact() -> None:
+    css = _css()
+    marker = "Operator shell final responsive overrides"
+    start = css.index(marker)
+    body = css[start:]
+
+    assert "grid-template-columns: repeat(3, minmax(0, 1fr))" in body
+    assert ".pillbox > *" in body
+    assert "width: auto" in body
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in body
+    assert ".home-readiness-card" in body
+    assert "grid-column: 1 / -1" in body

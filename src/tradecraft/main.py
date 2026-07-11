@@ -11,7 +11,6 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +30,11 @@ from tradecraft.api.app_route_groups import (
 )
 from tradecraft.api.app_routes import register_app_routes
 from tradecraft.api.binance_blocks_payloads import build_binance_block_readiness_payload
+from tradecraft.api.crypto_payloads import (
+    crypto_research_symbols,
+    default_crypto_research_symbols,
+    parse_crypto_kline_intervals,
+)
 from tradecraft.api.dashboard_payloads import (
     DashboardPayloadCache,
     DashboardPayloadDeps,
@@ -65,6 +69,7 @@ from tradecraft.api.helper_payloads import (
     parse_helper_llm_content as _parse_helper_llm_content,
     safe_helper_limit as _safe_helper_limit,
 )
+from tradecraft.api.jue_workflow_payloads import available_jue_workflow_ids
 from tradecraft.api.kis_rebalance_payloads import (
     build_kis_block_rebalance_status_payload,
 )
@@ -74,8 +79,12 @@ from tradecraft.api.llm_payloads import (
     build_llm_usage_status_payload as build_llm_usage_status_payload_from_summary,
     enrich_llm_usage_component_recovery as enrich_llm_usage_component_recovery_payload,
 )
+from tradecraft.api.ops import (
+    _compact_ops_readiness as build_compact_ops_readiness_payload,
+)
 from tradecraft.api.ops_payloads import (
     build_disk_space_status as build_disk_space_status_payload,
+    build_runtime_storage_size_status as build_runtime_storage_size_status_payload,
     build_llm_operational_status as build_llm_operational_status_payload,
     build_ops_binance_block_trader_payload as build_ops_binance_block_trader_payload_payload,
     build_ops_crypto_alpha_payload as build_ops_crypto_alpha_payload_payload,
@@ -94,12 +103,18 @@ from tradecraft.api.ops_payloads import (
     finalize_ops_readiness_signals as build_finalize_ops_readiness_signals_payload,
     merge_section_readiness_signals as merge_ops_section_readiness_signals_payload,
 )
+from tradecraft.api.ops_process_payloads import (
+    DUPLICATE_SCAN_RUNNER_KEYS,  # noqa: F401
+    build_app_core_runner_processes,
+    iso_to_utc,
+    light_process_with_staleness as build_light_process_with_staleness,
+    runner_process_status_light as build_runner_process_status_light,
+)
 from tradecraft.api.ops_readiness import (
-    build_core_runner_processes as build_core_runner_processes_payload,
+    build_compact_ops_readiness_source,
     build_market_judgment_readiness_status,
     build_market_pulse_readiness_status,
     build_ops_readiness_payload,
-    light_runner_process_status as build_light_runner_process_status,
     runner_status_with_cover as build_runner_status_with_cover,
 )
 from tradecraft.api.trading_validation_payloads import (
@@ -191,6 +206,17 @@ from tradecraft.services.investment_memory import (
 from tradecraft.services.jue_lifecycle import JueLifecycleRepository
 from tradecraft.services.jue_skill_registry import JueSkillRegistry, JueSkillValidationError
 from tradecraft.services.jue_wiki import JueWikiConfig, JueWikiService
+from tradecraft.services.jue_wiki_context import (
+    JueWikiContextService,
+    evaluate_wiki_decision_gate,
+)
+from tradecraft.services.jue_wiki_contract import WikiContextRequestV1
+from tradecraft.services.jue_wiki_repository import JueWikiRepository
+from tradecraft.services.jue_wiki_shadow import (
+    JueWikiShadowStore,
+    WikiCompletionSigner,
+    build_runtime_recording_recorder,
+)
 from tradecraft.services.jue_wiki_selector import (
     JueWikiSelectionRequest,
     JueWikiSelector,
@@ -202,12 +228,20 @@ from tradecraft.services.codex_native import (
 )
 from tradecraft.services.codex_native_store import CodexNativeStore
 from tradecraft.services.llm_usage import KST, LLMUsageRepository
+from tradecraft.services.llm_model_policy import (
+    llm_model_config_kwargs,
+    resolve_llm_model_policy,
+)
 from tradecraft.services.live_authority import (
     EXPECTED_TRADING_VALIDATION_DISCIPLINE_COUNT,
 )
 from tradecraft.services.trading_validation import (
     TradingValidationConfig,
     TradingValidationService,
+)
+from tradecraft.services.unavailable_services import (
+    UnavailableCryptoAlphaService,
+    UnavailableCryptoMarketResearchService,
 )
 from tradecraft.services.intelligence import (
     build_report_intelligence_status,
@@ -228,18 +262,34 @@ from tradecraft.services.market_judgment import (
 )
 from tradecraft.services.opportunity_scanner import rank_opportunities
 from tradecraft.services.market_pulse import MarketPulseConfig, MarketPulseService
+from tradecraft.services.ops_readiness_snapshot import (
+    OpsReadinessSnapshotConfig,
+    OpsReadinessSnapshotCoordinator,
+)
 from tradecraft.services.runtime_bridge import (
     ResearchSnapshotReader,
     RuntimeSnapshotReader,
+)
+from tradecraft.services.runtime_cold_archive_status import (
+    persist_runtime_cold_archive_status,
+    read_runtime_cold_archive_status,
 )
 from tradecraft.services.runtime_maintenance import (
     RuntimeStoragePolicy,
     build_runtime_storage_report,
     cleanup_runtime_storage,
 )
+from tradecraft.services.runtime_storage_policy import (
+    runtime_storage_policy_from_settings,
+)
 from tradecraft.services.settings_catalog import (
     build_settings_catalog,
     update_settings_env,
+)
+from tradecraft.services.status_provider import StatusProviderPool
+from tradecraft.services.strategy_collect_sources import (
+    STRATEGY_COLLECT_SOURCE_ALIASES,
+    safe_strategy_collect_sources as build_safe_strategy_collect_sources,
 )
 from tradecraft.services.strategy_intelligence import (
     StrategyIntelligenceConfig,
@@ -257,8 +307,8 @@ from tradecraft.services.symbol_fundamentals import (
 from tradecraft.services.system_metrics import SystemMetricsService
 from tradecraft.runtime.process_status import (
     clear_current_runner_pid,
-    restart_runner_processes,
     runner_process_status,
+    schedule_runner_recovery as restart_runner_processes,
     write_current_runner_pid,
 )
 from tradecraft.runtime.watchdog_runner import watchdog_status
@@ -278,27 +328,6 @@ backtest_live_manager = BacktestLiveManager(
     max_curve_points=settings.backtest_max_curve_points,
 )
 backtest_data_registry = BacktestDataRegistry(settings.backtest_data_registry_path)
-JUE_WORKFLOW_IDS = (
-    "kis_pre_open",
-    "kis_intraday_manager",
-    "kis_post_close",
-    "block_reflection",
-    "policy_revision",
-    "crypto_research",
-    "binance_cycle",
-)
-
-
-def _available_jue_workflow_ids(registry: JueSkillRegistry) -> list[str]:
-    workflow_dir = registry.root / "workflows"
-    discovered = sorted(
-        path.stem
-        for path in workflow_dir.glob("*.json")
-        if path.is_file()
-    )
-    preferred = [workflow_id for workflow_id in JUE_WORKFLOW_IDS if workflow_id in discovered]
-    preferred_set = set(preferred)
-    return preferred + [workflow_id for workflow_id in discovered if workflow_id not in preferred_set]
 
 
 def _require_configured_admin_tokens() -> list[str]:
@@ -363,130 +392,6 @@ def _setting(name: str, default: Any) -> Any:
     return getattr(settings, name, default)
 
 
-class _UnavailableCryptoMarketResearchService:
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-
-    def status(self) -> dict[str, Any]:
-        return {
-            "status": "ok",
-            "available": False,
-            "db_path": settings.crypto_market_research_db_path,
-            "snapshot_count": 0,
-            "candidate_count": 0,
-            "reason": self.reason,
-        }
-
-    def latest_context(
-        self,
-        symbols: list[str] | None = None,
-        limit: int = 20,
-    ) -> dict[str, Any]:
-        return {
-            "status": "ok",
-            "available": False,
-            "symbols": symbols or [],
-            "limit": limit,
-            "items": [],
-            "market_regime": {"status": "missing", "regime": "unknown"},
-            "observed_symbol_count": len(symbols or []),
-            "focus_symbol_count": 0,
-            "candidates": [],
-            "symbol_notes": {},
-            "features": {},
-            "reason": self.reason,
-        }
-
-    async def collect_market_structure(self, symbols: list[str]) -> dict[str, Any]:
-        return {
-            "status": "skipped",
-            "available": False,
-            "symbols": symbols,
-            "reason": self.reason,
-        }
-
-    async def run_research_once(
-        self,
-        symbols: list[str] | None = None,
-    ) -> dict[str, Any]:
-        return {
-            "status": "skipped",
-            "available": False,
-            "symbols": symbols or [],
-            "reason": self.reason,
-        }
-
-
-class _UnavailableCryptoAlphaService:
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-
-    def status(self) -> dict[str, Any]:
-        return {
-            "status": "ok",
-            "available": False,
-            "db_path": settings.crypto_alpha_db_path,
-            "sources": 0,
-            "snapshots": 0,
-            "events": 0,
-            "outcomes": 0,
-            "hypotheses": 0,
-            "reason": self.reason,
-        }
-
-    def context_pack(
-        self,
-        *,
-        symbols: list[str] | None = None,
-        limit: int = 12,
-    ) -> dict[str, Any]:
-        return {
-            "status": "ok",
-            "available": False,
-            "scope": "binance_crypto_alpha",
-            "symbols": symbols or [],
-            "limit": limit,
-            "events": [],
-            "similar_outcomes": [],
-            "scorecards": [],
-            "active_lessons": [],
-            "contradictions": [],
-            "data_gaps": ["crypto_alpha_unavailable"],
-            "reason": self.reason,
-        }
-
-    async def collect_once(self) -> dict[str, Any]:
-        return {"status": "skipped", "available": False, "reason": self.reason}
-
-    async def label_due_outcomes(self) -> dict[str, Any]:
-        return {
-            "status": "skipped",
-            "available": False,
-            "reason": self.reason,
-            "labeled": 0,
-        }
-
-
-def _crypto_research_symbols(raw: Any) -> list[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        values = re.split(r"[\s,;]+", raw)
-    elif isinstance(raw, list):
-        values = [str(item) for item in raw]
-    else:
-        values = [str(raw)]
-    return [
-        symbol
-        for symbol in dict.fromkeys(item.strip().upper() for item in values)
-        if symbol and re.fullmatch(r"[A-Z0-9:_-]{2,30}", symbol)
-    ]
-
-
-def _default_crypto_research_symbols() -> list[str]:
-    return _crypto_research_symbols(settings.crypto_market_research_universe)
-
-
 async def _await_if_needed(value: Any) -> Any:
     if asyncio.iscoroutine(value):
         return await value
@@ -509,14 +414,99 @@ def _jue_wiki_prompt_mode() -> str:
     return mode if mode in {"observe", "assist", "primary"} else "assist"
 
 
+def _jue_wiki_trader_config_kwargs() -> dict[str, str]:
+    """Return the validated Wiki policy shared by every in-process trader."""
+
+    return {"jue_wiki_read_mode": settings.jue_wiki_read_mode}
+
+
 def _jue_wiki_context_provider(**kwargs: Any) -> dict[str, Any]:
+    default_max_chars = int(
+        getattr(
+            settings,
+            "jue_wiki_full_prompt_max_chars",
+            settings.jue_wiki_context_max_chars,
+        )
+    )
+    target_scope = str(kwargs.get("target_scope") or "")
+    symbols = _jue_wiki_arg_list(kwargs, "symbols")
+    page_types = _jue_wiki_arg_list(kwargs, "page_types")
+    lanes = _jue_wiki_arg_list(kwargs, "lanes")
+    regimes = _jue_wiki_arg_list(kwargs, "regimes")
+    block_ids = _jue_wiki_arg_list(kwargs, "block_ids")
+    horizons = _jue_wiki_arg_list(kwargs, "horizons")
+    max_chars = int(
+        kwargs["max_chars"]
+        if kwargs.get("max_chars") is not None
+        else default_max_chars
+    )
+    read_mode = settings.jue_wiki_read_mode
+    try:
+        packet = JueWikiContextService(
+            JueWikiRepository(Path(settings.jue_wiki_db_path)),
+            health_reader=jue_wiki_service.status,
+            eligibility_reader=JueWikiShadowStore(
+                Path(settings.jue_wiki_shadow_db_path),
+                completion_verifier=WikiCompletionSigner(
+                    Path(settings.jue_wiki_provenance_key_path)
+                ),
+            ),
+        ).context_packet(
+            WikiContextRequestV1(
+                target_scope=target_scope,
+                symbols=tuple(symbols),
+                page_types=tuple(page_types),
+                lanes=tuple(lanes),
+                regimes=tuple(regimes),
+                block_ids=tuple(block_ids),
+                horizons=tuple(horizons),
+                max_chars=max_chars,
+            ),
+            read_mode=read_mode,
+        )
+        packet_payload = packet.to_dict()
+        gate_payload = evaluate_wiki_decision_gate(packet).to_dict()
+    except Exception as exc:
+        packet_payload = {
+            "status": "error",
+            "read_mode": read_mode,
+            "snapshot_id": "",
+            "error_message": str(exc),
+        }
+        gate_payload = {
+            "allow_new_risk": read_mode != "required",
+            "allow_exit_actions": True,
+            "reason": (
+                "wiki_required_context_unavailable"
+                if read_mode == "required"
+                else "wiki_context_advisory"
+            ),
+            "read_mode": read_mode,
+            "snapshot_id": "",
+            "version": "wiki_decision_gate_v1",
+        }
+    base_payload = {
+        "read_mode": read_mode,
+        "jue_wiki_context_packet": packet_payload,
+        "jue_wiki_decision_gate": gate_payload,
+    }
     if not bool(settings.jue_wiki_enabled):
+        if read_mode == "required":
+            base_payload["jue_wiki_decision_gate"] = {
+                "allow_new_risk": False,
+                "allow_exit_actions": True,
+                "reason": "wiki_required_disabled",
+                "read_mode": "required",
+                "snapshot_id": "",
+                "version": "wiki_decision_gate_v1",
+            }
         return {
+            **base_payload,
             "status": "disabled",
             "enabled": False,
             "reason": "jue_wiki_disabled",
-            "target_scope": str(kwargs.get("target_scope") or ""),
-            "symbols": _jue_wiki_arg_list(kwargs, "symbols"),
+            "target_scope": target_scope,
+            "symbols": symbols,
             "prompt_mode": _jue_wiki_prompt_mode(),
             "pages": [],
             "content": "",
@@ -528,42 +518,59 @@ def _jue_wiki_context_provider(**kwargs: Any) -> dict[str, Any]:
                 "rejected_count": 0,
             },
         }
-    default_max_chars = int(
-        getattr(
-            settings,
-            "jue_wiki_full_prompt_max_chars",
-            settings.jue_wiki_context_max_chars,
+    try:
+        result = JueWikiSelector(jue_wiki_service).select(
+            JueWikiSelectionRequest(
+                target_scope=target_scope,
+                symbols=symbols,
+                page_types=page_types,
+                lanes=lanes,
+                regimes=regimes,
+                block_ids=block_ids,
+                horizons=horizons,
+                max_chars=max_chars,
+                max_pages=int(settings.jue_wiki_selector_max_pages),
+                min_confidence=float(settings.jue_wiki_selector_min_confidence),
+                exclude_lint_warnings=bool(settings.jue_wiki_exclude_lint_warnings),
+                effectiveness_weight=float(settings.jue_wiki_effectiveness_weight),
+                effectiveness_max_adjustment=float(
+                    settings.jue_wiki_effectiveness_max_adjustment
+                ),
+            )
         )
-    )
-    result = JueWikiSelector(jue_wiki_service).select(
-        JueWikiSelectionRequest(
-            target_scope=str(kwargs.get("target_scope") or ""),
-            symbols=_jue_wiki_arg_list(kwargs, "symbols"),
-            page_types=_jue_wiki_arg_list(kwargs, "page_types"),
-            lanes=_jue_wiki_arg_list(kwargs, "lanes"),
-            regimes=_jue_wiki_arg_list(kwargs, "regimes"),
-            block_ids=_jue_wiki_arg_list(kwargs, "block_ids"),
-            horizons=_jue_wiki_arg_list(kwargs, "horizons"),
-            max_chars=int(
-                kwargs["max_chars"]
-                if kwargs.get("max_chars") is not None
-                else default_max_chars
-            ),
-            max_pages=int(settings.jue_wiki_selector_max_pages),
-            min_confidence=float(settings.jue_wiki_selector_min_confidence),
-            exclude_lint_warnings=bool(settings.jue_wiki_exclude_lint_warnings),
-            effectiveness_weight=float(settings.jue_wiki_effectiveness_weight),
-            effectiveness_max_adjustment=float(
-                settings.jue_wiki_effectiveness_max_adjustment
-            ),
-        )
-    )
+    except Exception as exc:
+        if read_mode == "required":
+            base_payload["jue_wiki_decision_gate"] = {
+                "allow_new_risk": False,
+                "allow_exit_actions": True,
+                "reason": "wiki_required_selector_unavailable",
+                "read_mode": "required",
+                "snapshot_id": str(gate_payload.get("snapshot_id") or "")[:120],
+                "version": "wiki_decision_gate_v1",
+            }
+        return {
+            **base_payload,
+            "status": "error",
+            "target_scope": target_scope,
+            "prompt_mode": _jue_wiki_prompt_mode(),
+            "error_message": str(exc),
+        }
+    if read_mode == "required" and result.status != "ok":
+        base_payload["jue_wiki_decision_gate"] = {
+            "allow_new_risk": False,
+            "allow_exit_actions": True,
+            "reason": "wiki_required_selector_ineligible",
+            "read_mode": "required",
+            "snapshot_id": str(gate_payload.get("snapshot_id") or "")[:120],
+            "version": "wiki_decision_gate_v1",
+        }
     configured_prompt_mode = _jue_wiki_prompt_mode()
     prompt_mode_resolution = resolve_jue_wiki_prompt_mode(
         configured_prompt_mode,
         result.mode_recommendation,
     )
     return {
+        **base_payload,
         "status": result.status,
         "selection_run_id": result.selection_run_id,
         "target_scope": result.target_scope,
@@ -621,7 +628,10 @@ def _build_crypto_market_research_service(
         reason = "crypto market research service is not importable"
         if _crypto_market_research_import_error is not None:
             reason = str(_crypto_market_research_import_error)
-        return _UnavailableCryptoMarketResearchService(reason=reason)
+        return UnavailableCryptoMarketResearchService(
+            reason=reason,
+            db_path=settings.crypto_market_research_db_path,
+        )
 
     config = CryptoMarketResearchConfig(
         db_path=settings.crypto_market_research_db_path,
@@ -635,7 +645,7 @@ def _build_crypto_market_research_service(
         research_universe_limit=settings.crypto_market_research_research_universe_limit,
         llm_top_symbols=settings.crypto_market_research_llm_top_symbols,
         min_quote_volume_usdt=settings.crypto_market_research_min_quote_volume_usdt,
-        kline_intervals=_parse_crypto_kline_intervals(
+        kline_intervals=parse_crypto_kline_intervals(
             settings.crypto_market_research_kline_intervals
         ),
         kline_hot_window_rows=settings.crypto_market_research_kline_hot_window_rows,
@@ -657,7 +667,10 @@ def _build_crypto_alpha_service() -> Any:
         reason = "crypto alpha service is not importable"
         if _crypto_alpha_import_error is not None:
             reason = str(_crypto_alpha_import_error)
-        return _UnavailableCryptoAlphaService(reason=reason)
+        return UnavailableCryptoAlphaService(
+            reason=reason,
+            db_path=settings.crypto_alpha_db_path,
+        )
     return CryptoAlphaService(
         config=CryptoAlphaConfig(
             db_path=settings.crypto_alpha_db_path,
@@ -719,22 +732,6 @@ def _build_crypto_pattern_service() -> Any | None:
             )
         ),
     )
-
-
-def _parse_crypto_kline_intervals(value: Any) -> dict[str, int]:
-    intervals: dict[str, int] = {}
-    for part in re.split(r"[,;]+", str(value or "")):
-        if ":" not in part:
-            continue
-        key, raw_limit = part.split(":", 1)
-        interval = key.strip()
-        try:
-            limit = int(str(raw_limit).strip())
-        except ValueError:
-            continue
-        if interval and limit > 0:
-            intervals[interval] = limit
-    return intervals or {"1m": 120, "5m": 96, "15m": 96, "1h": 168, "4h": 180}
 
 
 telegram = TelegramBridge(
@@ -815,8 +812,7 @@ helper_codex_runtime = CodexNativeRuntime(
         mode=settings.codex_runtime_mode,
         sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
         timeout_ms=settings.codex_runtime_timeout_ms,
-        model=settings.llm_model,
-        reasoning_effort=settings.llm_reasoning_effort,
+        **llm_model_config_kwargs(settings, component="research_ask"),
         usage_enabled=settings.llm_usage_enabled,
         usage_db_path=settings.llm_usage_db_path,
         usage_component="research_ask",
@@ -832,11 +828,42 @@ daily_discovery_codex_runtime = CodexNativeRuntime(
         mode=settings.codex_runtime_mode,
         sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
         timeout_ms=settings.codex_runtime_timeout_ms,
-        model=settings.llm_model,
-        reasoning_effort=settings.llm_reasoning_effort,
+        **llm_model_config_kwargs(settings, component="daily_discovery"),
         usage_enabled=settings.llm_usage_enabled,
         usage_db_path=settings.llm_usage_db_path,
         usage_component="daily_discovery",
+        thread_mode=settings.codex_native_thread_mode,
+        thread_db_path=settings.codex_native_thread_db_path,
+        compact_after_turns=settings.codex_native_compact_after_turns,
+        read_turns=settings.codex_native_read_turns,
+        developer_instructions_enabled=settings.codex_native_developer_instructions_enabled,
+    )
+)
+investment_memory_codex_runtime = CodexNativeRuntime(
+    CodexNativeConfig(
+        mode=settings.codex_runtime_mode,
+        sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
+        timeout_ms=settings.codex_runtime_timeout_ms,
+        **llm_model_config_kwargs(settings, component="investment_memory"),
+        usage_enabled=settings.llm_usage_enabled,
+        usage_db_path=settings.llm_usage_db_path,
+        usage_component="investment_memory",
+        thread_mode=settings.codex_native_thread_mode,
+        thread_db_path=settings.codex_native_thread_db_path,
+        compact_after_turns=settings.codex_native_compact_after_turns,
+        read_turns=settings.codex_native_read_turns,
+        developer_instructions_enabled=settings.codex_native_developer_instructions_enabled,
+    )
+)
+kis_manager_codex_runtime = CodexNativeRuntime(
+    CodexNativeConfig(
+        mode=settings.codex_runtime_mode,
+        sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
+        timeout_ms=settings.codex_runtime_timeout_ms,
+        **llm_model_config_kwargs(settings, component="kis_block_manager"),
+        usage_enabled=settings.llm_usage_enabled,
+        usage_db_path=settings.llm_usage_db_path,
+        usage_component="kis_block_manager",
         thread_mode=settings.codex_native_thread_mode,
         thread_db_path=settings.codex_native_thread_db_path,
         compact_after_turns=settings.codex_native_compact_after_turns,
@@ -864,7 +891,7 @@ investment_memory_service = InvestmentMemoryService(
         context_max_chars=settings.investment_memory_context_max_chars,
         ops_summary_cache_ttl_sec=settings.investment_memory_ops_summary_cache_ttl_sec,
     ),
-    codex_runtime=helper_codex_runtime,
+    codex_runtime=investment_memory_codex_runtime,
     telegram=telegram,
     wiki_context_provider=_jue_wiki_context_provider,
 )
@@ -873,8 +900,7 @@ binance_manager_codex_runtime = CodexNativeRuntime(
         mode=settings.codex_runtime_mode,
         sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
         timeout_ms=settings.codex_runtime_timeout_ms,
-        model=settings.binance_block_trader_llm_model,
-        reasoning_effort=settings.binance_block_trader_llm_reasoning_effort,
+        **llm_model_config_kwargs(settings, component="binance_block_manager"),
         usage_enabled=settings.llm_usage_enabled,
         usage_db_path=settings.llm_usage_db_path,
         usage_component="binance_block_manager",
@@ -890,8 +916,7 @@ crypto_market_research_codex_runtime = CodexNativeRuntime(
         mode=settings.codex_runtime_mode,
         sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
         timeout_ms=settings.codex_runtime_timeout_ms,
-        model=settings.crypto_market_research_llm_model,
-        reasoning_effort=settings.crypto_market_research_llm_reasoning_effort,
+        **llm_model_config_kwargs(settings, component="crypto_market_research"),
         usage_enabled=settings.llm_usage_enabled,
         usage_db_path=settings.llm_usage_db_path,
         usage_component="crypto_market_research",
@@ -920,6 +945,12 @@ binance_block_trader = BinanceBlockTrader(
         quote_interval_sec=settings.binance_block_trader_quote_interval_sec,
         rule_interval_sec=settings.binance_block_trader_rule_interval_sec,
         manager_interval_sec=settings.binance_block_trader_manager_interval_sec,
+        waiting_entry_max_age_sec=(
+            settings.binance_block_trader_waiting_entry_max_age_sec
+        ),
+        entry_pending_max_age_sec=(
+            settings.binance_block_trader_entry_pending_max_age_sec
+        ),
         aggressive_limit_bps=settings.binance_block_trader_aggressive_limit_bps,
         failed_exit_retry_cooldown_sec=(
             settings.binance_block_trader_failed_exit_retry_cooldown_sec
@@ -1029,12 +1060,17 @@ binance_block_trader = BinanceBlockTrader(
         upbit_usdt_krw_rate=settings.binance_usdt_krw,
         llm_model=settings.binance_block_trader_llm_model,
         llm_reasoning_effort=settings.binance_block_trader_llm_reasoning_effort,
+        **_jue_wiki_trader_config_kwargs(),
     ),
     binance=binance,
     upbit=upbit,
     codex_runtime=binance_manager_codex_runtime,
     memory_context_provider=investment_memory_service.context_pack,
     wiki_context_provider=_jue_wiki_context_provider,
+    wiki_shadow_recording_recorder=build_runtime_recording_recorder(
+        settings.jue_wiki_shadow_db_path,
+        provenance_key_path=settings.jue_wiki_provenance_key_path,
+    ),
     crypto_research_provider=crypto_market_research_service,
     crypto_alpha_provider=crypto_alpha_service,
     quant_provider=crypto_quant_repository if settings.crypto_quant_enabled else None,
@@ -1068,6 +1104,10 @@ jue_wiki_service = JueWikiService(
         context_max_chars=settings.jue_wiki_context_max_chars,
         page_max_chars=settings.jue_wiki_page_max_chars,
         context_page_limit=settings.jue_wiki_context_page_limit,
+        repair_overdue_sec=settings.jue_wiki_repair_overdue_sec,
+        repair_stall_sec=settings.jue_wiki_repair_stall_sec,
+        repair_growth_window_sec=settings.jue_wiki_repair_growth_window_sec,
+        repair_growth_warn_count=settings.jue_wiki_repair_growth_warn_count,
         kis_blocks_db_path=Path(settings.kis_block_trader_db_path),
         binance_blocks_db_path=Path(settings.binance_block_trader_db_path),
         investment_memory_db_path=Path(settings.investment_memory_db_path),
@@ -1201,7 +1241,7 @@ market_judgment_engine = MarketJudgmentEngine(
         query=settings.market_judge_query,
     ),
     kis=kis_primary,
-    codex_runtime=helper_codex_runtime,
+    codex_runtime=kis_manager_codex_runtime,
     strategy_engine=strategy_intelligence,
     report_repository=naver_report_repository,
     fundamentals_repository=symbol_fundamentals_service,
@@ -1236,15 +1276,20 @@ kis_block_trader = KISBlockTrader(
         telegram_enabled=settings.investment_memory_send_telegram,
         horizon_targets=parse_horizon_targets(settings.block_horizon_targets),
         etf_universe=parse_etf_universe(settings.kis_block_trader_etf_universe),
+        **_jue_wiki_trader_config_kwargs(),
     ),
     kis=kis_primary,
-    codex_runtime=helper_codex_runtime,
+    codex_runtime=kis_manager_codex_runtime,
     strategy_engine=strategy_intelligence,
     etf_research_provider=etf_research_provider,
     market_judgment_provider=market_judgment_engine,
     research_feed_provider=lambda: _read_strategy_research_feed(),
     memory_context_provider=investment_memory_service.context_pack,
     wiki_context_provider=_jue_wiki_context_provider,
+    wiki_shadow_recording_recorder=build_runtime_recording_recorder(
+        settings.jue_wiki_shadow_db_path,
+        provenance_key_path=settings.jue_wiki_provenance_key_path,
+    ),
     market_pulse_provider=market_pulse_service.context_for_blocks,
     live_authority_provider=lambda: build_runner_live_authority_payload(settings)[
         "venues"
@@ -1282,7 +1327,8 @@ def _daily_discovery_context_limit() -> int:
     return min(
         max(
             int(settings.daily_discovery_kospi_count)
-            + int(settings.daily_discovery_kosdaq_count),
+            + int(settings.daily_discovery_kosdaq_count)
+            + int(settings.daily_discovery_etf_count),
             30,
         ),
         120,
@@ -1295,6 +1341,7 @@ daily_discovery_service = DailyDiscoveryService(
         enabled=settings.daily_discovery_enabled,
         kospi_count=settings.daily_discovery_kospi_count,
         kosdaq_count=settings.daily_discovery_kosdaq_count,
+        etf_count=settings.daily_discovery_etf_count,
         exclude_recent_days=settings.daily_discovery_exclude_recent_days,
         candidate_limit_per_market=(
             settings.daily_discovery_candidate_limit_per_market
@@ -1309,96 +1356,14 @@ kis_block_trader.daily_discovery_provider = lambda: daily_discovery_service.late
 )
 
 
-_STRATEGY_COLLECT_ALLOWED_HOSTS = {
-    "whale_insight": {"whale-insight.com", "www.whale-insight.com"},
-    "after_close_330": {
-        "api.lefthanders-new.xyz",
-        "www.sesiban.site",
-        "sesiban.site",
-    },
-}
-_STRATEGY_COLLECT_DEFAULTS: dict[str, dict[str, str]] = {
-    "whale_insight": {
-        "url": "https://whale-insight.com/major_stock",
-        "cache_path": ".runtime/cache/whale_insight_public_signals.json",
-        "symbol_cache_path": ".runtime/cache/strategy_insight_symbol_cache.json",
-        "symbol_search_url": "https://api.lefthanders-new.xyz/api/v1/assets",
-    },
-    "after_close_330": {
-        "url": "https://api.lefthanders-new.xyz/api/v1/rankings/leading?market=KR",
-        "cache_path": ".runtime/cache/sesiban_public_signals.json",
-    },
-}
-_STRATEGY_COLLECT_SOURCE_ALIASES = {
-    "whale": "whale_insight",
-    "whale_insight": "whale_insight",
-    "sesiban": "after_close_330",
-    "after_close": "after_close_330",
-    "after_close_330": "after_close_330",
-}
-
-
-def _is_allowed_collect_url(source_id: str, value: Any) -> bool:
-    raw = str(value or "").strip()
-    if not raw:
-        return False
-    host = (urlparse(raw).hostname or "").lower()
-    return host in _STRATEGY_COLLECT_ALLOWED_HOSTS.get(source_id, set())
-
-
-def _safe_runtime_cache_path(value: Any, default_value: str) -> str:
-    raw = str(value or default_value).strip() or default_value
-    candidate = Path(raw).expanduser()
-    base = (Path.cwd() / ".runtime" / "cache").resolve()
-    resolved = candidate.resolve() if candidate.is_absolute() else (Path.cwd() / candidate).resolve()
-    try:
-        resolved.relative_to(base)
-    except ValueError:
-        return default_value
-    return raw
-
-
-def _safe_strategy_collect_sources(source_ids: list[str] | None = None) -> list[dict[str, Any]]:
-    wanted = {
-        _STRATEGY_COLLECT_SOURCE_ALIASES.get(str(item or "").strip().lower(), "")
-        for item in (source_ids or [])
-        if str(item or "").strip()
-    }
-    wanted.discard("")
-    safe_sources: list[dict[str, Any]] = []
-    for source in settings.strategy_insight_source_list:
-        source_id = _STRATEGY_COLLECT_SOURCE_ALIASES.get(
-            str(source.get("source_id") or "").strip().lower(),
-            "",
-        )
-        if source_id not in _STRATEGY_COLLECT_DEFAULTS:
-            continue
-        if wanted and source_id not in wanted:
-            continue
-        defaults = _STRATEGY_COLLECT_DEFAULTS[source_id]
-        row = dict(source)
-        row["source_id"] = source_id
-        row["url"] = (
-            str(source.get("url")).strip()
-            if _is_allowed_collect_url(source_id, source.get("url"))
-            else defaults["url"]
-        )
-        row["cache_path"] = _safe_runtime_cache_path(
-            source.get("cache_path"),
-            defaults["cache_path"],
-        )
-        if source_id == "whale_insight":
-            row["symbol_cache_path"] = _safe_runtime_cache_path(
-                source.get("symbol_cache_path"),
-                defaults["symbol_cache_path"],
-            )
-            row["symbol_search_url"] = (
-                str(source.get("symbol_search_url")).strip()
-                if _is_allowed_collect_url("after_close_330", source.get("symbol_search_url"))
-                else defaults["symbol_search_url"]
-            )
-        safe_sources.append(row)
-    return safe_sources
+def _safe_strategy_collect_sources(
+    source_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    return build_safe_strategy_collect_sources(
+        settings.strategy_insight_source_list,
+        source_ids=source_ids,
+        root=Path.cwd(),
+    )
 
 
 def _strategy_collect_source_ids(payload: dict[str, Any] | None) -> list[str] | None:
@@ -1414,10 +1379,15 @@ def _strategy_collect_source_ids(payload: dict[str, Any] | None) -> list[str] | 
     if raw is None:
         return None
     if isinstance(raw, str):
-        return [item.strip() for item in re.split(r"[\s,;]+", raw) if item.strip()]
-    if isinstance(raw, list):
-        return [str(item).strip() for item in raw if str(item).strip()]
-    raise HTTPException(status_code=400, detail="source_ids must be a string or list")
+        values = [item.strip() for item in re.split(r"[\s,;]+", raw) if item.strip()]
+    elif isinstance(raw, list):
+        values = [str(item).strip() for item in raw if str(item).strip()]
+    else:
+        raise HTTPException(status_code=400, detail="source_ids must be a string or list")
+    return [
+        STRATEGY_COLLECT_SOURCE_ALIASES.get(item.lower(), item)
+        for item in values
+    ]
 
 
 def _build_strategy_insight_collector(
@@ -1445,6 +1415,8 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 RESEARCH_QUERY_LOG_PATH = Path(".runtime/research_query.log.jsonl")
 telegram_poller_task: asyncio.Task[None] | None = None
 telegram_update_offset: int | None = None
+ops_readiness_refresh_task: asyncio.Task[None] | None = None
+ops_readiness_refresh_stop_event: asyncio.Event | None = None
 bithumb_cached_assets: list[dict[str, Any]] | None = None
 kis_primary_cached_assets: list[dict[str, Any]] | None = None
 kis_primary_us_cached_assets: list[dict[str, Any]] | None = None
@@ -1455,12 +1427,27 @@ dashboard_payload_cache = DashboardPayloadCache()
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI):
     global telegram_poller_task
+    global ops_readiness_refresh_task
+    global ops_readiness_refresh_stop_event
     if telegram_poller_task is None and telegram.config.ready:
         await _prime_telegram_offset()
         telegram_poller_task = asyncio.create_task(_telegram_poll_worker())
+    readiness_coordinator = _get_ops_readiness_snapshot_coordinator()
+    await asyncio.to_thread(_ensure_ops_readiness_snapshot_current)
+    if ops_readiness_refresh_task is None:
+        ops_readiness_refresh_stop_event = asyncio.Event()
+        ops_readiness_refresh_task = asyncio.create_task(
+            readiness_coordinator.run(ops_readiness_refresh_stop_event)
+        )
     try:
         yield
     finally:
+        if ops_readiness_refresh_stop_event is not None:
+            ops_readiness_refresh_stop_event.set()
+        if ops_readiness_refresh_task is not None:
+            await ops_readiness_refresh_task
+            ops_readiness_refresh_task = None
+        ops_readiness_refresh_stop_event = None
         if telegram_poller_task is not None:
             telegram_poller_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1903,58 +1890,8 @@ def _runner_status_with_cover(
     return build_runner_status_with_cover(status, covered_by=covered_by)
 
 
-def _iso_to_utc(value: Any) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = f"{text[:-1]}+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _max_code_mtime(paths: list[Path]) -> dict[str, Any]:
-    existing = [path for path in paths if path.exists()]
-    if not existing:
-        return {"code_mtime": "", "code_mtime_epoch": None}
-    latest = max(path.stat().st_mtime for path in existing)
-    return {
-        "code_mtime": datetime.fromtimestamp(latest, tz=timezone.utc).isoformat(),
-        "code_mtime_epoch": latest,
-    }
-
-
-def _process_with_code_staleness(
-    process: dict[str, Any],
-    *,
-    code_paths: list[Path],
-) -> dict[str, Any]:
-    payload = dict(process)
-    code = _max_code_mtime(code_paths)
-    started_epoch = payload.get("started_at_epoch")
-    code_epoch = code.get("code_mtime_epoch")
-    stale = False
-    if bool(payload.get("direct_alive") or payload.get("alive")):
-        try:
-            stale = bool(
-                started_epoch is not None
-                and code_epoch is not None
-                and float(code_epoch) > float(started_epoch) + 1.0
-            )
-        except (TypeError, ValueError):
-            stale = False
-    payload.update(code)
-    payload["stale_process"] = stale
-    return payload
-
-
 def _next_from_latest(latest_iso: Any, interval_sec: int) -> str:
-    latest = _iso_to_utc(latest_iso)
+    latest = iso_to_utc(latest_iso)
     if latest is None:
         return ""
     return (latest + timedelta(seconds=max(int(interval_sec), 1))).isoformat()
@@ -1968,7 +1905,7 @@ def _next_from_latest_or_krx_clock(
     include_post_close: bool,
 ) -> str:
     candidate = _next_from_latest(latest_iso, interval_sec)
-    parsed_candidate = _iso_to_utc(candidate)
+    parsed_candidate = iso_to_utc(candidate)
     if parsed_candidate is not None and parsed_candidate > datetime.now(timezone.utc):
         return candidate
     if isinstance(clock, dict):
@@ -1979,49 +1916,16 @@ def _next_from_latest_or_krx_clock(
     return candidate
 
 
-DUPLICATE_SCAN_RUNNER_KEYS = {
-    "control",
-    "kis_block_trader",
-    "binance_block_trader",
-    "market_judge",
-    "market_pulse",
-    "investment_memory",
-    "live_evaluator",
-}
-
-
 def _runner_process_status_light(key: str) -> dict[str, Any]:
-    return build_light_runner_process_status(
-        key,
-        runner_process_status,
-        scan_alive_matches=key in DUPLICATE_SCAN_RUNNER_KEYS,
-    )
+    return build_runner_process_status_light(key, runner_process_status)
 
 
 def _build_core_runner_processes() -> dict[str, dict[str, Any]]:
-    base = Path(__file__).resolve().parent
-    processes = build_core_runner_processes_payload(
-        base=base,
-        runner_status=lambda key: _runner_status_with_cover(
-            _runner_process_status_light(key)
-        ),
-        apply_code_staleness=_process_with_code_staleness,
+    return build_app_core_runner_processes(
+        base=Path(__file__).resolve().parent,
+        runner_status=runner_process_status,
+        research_enabled=bool(settings.research_enabled),
     )
-    processes["jue_wiki"] = _process_with_code_staleness(
-        _runner_status_with_cover(_runner_process_status_light("jue_wiki")),
-        code_paths=[
-            base / "runtime" / "jue_wiki_runner.py",
-            base / "services" / "jue_wiki.py",
-        ],
-    )
-    # The legacy intelligence runner is superseded by naver_reports,
-    # strategy_insights, investment_memory, and jue_wiki. Keeping it in the
-    # live readiness process map makes the UI show a stopped core service even
-    # when the active intelligence pipeline is healthy.
-    processes.pop("intelligence", None)
-    if not bool(settings.research_enabled):
-        processes.pop("research", None)
-    return processes
 
 
 def _light_process_with_staleness(
@@ -2029,8 +1933,9 @@ def _light_process_with_staleness(
     *,
     code_paths: list[Path],
 ) -> dict[str, Any]:
-    return _process_with_code_staleness(
-        _runner_status_with_cover(_runner_process_status_light(key)),
+    return build_light_process_with_staleness(
+        key,
+        runner_status=runner_process_status,
         code_paths=code_paths,
     )
 
@@ -2216,13 +2121,13 @@ def _reflection_lagging(
     latest_reflection_at: Any,
     grace_sec: int,
 ) -> bool:
-    terminal_at = _iso_to_utc(latest_terminal_at)
+    terminal_at = iso_to_utc(latest_terminal_at)
     if terminal_at is None:
         return False
     now = datetime.now(timezone.utc)
     if (now - terminal_at).total_seconds() < max(int(grace_sec), 1):
         return False
-    reflected_at = _iso_to_utc(latest_reflection_at)
+    reflected_at = iso_to_utc(latest_reflection_at)
     if reflected_at is None:
         return True
     return terminal_at > reflected_at + timedelta(seconds=max(int(grace_sec), 1))
@@ -2536,7 +2441,7 @@ def _codex_runtime_descriptor(
 
 
 def _codex_native_components() -> list[dict[str, Any]]:
-    return [
+    descriptors = [
         _codex_runtime_descriptor("research_ask", helper_codex_runtime),
         _codex_runtime_descriptor(
             "strategy_intelligence",
@@ -2550,17 +2455,17 @@ def _codex_native_components() -> list[dict[str, Any]]:
         ),
         _codex_runtime_descriptor(
             "kis_block_manager",
-            helper_codex_runtime,
+            kis_manager_codex_runtime,
             usage_component="kis_block_manager",
         ),
         _codex_runtime_descriptor(
             "market_judge",
-            helper_codex_runtime,
+            kis_manager_codex_runtime,
             usage_component="market_judge",
         ),
         _codex_runtime_descriptor(
             "investment_memory",
-            helper_codex_runtime,
+            investment_memory_codex_runtime,
             usage_component="investment_memory",
         ),
         _codex_runtime_descriptor("daily_discovery", daily_discovery_codex_runtime),
@@ -2569,39 +2474,32 @@ def _codex_native_components() -> list[dict[str, Any]]:
             "crypto_market_research",
             crypto_market_research_codex_runtime,
         ),
-        {
-            "component": "crypto_alpha",
-            "workflow": "",
-            "mode": settings.codex_runtime_mode,
-            "model": settings.crypto_alpha_llm_model,
-            "reasoning_effort": settings.crypto_alpha_llm_reasoning_effort,
-            "usage_component": "crypto_alpha",
-        },
-        {
-            "component": "research_reports",
-            "workflow": "",
-            "mode": settings.codex_runtime_mode,
-            "model": settings.llm_model,
-            "reasoning_effort": settings.llm_reasoning_effort,
-            "usage_component": "research_reports",
-        },
-        {
-            "component": "research_pipeline",
-            "workflow": "",
-            "mode": settings.codex_runtime_mode,
-            "model": settings.llm_model,
-            "reasoning_effort": settings.llm_reasoning_effort,
-            "usage_component": "research_pipeline",
-        },
-        {
-            "component": "portfolio_coach",
-            "workflow": "",
-            "mode": settings.codex_runtime_mode,
-            "model": settings.llm_model,
-            "reasoning_effort": settings.llm_reasoning_effort,
-            "usage_component": "portfolio_coach",
-        },
     ]
+    for component in (
+        "crypto_alpha",
+        "research_reports",
+        "research_pipeline",
+        "portfolio_coach",
+        "jue_codex_lab",
+    ):
+        policy = resolve_llm_model_policy(settings, component=component)
+        descriptors.append(
+            {
+                "component": component,
+                "workflow": "",
+                "mode": settings.codex_runtime_mode,
+                "model": policy.model,
+                "reasoning_effort": policy.reasoning_effort,
+                "usage_component": component,
+            }
+        )
+    for descriptor in descriptors:
+        policy = resolve_llm_model_policy(
+            settings,
+            component=str(descriptor.get("component") or ""),
+        )
+        descriptor["tier"] = policy.tier
+    return descriptors
 
 
 def _iso_age_sec(value: Any) -> float | None:
@@ -2955,6 +2853,11 @@ def _codex_native_sdk_import_available() -> bool:
 _ops_readiness_cache_payload: dict[str, Any] | None = None
 _ops_readiness_cache_expires_at = 0.0
 _ops_readiness_cache_key: tuple[Any, ...] | None = None
+_ops_compact_readiness_cache_payload: dict[str, Any] | None = None
+_ops_compact_readiness_cache_expires_at = 0.0
+_ops_compact_readiness_cache_key: tuple[Any, ...] | None = None
+_ops_status_provider_pool = StatusProviderPool(max_workers=16)
+_OPS_STATUS_PROVIDER_TIMEOUT_SEC = 1.5
 
 
 def _callable_cache_identity(func: Any) -> tuple[Any, ...]:
@@ -3013,7 +2916,13 @@ def _ops_readiness_dependency_cache_key() -> tuple[Any, ...]:
         _callable_cache_identity(binance_block_trader.status),
         _callable_cache_identity(crypto_market_research_service.status),
         _callable_cache_identity(crypto_alpha_service.status),
-        _callable_cache_identity(naver_report_repository.status),
+        (
+            "naver_report_repository",
+            id(naver_report_repository),
+            _callable_cache_identity(
+                getattr(naver_report_repository, "status", None)
+            ),
+        ),
         _callable_cache_identity(market_judgment_engine.status),
         _callable_cache_identity(market_judgment_engine.schedule),
     )
@@ -3041,57 +2950,123 @@ def _build_ops_readiness_cached(*, ttl_sec: float = 30.0) -> dict[str, Any]:
     return dict(payload)
 
 
+def _collect_ops_provider_status() -> dict[str, dict[str, Any]]:
+    return _ops_status_provider_pool.collect(
+        {
+            "processes": _build_core_runner_processes,
+            "memory": _investment_memory_read_only_status,
+            "kis_block_trader": kis_block_trader.status,
+            "binance_block_trader": binance_block_trader.status,
+            "crypto_market_research": crypto_market_research_service.status,
+            "crypto_alpha": crypto_alpha_service.status,
+            "reports": _naver_reports_ops_status,
+            "market_judge": lambda: build_market_judgment_readiness_status(
+                market_judgment_engine
+            ),
+            "market_schedule": market_judgment_engine.schedule,
+            "market_pulse": lambda: build_market_pulse_readiness_status(
+                market_pulse_service
+            ),
+            "llm_usage": _build_llm_usage_status_payload,
+            "trading_validation": _build_trading_validation_ops_status,
+            "disk_space": _build_disk_and_runtime_storage_status,
+            "jue_wiki": jue_wiki_service.status,
+        },
+        timeout_sec=_OPS_STATUS_PROVIDER_TIMEOUT_SEC,
+    )
+
+
+def _build_disk_and_runtime_storage_status() -> dict[str, Any]:
+    payload = build_disk_space_status_payload(
+        runtime_state_path=settings.runtime_state_path,
+    )
+    payload["runtime_storage"] = build_runtime_storage_size_status_payload(
+        runtime_state_path=settings.runtime_state_path,
+    )
+    payload["runtime_storage"]["cold_archive"] = read_runtime_cold_archive_status(
+        root=settings.runtime_cold_archive_root,
+    )
+    return payload
+
+
+def _build_ops_readiness_compact() -> dict[str, Any]:
+    provider_status = _collect_ops_provider_status()
+    raw = build_compact_ops_readiness_source(
+        provider_status=provider_status,
+        enabled={
+            "memory": bool(settings.investment_memory_enabled),
+            "market_judge": bool(settings.market_judge_enabled),
+            "market_pulse": bool(settings.market_pulse_enabled),
+            "kis_block_trader": bool(settings.kis_block_trader_enabled),
+            "binance_block_trader": bool(settings.binance_block_trader_enabled),
+            "reports": bool(settings.naver_reports_enabled),
+            "jue_wiki": bool(settings.jue_wiki_enabled),
+            "crypto_market_research": bool(
+                settings.crypto_market_research_enabled
+            ),
+            "crypto_alpha": bool(settings.crypto_alpha_enabled),
+            "llm_usage": bool(settings.llm_usage_enabled),
+        },
+        checked_at=datetime.now(timezone.utc).isoformat(),
+        configured_jue_wiki_read_mode=settings.jue_wiki_read_mode,
+    )
+    return build_compact_ops_readiness_payload(raw)
+
+
+def _build_ops_readiness_compact_cached(
+    *,
+    ttl_sec: float = 30.0,
+) -> dict[str, Any]:
+    global _ops_compact_readiness_cache_payload
+    global _ops_compact_readiness_cache_expires_at
+    global _ops_compact_readiness_cache_key
+
+    now = time.monotonic()
+    cache_key = _ops_readiness_dependency_cache_key()
+    if (
+        _ops_readiness_cache_payload is not None
+        and _ops_readiness_cache_key == cache_key
+        and now < _ops_readiness_cache_expires_at
+    ):
+        return build_compact_ops_readiness_payload(_ops_readiness_cache_payload)
+    if (
+        ttl_sec > 0
+        and _ops_compact_readiness_cache_payload is not None
+        and _ops_compact_readiness_cache_key == cache_key
+        and now < _ops_compact_readiness_cache_expires_at
+    ):
+        return dict(_ops_compact_readiness_cache_payload)
+    payload = _build_ops_readiness_compact()
+    _ops_compact_readiness_cache_payload = dict(payload)
+    _ops_compact_readiness_cache_key = cache_key
+    _ops_compact_readiness_cache_expires_at = (
+        time.monotonic() + max(float(ttl_sec), 0.0)
+    )
+    return dict(payload)
+
+
 def _build_ops_readiness() -> dict[str, Any]:
-    processes = _build_core_runner_processes()
-    try:
-        memory_status = _investment_memory_read_only_status()
-    except Exception as exc:
-        memory_status = {"status": "error", "error_message": str(exc)}
-    try:
-        block_status = kis_block_trader.status()
-    except Exception as exc:
-        block_status = {"status": "error", "error_message": str(exc)}
-    try:
-        binance_block_status = binance_block_trader.status()
-    except Exception as exc:
-        binance_block_status = {"status": "error", "error_message": str(exc)}
-    try:
-        crypto_research_status = crypto_market_research_service.status()
-    except Exception as exc:
-        crypto_research_status = {"status": "error", "error_message": str(exc)}
-    try:
-        crypto_alpha_status = crypto_alpha_service.status()
-    except Exception as exc:
-        crypto_alpha_status = {"status": "error", "error_message": str(exc)}
-    try:
-        reports_repository_status = _naver_reports_ops_status()
-    except Exception as exc:
-        reports_repository_status = {"status": "error", "error_message": str(exc)}
-    market_status = build_market_judgment_readiness_status(market_judgment_engine)
-    try:
-        market_schedule = market_judgment_engine.schedule()
-    except Exception as exc:
-        market_schedule = {"status": "error", "error_message": str(exc)}
-    pulse_status = build_market_pulse_readiness_status(market_pulse_service)
-    llm_usage_payload = _build_llm_usage_status_payload()
+    provider_status = _collect_ops_provider_status()
+    processes = provider_status["processes"]
+    memory_status = provider_status["memory"]
+    block_status = provider_status["kis_block_trader"]
+    binance_block_status = provider_status["binance_block_trader"]
+    crypto_research_status = provider_status["crypto_market_research"]
+    crypto_alpha_status = provider_status["crypto_alpha"]
+    reports_repository_status = provider_status["reports"]
+    market_status = provider_status["market_judge"]
+    market_schedule = provider_status["market_schedule"]
+    pulse_status = provider_status["market_pulse"]
+    llm_usage_payload = provider_status["llm_usage"]
+    trading_validation_status = provider_status["trading_validation"]
+    disk_space_status = provider_status["disk_space"]
+    jue_wiki_status = provider_status["jue_wiki"]
     semantic_checks = _build_jue_semantic_checks(
         memory_status=memory_status,
         reports_status=reports_repository_status,
         llm_usage_payload=llm_usage_payload,
         processes=processes,
     )
-    try:
-        trading_validation_status = _build_trading_validation_ops_status()
-    except Exception as exc:
-        trading_validation_status = {
-            "status": "error",
-            "db_path": settings.trading_validation_db_path,
-            "error_message": str(exc),
-        }
-    disk_space_status = build_disk_space_status_payload(
-        runtime_state_path=settings.runtime_state_path,
-    )
-
     runner_liveness = build_ops_runner_liveness_payload(
         processes=processes,
         enabled={
@@ -3143,6 +3118,7 @@ def _build_ops_readiness() -> dict[str, Any]:
     )
     llm_operational = build_llm_operational_status_payload(
         block_status=block_status,
+        binance_block_status=binance_block_status,
         market_schedule=market_schedule,
         processes=processes,
         configured=bool(settings.codex_runtime_ready),
@@ -3250,7 +3226,7 @@ def _build_ops_readiness() -> dict[str, Any]:
             llm_interval_sec=settings.crypto_market_research_llm_interval_sec,
             max_symbols=settings.crypto_market_research_max_symbols,
             llm_top_symbols=settings.crypto_market_research_llm_top_symbols,
-            kline_intervals=_parse_crypto_kline_intervals(
+            kline_intervals=parse_crypto_kline_intervals(
                 settings.crypto_market_research_kline_intervals
             ),
             regime_enabled=bool(settings.crypto_market_research_regime_enabled),
@@ -3275,10 +3251,11 @@ def _build_ops_readiness() -> dict[str, Any]:
         ),
         "jue_wiki": build_ops_jue_wiki_payload_payload(
             enabled=bool(settings.jue_wiki_enabled),
-            status=jue_wiki_service.status(),
+            status=jue_wiki_status,
             runner=processes.get("jue_wiki", {}),
             state_path=".runtime/jue_wiki_runner.json",
             interval_sec=settings.jue_wiki_runner_interval_sec,
+            configured_read_mode=settings.jue_wiki_read_mode,
         ),
     }
     for section_key in ("kis_block_trader", "binance_block_trader", "jue_wiki"):
@@ -3314,6 +3291,47 @@ def _build_ops_readiness() -> dict[str, Any]:
     )
     readiness_payload["jue_wiki"] = sections.get("jue_wiki", {})
     return readiness_payload
+
+
+_ops_readiness_snapshot_coordinator_instance: (
+    OpsReadinessSnapshotCoordinator | None
+) = None
+_ops_readiness_snapshot_dependency_key: tuple[Any, ...] | None = None
+
+
+def _get_ops_readiness_snapshot_coordinator() -> OpsReadinessSnapshotCoordinator:
+    global _ops_readiness_snapshot_coordinator_instance
+    if _ops_readiness_snapshot_coordinator_instance is None:
+        _ops_readiness_snapshot_coordinator_instance = OpsReadinessSnapshotCoordinator(
+            builder=lambda: _build_ops_readiness(),
+            compact_builder=build_compact_ops_readiness_payload,
+            config=OpsReadinessSnapshotConfig(
+                path=settings.ops_readiness_snapshot_path,
+                refresh_interval_sec=settings.ops_readiness_refresh_interval_sec,
+                max_age_sec=settings.ops_readiness_snapshot_max_age_sec,
+            ),
+        )
+    return _ops_readiness_snapshot_coordinator_instance
+
+
+def _ensure_ops_readiness_snapshot_current() -> dict[str, Any]:
+    global _ops_readiness_snapshot_dependency_key
+    coordinator = _get_ops_readiness_snapshot_coordinator()
+    dependency_key = _ops_readiness_dependency_cache_key()
+    if _ops_readiness_snapshot_dependency_key != dependency_key:
+        result = coordinator.refresh()
+        if result.get("status") != "error":
+            _ops_readiness_snapshot_dependency_key = dependency_key
+        return result
+    return coordinator.ensure_current()
+
+
+def _published_ops_readiness() -> dict[str, Any]:
+    return _get_ops_readiness_snapshot_coordinator().current_full()
+
+
+def _published_ops_readiness_compact() -> dict[str, Any]:
+    return _get_ops_readiness_snapshot_coordinator().current_compact()
 
 
 def _attach_block_memory(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3982,8 +4000,8 @@ register_app_routes(
             helper_ask=lambda payload: _helper_ask_impl(payload),
             static_dir=lambda: STATIC_DIR,
             jue_registry_factory=lambda: JueSkillRegistry(),
-            jue_available_workflow_ids=lambda registry: _available_jue_workflow_ids(
-                registry
+            jue_available_workflow_ids=lambda registry: available_jue_workflow_ids(
+                registry.root / "workflows"
             ),
             jue_validation_error_type=JueSkillValidationError,
             jue_lifecycle_repository_factory=lambda db_path: JueLifecycleRepository(
@@ -4037,6 +4055,7 @@ register_app_routes(
                 "enabled": bool(settings.daily_discovery_enabled),
                 "kospi_count": int(settings.daily_discovery_kospi_count),
                 "kosdaq_count": int(settings.daily_discovery_kosdaq_count),
+                "etf_count": int(settings.daily_discovery_etf_count),
                 "exclude_recent_days": int(
                     settings.daily_discovery_exclude_recent_days
                 ),
@@ -4045,7 +4064,8 @@ register_app_routes(
                 ),
                 "db_path": settings.daily_discovery_db_path,
             },
-            build_ops_readiness=lambda: _build_ops_readiness_cached(),
+            build_ops_readiness=lambda: _published_ops_readiness(),
+            build_compact_ops_readiness=lambda: _published_ops_readiness_compact(),
             build_ops_restart_readiness=lambda: _build_ops_readiness(),
             build_codex_native_status=lambda: _build_codex_native_status(),
             refresh_codex_native_checks=(
@@ -4247,125 +4267,7 @@ def _investment_memory_read_only_status() -> dict[str, Any]:
 
 
 def _runtime_storage_policy() -> RuntimeStoragePolicy:
-    runtime_dir = Path(settings.runtime_state_path).parent
-    return RuntimeStoragePolicy(
-        runtime_dir=str(runtime_dir or Path(".runtime")),
-        reports_db_path=settings.naver_reports_db_path,
-        pdf_archive_dir=settings.naver_reports_pdf_archive_dir,
-        rag_persist_path=settings.rag_persist_path,
-        large_file_threshold_mb=settings.runtime_storage_large_file_threshold_mb,
-        prune_unreferenced_pdfs=settings.runtime_storage_prune_unreferenced_pdfs,
-        prune_extracted_report_pdfs=(
-            settings.runtime_storage_prune_extracted_report_pdfs
-        ),
-        extracted_report_pdf_retention_days=(
-            settings.runtime_storage_extracted_report_pdf_retention_days
-        ),
-        prune_rag_repair_artifacts=(
-            settings.runtime_storage_prune_rag_repair_artifacts
-        ),
-        rag_repair_artifact_retention_days=(
-            settings.runtime_storage_rag_repair_artifact_retention_days
-        ),
-        prune_rag_rebuild_backups=(
-            settings.runtime_storage_prune_rag_rebuild_backups
-        ),
-        rag_rebuild_backup_retention_days=(
-            settings.runtime_storage_rag_rebuild_backup_retention_days
-        ),
-        prune_old_runtime_logs=settings.runtime_storage_prune_old_runtime_logs,
-        runtime_log_retention_days=settings.runtime_storage_log_retention_days,
-        rotate_large_active_logs=settings.runtime_storage_rotate_large_active_logs,
-        active_log_max_mb=settings.runtime_storage_active_log_max_mb,
-        active_log_tail_kb=settings.runtime_storage_active_log_tail_kb,
-        prune_scratch_artifacts=settings.runtime_storage_prune_scratch_artifacts,
-        scratch_artifact_retention_days=(
-            settings.runtime_storage_scratch_artifact_retention_days
-        ),
-        prune_old_backtest_artifacts=(
-            settings.runtime_storage_prune_old_backtest_artifacts
-        ),
-        backtest_artifact_retention_days=(
-            settings.runtime_storage_backtest_artifact_retention_days
-        ),
-        prune_old_ui_check_artifacts=(
-            settings.runtime_storage_prune_old_ui_check_artifacts
-        ),
-        ui_check_artifact_retention_days=(
-            settings.runtime_storage_ui_check_artifact_retention_days
-        ),
-        prune_zero_byte_runtime_markers=(
-            settings.runtime_storage_prune_zero_byte_runtime_markers
-        ),
-        zero_byte_marker_retention_days=(
-            settings.runtime_storage_zero_byte_marker_retention_days
-        ),
-        database_compact_min_free_mb=(
-            settings.runtime_storage_database_compact_min_free_mb
-        ),
-        database_compact_min_free_ratio_pct=(
-            settings.runtime_storage_database_compact_min_free_ratio_pct
-        ),
-        archive_retention_days_by_key={
-            "kis_blocks": {
-                "quote_snapshots_archive": (
-                    settings.kis_block_trader_quote_retention_days
-                    + settings.kis_block_trader_archive_retention_days
-                ),
-                "manager_runs_archive": (
-                    settings.kis_block_trader_manager_run_retention_days
-                    + settings.kis_block_trader_archive_retention_days
-                ),
-                "reconciliation_runs_archive": (
-                    settings.kis_block_trader_reconciliation_retention_days
-                    + settings.kis_block_trader_archive_retention_days
-                ),
-            },
-            "binance_blocks": {
-                "quote_snapshots_archive": (
-                    settings.binance_block_trader_quote_retention_days
-                    + settings.binance_block_trader_archive_retention_days
-                ),
-                "manager_runs_archive": (
-                    settings.binance_block_trader_manager_run_retention_days
-                    + settings.binance_block_trader_archive_retention_days
-                ),
-            },
-            "market_judgment": {
-                "quote_snapshots_archive": (
-                    settings.market_judge_quote_archive_retention_days
-                ),
-                "judgment_runs_archive": (
-                    settings.market_judge_judgment_retention_days
-                    + settings.market_judge_judgment_archive_retention_days
-                ),
-                "symbol_judgments_archive": (
-                    settings.market_judge_judgment_retention_days
-                    + settings.market_judge_judgment_archive_retention_days
-                ),
-            },
-            "market_pulse": settings.market_pulse_archive_retention_days,
-            "crypto_market_research": (
-                settings.crypto_market_research_archive_retention_days
-            ),
-            "crypto_quant": settings.crypto_quant_archive_retention_days,
-            "etf_research": settings.etf_research_archive_retention_days,
-        },
-        operational_db_paths=(
-            str(runtime_dir / "crypto_market_research.db"),
-            str(runtime_dir / "crypto_quant.db"),
-            str(runtime_dir / "crypto_pattern_lab.db"),
-            str(runtime_dir / "binance_blocks.db"),
-            str(runtime_dir / "kis_blocks.db"),
-            str(runtime_dir / "market_judgment.db"),
-            str(runtime_dir / "market_pulse.db"),
-            str(runtime_dir / "investment_memory.db"),
-            str(runtime_dir / "etf_research.db"),
-            str(runtime_dir / "strategy_insights.db"),
-            str(runtime_dir / "trading_validation.db"),
-            str(runtime_dir / "live_performance.db"),
-        ),
-    )
+    return runtime_storage_policy_from_settings(settings)
 
 
 register_app_routes(
@@ -4391,6 +4293,12 @@ register_app_routes(
             runtime_storage_policy=_runtime_storage_policy,
             build_runtime_storage_report=build_runtime_storage_report,
             cleanup_runtime_storage=cleanup_runtime_storage,
+            refresh_cold_archive_status=lambda: (
+                persist_runtime_cold_archive_status(
+                    root=settings.runtime_cold_archive_root,
+                    jue_wiki_db_path=settings.jue_wiki_db_path,
+                )
+            ),
         )
     ),
 )
@@ -4675,8 +4583,10 @@ register_app_routes(
             etf_fetch_quote=lambda symbol: kis_primary.fetch_domestic_quote(symbol),
             crypto_research_service=lambda: crypto_market_research_service,
             crypto_alpha_service=lambda: crypto_alpha_service,
-            crypto_research_symbols=_crypto_research_symbols,
-            default_crypto_research_symbols=_default_crypto_research_symbols,
+            crypto_research_symbols=crypto_research_symbols,
+            default_crypto_research_symbols=lambda: default_crypto_research_symbols(
+                settings.crypto_market_research_universe
+            ),
             research_helper_ask=_helper_ask_impl,
             research_settings=settings,
             naver_report_repository=lambda: naver_report_repository,
@@ -4717,7 +4627,7 @@ register_app_routes(
                     limit=limit,
                 )
             ),
-            ops_readiness=lambda: _build_ops_readiness_cached(),
+            ops_readiness=lambda: _published_ops_readiness(),
             kis_blocks_status_readiness=lambda: _build_kis_blocks_status_readiness(),
             kis_manager_run_once=lambda: kis_block_trader.run_manager_once(),
             kis_adoption_run_once=lambda: kis_block_trader.run_adoption_once(),

@@ -93,3 +93,39 @@ This order gives the control surface, memory layer, and live authority state a c
 - PID file stale, missing, or mismatched with the actual process command.
 - Process running with code older than touched runner/service files.
 - UI compact refresh losing account state or hiding auth/stale/error states.
+
+## Jue Wiki V3 Publication And Read Safety
+
+The approved plan referred to `docs/spec/09_runtime_processes.md`; the active
+repository specification is this file, `docs/spec/03_runtime_processes.md`.
+
+`tradecraft-jue-wiki` is the only process that compiles, lints, publishes,
+repairs, projects the index, and persists Wiki V3 operational health. Its stored
+`OpsSectionSnapshotV1.v3` contains the configured active read mode, signed
+per-venue eligibility, aggregate compatibility fields, and `by_scope` health for
+KIS and Binance. Each scope records snapshot identity and creation time,
+ingest/compile/lint/publish/projection state, index rebuild state, and
+stale/conflicted/orphan/repair-backlog counts. Snapshot age displayed by ops is
+informational; required-mode decisions recompute age from
+`snapshot_created_at`, so a stopped runner cannot freeze a healthy age.
+
+The control API, KIS runner, Binance runner, and market-judge provider only read
+the stored snapshot and signed shadow eligibility on request paths. They never
+compile, lint, repair, rebuild, initialize, or write Wiki storage while serving
+context/readiness. Provider timeouts and stale-cache behavior remain intact.
+
+Required mode permits new risk only when the requested venue scope exists, its
+snapshot id matches the packet, live age is at most 3,600 seconds, all source and
+publication stages are healthy, the index is operational, degradation counts
+are zero, and the signed eligibility contract is fresh and valid. A projection
+warning caused only by cleanup leaves the index operational but remains visible.
+Missing/malformed status, Wiki DB outage, source/compiler/lint/index failure,
+stale/conflicted support, or eligibility failure blocks create and
+risk-increasing update actions. Risk-reducing updates, close/exit,
+reconciliation, and kill-switch checks remain available.
+
+The migration sequence is `shadow -> prefer -> required`; it is evidence-gated,
+not time-gated. No runner or readiness response changes the live read setting
+automatically. Recovery rolls back to `shadow`, restarts the Wiki runner, waits
+for a fresh stored publication and signed comparisons, then reevaluates gates.
+RAG continues only as a bounded repair, audit, backfill, and index-rebuild input.

@@ -32,6 +32,43 @@ def test_codex_native_config_default_timeout_allows_long_reasoning() -> None:
     assert CodexNativeConfig().timeout_ms == 600000
 
 
+def test_codex_runtime_applies_operation_specific_model_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    assert "operation_model_overrides" in CodexNativeConfig.__dataclass_fields__
+    captured = _install_fake_codex(monkeypatch)
+    runtime = CodexNativeRuntime(
+        CodexNativeConfig(
+            model="gpt-5.6-terra",
+            reasoning_effort="high",
+            operation_model_overrides={
+                "weekly_review": ("gpt-5.6-sol", "max"),
+            },
+            usage_enabled=False,
+            thread_mode="ephemeral",
+            thread_db_path=_native_thread_db(tmp_path),
+        )
+    )
+
+    result = asyncio.run(
+        runtime.complete(
+            {
+                "telemetry": {
+                    "component": "investment_memory",
+                    "operation": "weekly_review",
+                },
+                "messages": [{"role": "user", "content": "Review policy."}],
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert captured["thread_kwargs"]["model"] == "gpt-5.6-sol"
+    assert captured["run_kwargs"]["model"] == "gpt-5.6-sol"
+    assert captured["run_kwargs"]["effort"] == "max"
+
+
 def test_codex_native_store_records_and_resumes_thread(tmp_path: Path) -> None:
     from tradecraft.services.codex_native_store import CodexNativeStore
 

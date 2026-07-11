@@ -10,6 +10,7 @@ const UI_SHARED = window.HERMES_UI_SHARED || {};
 const UI_FORMATTERS = window.HERMES_UI_FORMATTERS || {};
 const UI_OPS = window.HERMES_UI_OPS || {};
 const UI_AUTH = window.HERMES_UI_AUTH || {};
+const UI_SHELL = window.HERMES_UI_SHELL || {};
 const UI_LIVE_AUTHORITY = window.HERMES_UI_LIVE_AUTHORITY || {};
 const SYSTEM_METRICS_WIDGET = window.HERMES_SYSTEM_METRICS_WIDGET || {};
 const KIS_QUICK_VIEW = window.HERMES_KIS_QUICK_VIEW || {};
@@ -79,6 +80,7 @@ const state = {
   dashboardLiveRefreshInFlight: false,
   activeVenueId: "all",
   activePage: "main",
+  mobileMenuOpen: false,
   view: "dashboard",
   activeHelperTab: "ask",
   kisBlockStatus: null,
@@ -218,6 +220,7 @@ const state = {
     token: "",
     required: false,
     message: "",
+    expanded: false,
   },
   lastRenderedWebhookMessage: "",
   helperAsk: {
@@ -299,6 +302,26 @@ function statusSaysPaper(payload) {
   return payload.execute_orders === false || mode === "paper" || mode === "dry_run";
 }
 
+function binanceLiveExecutionEnabled() {
+  const sources = [
+    state.binanceTrader.status?.readiness?.execution,
+    state.binanceTrader.status?.execution,
+    state.opsReadiness?.binance_block_trader?.execution,
+  ].filter((source) => source && typeof source === "object");
+  return sources.some((execution) => (
+    ["spot_mode", "futures_mode", "upbit_spot_mode"].some((key) => (
+      String(execution[key] || "").trim().toLowerCase() === "live"
+    ))
+  ));
+}
+
+function confirmBinanceLiveManualAction(label) {
+  if (!binanceLiveExecutionEnabled()) return true;
+  return window.confirm(
+    `Binance ${label}은 live crypto execution 상태에서 주문을 만들거나 체결할 수 있습니다. 계속할까요?`
+  );
+}
+
 function renderGlobalExecutionMode() {
   const node = qs("globalExecutionModeText");
   if (!node) return;
@@ -313,6 +336,22 @@ function renderGlobalExecutionMode() {
     || statusSaysPaper(state.binanceTrader.status)
     || state.opsReadiness?.live_trading_enabled === false;
   node.textContent = knownPaper ? "Paper · 실주문 잠금" : "상태 확인 중";
+}
+
+function renderHomeOpsSummary() {
+  const root = qs("homeOpsSummary");
+  if (!root || typeof UI_SHELL.buildSafetySummary !== "function" || typeof UI_SHELL.renderHomeOpsSummaryHtml !== "function") {
+    return;
+  }
+  const summary = UI_SHELL.buildSafetySummary({
+    readiness: state.opsReadiness,
+    kisStatus: state.kisBlockStatus,
+    binanceStatus: state.binanceTrader.status,
+    authRequired: state.auth.required,
+    hasAdminToken: hasAdminToken(),
+  });
+  root.innerHTML = UI_SHELL.renderHomeOpsSummaryHtml(summary, { escapeHTML });
+  root.dataset.tone = summary.tone;
 }
 
 function bindEvent(id, eventName, handler) {
@@ -499,15 +538,33 @@ function renderAuthPrompt() {
   if (tokenInput && document.activeElement !== tokenInput) {
     tokenInput.value = String(state.auth.token || readAdminToken() || "");
   }
+  setAuthPromptExpanded(state.auth.required && state.auth.expanded);
   renderAuthGatedDashboardShell();
+  if (typeof renderHomeOpsSummary === "function") renderHomeOpsSummary();
   renderHelperAgent();
+}
+
+function setAuthPromptExpanded(expanded, options = {}) {
+  const banner = qs("authBanner");
+  const toggle = qs("authBannerToggleBtn");
+  const next = Boolean(expanded && state.auth.required);
+  state.auth.expanded = next;
+  if (banner?.classList) banner.classList.toggle("expanded", next);
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", String(next));
+    toggle.textContent = next ? "입력 닫기" : "토큰 입력";
+  }
+  if (next && options.focus) {
+    const input = qs("authTokenInput");
+    input?.focus();
+    input?.select?.();
+  }
 }
 
 function focusAuthTokenInput() {
   const input = qs("authTokenInput");
   if (!input) return;
-  input.focus();
-  input.select?.();
+  setAuthPromptExpanded(true, { focus: true });
 }
 
 function renderAuthGatedDashboardShell() {
@@ -547,23 +604,35 @@ function renderAuthGatedDashboardShell() {
   }
 }
 
-function renderAuthRequiredHelperPanel() {
+function renderAuthRequiredHelperPanel(activeHelperTab = state.activeHelperTab) {
   const message = state.auth.message || "운영 토큰이 필요한 요청입니다.";
+  const isBinance = activeHelperTab === "binance_trader";
+  const isKis = activeHelperTab === "kis_trader" || activeHelperTab === "kis_memory";
+  const scope = isBinance ? "binance" : isKis ? "kis" : "operations";
+  const title = isBinance ? "Binance 운영 토큰 필요" : isKis ? "KIS 운영 토큰 필요" : "운영 토큰 필요";
+  const protectedText = isBinance
+    ? "Binance 계좌·블록·실행 정보는 보호 API라 인증 후 표시됩니다."
+    : isKis
+      ? "KIS 국장 계좌·블록·장중 판단 정보는 보호 API라 인증 후 표시됩니다."
+      : "보호된 투자 운영 정보는 인증 후 표시됩니다.";
+  const chips = isBinance
+    ? ["Binance 계좌 보호됨", "현물·선물 블록 보호됨", "실행 상태 보호됨"]
+    : isKis
+      ? ["KIS 국장 계좌 보호됨", "국장 블록 보호됨", "장중 판단 보호됨"]
+      : ["계좌 정보 보호됨", "블록 트레이딩 보호됨", "운영 상태 보호됨"];
   return `
-    <section class="memory-section">
+    <section class="memory-section" data-auth-scope="${escapeHTML(scope)}">
       <div class="panel-head compact">
         <div>
-          <h3>운영 토큰 필요</h3>
-          <p>국장 계좌, 블록, 장중 판단, 메모리 정보는 보호 API라 인증 후 표시됩니다.</p>
+          <h3>${escapeHTML(title)}</h3>
+          <p>${escapeHTML(protectedText)}</p>
         </div>
       </div>
       <div class="notice warn">
-        ${escapeHTML(message)} 상단의 Admin token 입력칸에 운영 토큰을 넣고 인증을 누르면 국장 정보가 다시 표시됩니다.
+        ${escapeHTML(message)} 상단의 토큰 입력을 열어 인증하면 이 작업공간을 다시 불러옵니다.
       </div>
       <div class="strategy-data-strip">
-        <span class="strategy-data-chip warn">KIS 국장 계좌 보호됨</span>
-        <span class="strategy-data-chip warn">블록 트레이딩 보호됨</span>
-        <span class="strategy-data-chip warn">장중 판단 보호됨</span>
+        ${chips.map((chip) => `<span class="strategy-data-chip warn">${escapeHTML(chip)}</span>`).join("")}
       </div>
       <button class="btn small warm" type="button" data-auth-focus="true">운영 토큰 입력하기</button>
     </section>
@@ -590,12 +659,14 @@ function renderOpsBanner() {
     return;
   }
   const warnings = Array.isArray(readiness.warnings) ? readiness.warnings : [];
-  const advisories = Array.isArray(readiness.advisories) ? readiness.advisories : [];
   const blockers = Array.isArray(readiness.blockers) ? readiness.blockers : [];
   const status = String(readiness.status || "yellow");
+  banner.hidden = blockers.length === 0 && warnings.length === 0;
+  if (banner.hidden) {
+    banner.innerHTML = "";
+    return;
+  }
   const liveText = readiness.live_trading_enabled ? "실주문 활성" : "Paper/실주문 비활성";
-  const hasOnlyAdvisories =
-    status === "green" && blockers.length === 0 && warnings.length === 0 && advisories.length > 0;
   const disk = readiness.disk_space && typeof readiness.disk_space === "object" ? readiness.disk_space : {};
   const diskText = disk.free_bytes === undefined
     ? "디스크 -"
@@ -607,30 +678,20 @@ function renderOpsBanner() {
     readiness.market_pulse?.enabled ? "Market pulse on" : "Market pulse off",
     diskText,
     warnings.includes("restart_required") ? "재시작 필요" : "프로세스 최신",
-    advisories.length ? `전략 advisory ${advisories.length}` : "전략 advisory 없음",
   ];
-  banner.hidden = status === "green" && blockers.length === 0 && warnings.length === 0 && advisories.length === 0;
   banner.className = `ops-banner ${status === "red" ? "bad" : status === "green" ? "good" : "warn"}`;
   const restartText = formatOpsRestartProcessSummary(readiness, 4);
   const baseSignalText = formatOpsSignalList([...blockers, ...warnings]);
   const signalText = restartText ? `${baseSignalText} · ${restartText}` : baseSignalText;
-  const remediationHtml = renderOpsRemediationActions(readiness.remediation_actions, 3);
-  const validationBottleneckHtml = renderTradingValidationBottleneckSummary(readiness.trading_validation, 3);
-  const advisoryDetailHtml = renderOpsAdvisoryDetails(readiness.advisory_details, 3);
+  const remediationHtml = renderOpsRemediationActions(readiness.operational_remediation_actions, 3);
   const bannerTitle = status === "red"
     ? "운영 차단"
-    : hasOnlyAdvisories
-      ? "쥬 운영 정상 · 전략 개선 큐"
-      : status === "green"
-        ? "쥬 운영 준비 완료"
-        : "운영 점검 필요";
+    : "운영 점검 필요";
   banner.innerHTML = `
     <div>
       <strong>${escapeHTML(bannerTitle)}</strong>
       <span>${escapeHTML(signalText)}</span>
       ${remediationHtml}
-      ${validationBottleneckHtml}
-      ${advisoryDetailHtml}
     </div>
     <div class="ops-chip-row">
       ${chips.map((chip) => `<span class="strategy-data-chip">${escapeHTML(chip)}</span>`).join("")}
@@ -1018,9 +1079,13 @@ function syncDashboardKisVenueFromBlockStatus(kisBlockStatus) {
 
 function renderKisQuickStrip() {
   const targets = ["kisQuickStrip", "helperKisQuickStrip"]
-    .map((id) => qs(id))
-    .filter(Boolean);
+    .map((id) => [id, qs(id)])
+    .filter(([, target]) => Boolean(target));
   if (!targets.length) return;
+  const showHelperKisStrip = state.activePage === "helper" && (
+    state.activeHelperTab === "kis_trader"
+    || state.activeHelperTab === "kis_memory"
+  );
   const renderer = typeof KIS_QUICK_VIEW !== "undefined" && typeof KIS_QUICK_VIEW.renderKisQuickStripHtml === "function"
     ? KIS_QUICK_VIEW.renderKisQuickStripHtml
     : null;
@@ -1098,7 +1163,12 @@ function renderKisQuickStrip() {
       }).join("");
     }
   }
-  targets.forEach((target) => {
+  targets.forEach(([id, target]) => {
+    target.hidden = id === "helperKisQuickStrip" && !showHelperKisStrip;
+    if (target.hidden) {
+      target.innerHTML = "";
+      return;
+    }
     target.innerHTML = html;
   });
 }
@@ -1902,7 +1972,9 @@ function renderPageMode() {
 
   const mainNavBtn = qs("mainNavBtn");
   if (mainNavBtn) {
-    mainNavBtn.classList.toggle("active", !isHelper);
+    const active = !isHelper;
+    mainNavBtn.classList.toggle("active", active);
+    mainNavBtn.setAttribute("aria-current", active ? "page" : "false");
   }
   const helperNavBtn = qs("helperNavBtn");
   if (helperNavBtn) {
@@ -1910,14 +1982,39 @@ function renderPageMode() {
   }
   document.querySelectorAll("[data-nav-helper-tab]").forEach((button) => {
     const targetTab = String(button.dataset.navHelperTab || "");
-    button.classList.toggle("active", isHelper && targetTab === state.activeHelperTab);
+    const active = isHelper && targetTab === state.activeHelperTab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-current", active ? "page" : "false");
   });
+  document.querySelectorAll("[data-mobile-page], [data-mobile-helper-tab]").forEach((button) => {
+    const mobilePage = String(button.dataset.mobilePage || "");
+    const mobileTab = String(button.dataset.mobileHelperTab || "");
+    const active = mobilePage === "main"
+      ? !isHelper
+      : isHelper && mobileTab === state.activeHelperTab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-current", active ? "page" : "false");
+  });
+  const mobileMore = qs("mobileNavMoreBtn");
+  if (mobileMore) {
+    mobileMore.setAttribute("aria-expanded", String(state.mobileMenuOpen));
+  }
+}
+
+function setMobileMenuOpen(open) {
+  state.mobileMenuOpen = Boolean(open);
+  document.body.classList.toggle("mobile-menu-open", state.mobileMenuOpen);
+  const mobileMore = qs("mobileNavMoreBtn");
+  if (mobileMore) {
+    mobileMore.setAttribute("aria-expanded", String(state.mobileMenuOpen));
+  }
 }
 
 function openHelperPage(tab = ASK_HELPER_TAB) {
   const nextTab = HELPER_TABS.has(tab) ? tab : resolveInitialHelperTab();
   state.activePage = "helper";
   state.activeHelperTab = nextTab;
+  setMobileMenuOpen(false);
   saveUiState();
   renderPageMode();
   renderHelperAgent();
@@ -1934,6 +2031,7 @@ function openAskPageWithQuery(query = "") {
 function openMainPage() {
   state.activePage = "main";
   state.helperDetailModal = null;
+  setMobileMenuOpen(false);
   const modalRoot = qs("helperModalRoot");
   if (modalRoot) {
     modalRoot.innerHTML = "";
@@ -2334,7 +2432,7 @@ function renderHelperAskResult() {
   const limitations = Array.isArray(result.limitations) ? result.limitations.slice(0, 4) : [];
   const mode = String(result.mode || "deterministic");
   const confidence = String(result.confidence || "medium");
-  const model = String(result.model || "gpt-5.5");
+  const model = String(result.model || "gpt-5.6-terra");
 
   const citationsHtml = citations.length
     ? citations.map((row) => `<span>${escapeHTML(row)}</span>`).join("")
@@ -2917,7 +3015,7 @@ function renderStrategyIntelTab() {
           </label>
           <div class="strategy-intel-actions">
             <button class="btn primary" type="submit" ${disabled}>빠른 스캔</button>
-            <button class="btn" type="button" data-strategy-intel-action="llm" ${disabled}>gpt-5.5 브리핑</button>
+            <button class="btn" type="button" data-strategy-intel-action="llm" ${disabled}>AI 심층 브리핑</button>
             <button class="btn" type="button" data-strategy-intel-action="collect" ${collectDisabled}>시그널 수집</button>
             <button class="btn" type="button" data-strategy-intel-action="valuation_collect" ${valuationCollectDisabled}>밸류 갱신</button>
           </div>
@@ -2946,7 +3044,7 @@ function renderStrategyIntelTab() {
         </label>
         <div class="strategy-intel-actions">
           <button class="btn primary" type="submit" ${disabled}>빠른 스캔</button>
-          <button class="btn" type="button" data-strategy-intel-action="llm" ${disabled}>gpt-5.5 브리핑</button>
+          <button class="btn" type="button" data-strategy-intel-action="llm" ${disabled}>AI 심층 브리핑</button>
           <button class="btn" type="button" data-strategy-intel-action="collect" ${collectDisabled}>${state.strategyIntel.collectLoading ? "수집 중" : "시그널 수집"}</button>
           <button class="btn" type="button" data-strategy-intel-action="valuation_collect" ${valuationCollectDisabled}>${state.strategyIntel.valuationCollectLoading ? "갱신 중" : "밸류 갱신"}</button>
         </div>
@@ -2976,7 +3074,7 @@ function renderStrategyIntelTab() {
             <span class="eyebrow">BRIEF</span>
             <h4>${escapeHTML(truncateWithEllipsis(result.query || state.strategyIntel.query, 90))}</h4>
           </div>
-          <span class="pill mono">${escapeHTML(result.model || "gpt-5.5")}</span>
+          <span class="pill mono">${escapeHTML(result.model || "gpt-5.6-terra")}</span>
         </div>
         <pre class="helper-answer-text">${escapeHTML(brief)}</pre>
       </section>
@@ -4668,6 +4766,8 @@ function renderKisBlockTradingTab() {
   const killEnabled = Boolean(payload.summary?.kill_switch?.enabled);
   return `
     <div class="block-trader-shell">
+      ${UI_SHELL.renderWorkspaceJumpNav("kis", { escapeHTML })}
+      <section id="kis-workspace-overview" class="venue-workspace-section" tabindex="-1">
       <div class="strategy-intel-actions">
         ${renderActiveRefreshChip("kis_trader")}
         <button class="btn primary" type="button" data-block-action="refresh">새로고침</button>
@@ -4697,6 +4797,8 @@ function renderKisBlockTradingTab() {
       )}
       ${renderValidationRepairOpsPanel(payload, "KIS 쥬")}
       ${renderJueDiagnosticStrip(payload)}
+      </section>
+      <section id="kis-workspace-active" class="venue-workspace-section" tabindex="-1">
       ${KIS_TRADER_TAB.renderKisHoldDecision(payload, {
         escapeHTML,
         fmtKST,
@@ -4742,6 +4844,8 @@ function renderKisBlockTradingTab() {
           renderBlockPolicyEffectChips: (metadata) => renderBlockPolicyEffectChips(metadata),
         }),
       })}
+      </section>
+      <section id="kis-workspace-history" class="venue-workspace-section" tabindex="-1">
       ${KIS_TRADER_TAB.renderBlockHistoryBoard(payload, {
         historyState: state.kisBlockHistory,
         escapeHTML,
@@ -4756,6 +4860,8 @@ function renderKisBlockTradingTab() {
         renderBlockCostFeasibilityChips: (metadata) => renderBlockCostFeasibilityChips(metadata),
         renderBlockPolicyEffectChips: (metadata) => renderBlockPolicyEffectChips(metadata),
       })}
+      </section>
+      <section class="venue-workspace-section workspace-evidence-section" aria-label="KIS 주문·이벤트·매니저 근거">
       <div class="helper-grid">
         ${KIS_TRADER_TAB.renderBlockAllocation(payload, {
           escapeHTML,
@@ -4773,6 +4879,7 @@ function renderKisBlockTradingTab() {
         })}
       </div>
       <p class="strategy-footnote">블록 트레이딩은 독립 블록 단위 관리 도구입니다. 실주문은 별도 실행 플래그가 켜져야 동작합니다.</p>
+      </section>
     </div>
   `;
 }
@@ -5230,15 +5337,17 @@ function renderBinanceTraderTab() {
   const blocks = BINANCE_TAB.activeBlocks(payload);
   const killEnabled = Boolean(payload.kill_switch?.enabled || payload.summary?.kill_switch?.enabled);
   const execution = payload.execution || {};
-  const model = payload.model || execution.model || payload.config?.llm_model || "gpt-5.5";
+  const model = payload.model || execution.model || payload.config?.llm_model || "gpt-5.6-sol";
 
   return `
     <div class="binance-trader-shell">
+      ${UI_SHELL.renderWorkspaceJumpNav("binance", { escapeHTML })}
+      <section id="binance-workspace-overview" class="venue-workspace-section" tabindex="-1">
       <section class="block-trader-hero">
         <div>
           <span class="section-kicker">24H Crypto Branch</span>
           <h3>바이낸스 쥬 브랜치</h3>
-          <p>현물과 USD-M 선물을 별도 게이트로 관리하고, ${escapeHTML(model)}가 24시간 경량 판단을 맡습니다.</p>
+          <p>현물과 USD-M 선물을 별도 게이트로 관리하고, ${escapeHTML(model)}가 24시간 핵심 판단을 맡습니다.</p>
         </div>
         <div class="strategy-intel-actions">
           ${renderActiveRefreshChip("binance_trader")}
@@ -5336,6 +5445,8 @@ function renderBinanceTraderTab() {
         </div>
       </section>
       ${renderBinanceHoldDecision(payload)}
+      </section>
+      <section id="binance-workspace-active" class="venue-workspace-section" tabindex="-1">
       ${BINANCE_TAB.renderLaneBoard(payload, blocks, {
         lanes: BINANCE_LANES,
         escapeHTML,
@@ -5349,6 +5460,8 @@ function renderBinanceTraderTab() {
           renderBlockPolicyEffectChips,
         }),
       })}
+      </section>
+      <section id="binance-workspace-history" class="venue-workspace-section" tabindex="-1">
       ${BINANCE_TAB.renderBlockHistory(payload, {
         state: state.binanceTrader,
         lanes: BINANCE_LANES,
@@ -5359,6 +5472,7 @@ function renderBinanceTraderTab() {
         fmtKST,
         asNumber,
       })}
+      </section>
     </div>
   `;
 }
@@ -5605,6 +5719,7 @@ function renderHelperAgent() {
   if (!HELPER_TABS.has(state.activeHelperTab)) {
     state.activeHelperTab = ASK_HELPER_TAB;
   }
+  renderKisQuickStrip();
   state.helperDetailRegistry = {};
   state.helperDetailSeq = 0;
 
@@ -6370,6 +6485,8 @@ function mergeOpsReadinessFromKisPayload(readiness) {
     kis_block_trader: readiness.kis_block_trader || previous.kis_block_trader || {},
     trading_validation: readiness.trading_validation || previous.trading_validation || {},
     remediation_actions: readiness.remediation_actions || previous.remediation_actions || [],
+    operational_remediation_actions: readiness.operational_remediation_actions || previous.operational_remediation_actions || [],
+    advisory_actions: readiness.advisory_actions || previous.advisory_actions || [],
     advisory_details: readiness.advisory_details || previous.advisory_details || [],
   };
   state.opsReadinessError = "";
@@ -6405,6 +6522,9 @@ async function loadBinanceBlocks(action = "refresh", options = {}) {
   const passive = action === "auto";
   const silent = Boolean(options.silent || passive);
   const includeContext = options.includeContext !== false && !passive;
+  const liveExecution = binanceLiveExecutionEnabled();
+  if (runManager && !confirmBinanceLiveManualAction("LLM 매니저 1회 실행")) return;
+  if (runTick && !confirmBinanceLiveManualAction("룰엔진 tick 실행")) return;
   state.binanceTrader.loading = !silent && !runManager && !runTick;
   state.binanceTrader.running = runManager || runTick;
   state.binanceTrader.error = "";
@@ -6413,9 +6533,19 @@ async function loadBinanceBlocks(action = "refresh", options = {}) {
   }
   try {
     if (runManager) {
-      await getJSON("/binance/blocks/manager/run-once", { method: "POST" });
+      await getJSON("/binance/blocks/manager/run-once", {
+        method: "POST",
+        body: JSON.stringify(
+          liveExecution ? { confirm_live_manager_run: true } : {}
+        ),
+      });
     } else if (runTick) {
-      await getJSON("/binance/blocks/executor/tick", { method: "POST" });
+      await getJSON("/binance/blocks/executor/tick", {
+        method: "POST",
+        body: JSON.stringify(
+          liveExecution ? { confirm_live_executor_tick: true } : {}
+        ),
+      });
     } else if (action === "kill") {
       await getJSON("/binance/blocks/kill-switch", {
         method: "POST",
@@ -6895,6 +7025,7 @@ async function runKisBlockAction(action, blockId = "") {
 
 function renderDashboard() {
   renderGlobalExecutionMode();
+  renderHomeOpsSummary();
   renderTopMetrics();
   renderKisQuickStrip();
   renderVenueTabs();
@@ -7167,6 +7298,9 @@ async function init() {
   restoreUiState();
   applyTheme(getInitialTheme());
   qs("themeToggle").addEventListener("click", toggleTheme);
+  bindEvent("authBannerToggleBtn", "click", () => {
+    setAuthPromptExpanded(!state.auth.expanded, { focus: !state.auth.expanded });
+  });
   bindEvent("authTokenSaveBtn", "click", async () => {
     const token = String(qs("authTokenInput")?.value || "").trim();
     state.auth.token = token;
@@ -7190,6 +7324,7 @@ async function init() {
     state.auth.token = "";
     writeAdminToken("");
     markAuthRequired("운영 토큰이 지워졌습니다.");
+    setAuthPromptExpanded(false);
     syncSystemMetricsRefresh();
   });
   bindEvent("authTokenInput", "keydown", (event) => {
@@ -7213,6 +7348,20 @@ async function init() {
       openHelperPage(String(button.dataset.navHelperTab || resolveInitialHelperTab()));
       ensureHelperTabData();
     });
+  });
+  document.querySelectorAll("[data-mobile-page]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (String(button.dataset.mobilePage || "") === "main") openMainPage();
+    });
+  });
+  document.querySelectorAll("[data-mobile-helper-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      openHelperPage(String(button.dataset.mobileHelperTab || resolveInitialHelperTab()));
+      ensureHelperTabData();
+    });
+  });
+  bindEvent("mobileNavMoreBtn", "click", () => {
+    setMobileMenuOpen(!state.mobileMenuOpen);
   });
   bindEvent("helperBackBtn", "click", openMainPage);
   qs("refreshBtn").addEventListener("click", async () => {
@@ -7241,6 +7390,21 @@ async function init() {
       } else if (kind === "refresh") {
         loadSystemMetrics({ force: true });
       }
+    });
+  }
+  const homeOpsSummary = qs("homeOpsSummary");
+  if (homeOpsSummary) {
+    homeOpsSummary.addEventListener("click", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target) return;
+      if (target.closest("[data-auth-focus]")) {
+        focusAuthTokenInput();
+        return;
+      }
+      const workspaceButton = target.closest("[data-open-helper]");
+      if (!workspaceButton) return;
+      openHelperPage(String(workspaceButton.dataset.openHelper || ASK_HELPER_TAB));
+      ensureHelperTabData();
     });
   }
   qs("venueTabs").addEventListener("click", (event) => {
@@ -7344,6 +7508,16 @@ async function init() {
   });
   helperContent.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null;
+    const workspaceJump = target ? target.closest("[data-workspace-jump]") : null;
+    if (workspaceJump) {
+      const section = qs(String(workspaceJump.dataset.workspaceJump || ""));
+      if (section) {
+        const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+        section.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" });
+        section.focus({ preventScroll: true });
+      }
+      return;
+    }
     const authFocus = target ? target.closest("[data-auth-focus]") : null;
     if (authFocus) {
       focusAuthTokenInput();
@@ -7637,9 +7811,16 @@ async function init() {
     await submitHelperAsk();
   });
   window.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape" || !state.helperDetailModal) return;
-    state.helperDetailModal = null;
-    renderHelperAgent();
+    if (event.key !== "Escape") return;
+    if (state.mobileMenuOpen) {
+      setMobileMenuOpen(false);
+      qs("mobileNavMoreBtn")?.focus();
+      return;
+    }
+    if (state.helperDetailModal) {
+      state.helperDetailModal = null;
+      renderHelperAgent();
+    }
   });
   window.addEventListener("visibilitychange", () => {
     syncActiveBlockRefresh();

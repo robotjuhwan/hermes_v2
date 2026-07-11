@@ -12,6 +12,11 @@ from tradecraft.services.runtime_maintenance import (
     build_runtime_storage_report,
     cleanup_runtime_storage,
 )
+from tradecraft.services.runtime_storage_policy import (
+    runtime_storage_policy_from_settings,
+)
+from tradecraft.config import AppSettings
+from tradecraft.services.runtime_cold_archive import RuntimeColdArchiveV1
 
 
 def test_runtime_storage_report_and_cleanup_prunes_unreferenced_pdfs(tmp_path) -> None:
@@ -33,6 +38,7 @@ def test_runtime_storage_report_and_cleanup_prunes_unreferenced_pdfs(tmp_path) -
 
     policy = RuntimeStoragePolicy(
         runtime_dir=str(runtime_dir),
+        cold_archive_root=str(tmp_path / ".runtime-cold-archive"),
         reports_db_path=str(db_path),
         pdf_archive_dir=str(pdf_dir),
         large_file_threshold_mb=1,
@@ -60,6 +66,22 @@ def test_runtime_storage_report_and_cleanup_prunes_unreferenced_pdfs(tmp_path) -
     assert result["deleted_size_mb"] == 0.0
     assert keep_pdf.exists()
     assert not stale_pdf.exists()
+
+
+def test_runtime_storage_policy_is_built_outside_main_from_read_only_settings() -> None:
+    settings = AppSettings()
+    policy = runtime_storage_policy_from_settings(settings)
+    main_source = (Path(__file__).resolve().parents[1] / "src/tradecraft/main.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert policy.runtime_log_retention_days == 7
+    assert policy.dryrun_artifact_retention_days == 14
+    assert policy.dryrun_recent_per_scenario == 3
+    assert policy.cold_archive_root == settings.runtime_cold_archive_root
+    assert policy.archive_dryrun_artifacts is True
+    assert policy.dryrun_hot_hours == 24
+    assert '"quote_snapshots_archive": (' not in main_source
 
 
 def test_runtime_storage_report_exposes_operational_summary_counts(tmp_path) -> None:
@@ -681,6 +703,7 @@ def test_runtime_storage_cleanup_can_prune_old_extracted_report_pdfs(tmp_path) -
 
     policy = RuntimeStoragePolicy(
         runtime_dir=str(runtime_dir),
+        cold_archive_root=str(tmp_path / ".runtime-cold-archive"),
         reports_db_path=str(db_path),
         pdf_archive_dir=str(pdf_dir),
         large_file_threshold_mb=1,
@@ -689,6 +712,7 @@ def test_runtime_storage_cleanup_can_prune_old_extracted_report_pdfs(tmp_path) -
         extracted_report_pdf_retention_days=30,
         now_iso="2026-06-14T00:00:00+00:00",
     )
+    assert Path(policy.cold_archive_root) == tmp_path / ".runtime-cold-archive"
 
     report = build_runtime_storage_report(policy)
     candidates = report["cleanup_candidates"]["extracted_report_pdfs"]
@@ -703,9 +727,22 @@ def test_runtime_storage_cleanup_can_prune_old_extracted_report_pdfs(tmp_path) -
 
     result = cleanup_runtime_storage(policy, dry_run=False)
     assert result["deleted_count"] == 1
+    archives = [
+        row
+        for row in result["archived"]
+        if row["category"] == "extracted_report_pdfs"
+    ]
+    assert len(archives) == 1
+    assert archives[0]["verified"] is True
     assert not old_pdf.exists()
     assert recent_pdf.exists()
     assert no_content_pdf.exists()
+    restored = RuntimeColdArchiveV1(policy.cold_archive_root).restore(
+        archives[0]["entry_id"],
+        tmp_path / "restored-pdfs",
+    )
+    assert restored.restored is True
+    assert restored.paths[0].read_bytes() == b"a" * 100
 
 
 def test_runtime_storage_cleanup_can_prune_old_rag_repair_artifacts(tmp_path) -> None:
@@ -765,9 +802,14 @@ def test_runtime_storage_cleanup_can_prune_old_rag_rebuild_backups(tmp_path) -> 
     active_db = active_rag / "chroma.sqlite3"
     old_backup_db = old_backup / "chroma.sqlite3"
     recent_backup_db = recent_backup / "chroma.sqlite3"
-    active_db.write_bytes(b"active" * 10)
-    old_backup_db.write_bytes(b"old backup" * 20)
-    recent_backup_db.write_bytes(b"recent backup" * 30)
+    for database, value in (
+        (active_db, "active"),
+        (old_backup_db, "old backup"),
+        (recent_backup_db, "recent backup"),
+    ):
+        with sqlite3.connect(database) as conn:
+            conn.execute("CREATE TABLE documents (value TEXT)")
+            conn.execute("INSERT INTO documents (value) VALUES (?)", (value,))
 
     old_ts = datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp()
     recent_ts = datetime(2026, 6, 13, tzinfo=timezone.utc).timestamp()
@@ -778,6 +820,7 @@ def test_runtime_storage_cleanup_can_prune_old_rag_rebuild_backups(tmp_path) -> 
 
     policy = RuntimeStoragePolicy(
         runtime_dir=str(runtime_dir),
+        cold_archive_root=str(tmp_path / ".runtime-cold-archive"),
         rag_persist_path=str(active_rag),
         prune_unreferenced_pdfs=False,
         prune_extracted_report_pdfs=False,
@@ -806,9 +849,22 @@ def test_runtime_storage_cleanup_can_prune_old_rag_rebuild_backups(tmp_path) -> 
 
     result = cleanup_runtime_storage(policy, dry_run=False)
     assert result["deleted_by_category"]["rag_rebuild_backups"]["count"] == 1
+    rag_archives = [
+        row for row in result["archived"] if row["category"] == "rag_rebuild_backups"
+    ]
+    assert len(rag_archives) == 1
+    assert rag_archives[0]["verified"] is True
     assert active_db.exists()
     assert not old_backup.exists()
     assert recent_backup.exists()
+    restored = RuntimeColdArchiveV1(policy.cold_archive_root).restore(
+        rag_archives[0]["entry_id"],
+        tmp_path / "restored-rag",
+    )
+    assert restored.restored is True
+    with sqlite3.connect(restored.paths[0]) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT value FROM documents").fetchone()[0] == "old backup"
 
 
 def test_runtime_storage_cleanup_can_prune_old_runtime_logs(tmp_path) -> None:
@@ -914,6 +970,155 @@ def test_runtime_storage_cleanup_rotates_large_active_runtime_logs(tmp_path) -> 
     assert old_log.exists()
 
 
+def test_runtime_storage_protects_manifest_log_and_flags_old_duplicate(
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / ".runtime"
+    duplicate_dir = runtime_dir / "logs"
+    duplicate_dir.mkdir(parents=True)
+    canonical = runtime_dir / "control.log"
+    duplicate = duplicate_dir / "tradecraft-control.log"
+    canonical.write_text("canonical", encoding="utf-8")
+    duplicate.write_text("duplicate", encoding="utf-8")
+    old_ts = datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp()
+    os.utime(canonical, (old_ts, old_ts))
+    os.utime(duplicate, (old_ts, old_ts))
+    policy = RuntimeStoragePolicy(
+        runtime_dir=str(runtime_dir),
+        prune_unreferenced_pdfs=False,
+        prune_extracted_report_pdfs=False,
+        prune_rag_repair_artifacts=False,
+        runtime_log_retention_days=7,
+        now_iso="2026-06-14T00:00:00+00:00",
+    )
+
+    report = build_runtime_storage_report(policy)
+
+    assert str(canonical) in report["canonical_runner_log_paths"]
+    assert str(canonical) not in report["cleanup_candidates"]["old_runtime_logs"][
+        "sample"
+    ]
+    assert report["cleanup_candidates"]["duplicate_runtime_logs"]["sample"] == [
+        str(duplicate)
+    ]
+    cleanup = cleanup_runtime_storage(policy, dry_run=True)
+    assert cleanup["deleted_by_category"]["duplicate_runtime_logs"]["count"] == 1
+    assert canonical.exists()
+    assert duplicate.exists()
+
+
+def test_runtime_storage_dryrun_retention_archives_all_over_24h_except_manifest(
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / ".runtime"
+    scenario_dir = runtime_dir / "dryrun" / "rehearsal-a"
+    scenario_dir.mkdir(parents=True)
+    files = [scenario_dir / f"run-{index}.json" for index in range(5)]
+    for index, path in enumerate(files):
+        path.write_text(str(index), encoding="utf-8")
+        timestamp = datetime(2026, 5, 1 + index, tzinfo=timezone.utc).timestamp()
+        os.utime(path, (timestamp, timestamp))
+    manifest = runtime_dir / "dryrun" / "protected_manifest.json"
+    manifest.write_text(
+        '{"protected_paths":["rehearsal-a/run-0.json"]}',
+        encoding="utf-8",
+    )
+    policy = RuntimeStoragePolicy(
+        runtime_dir=str(runtime_dir),
+        prune_unreferenced_pdfs=False,
+        prune_extracted_report_pdfs=False,
+        prune_rag_repair_artifacts=False,
+        now_iso="2026-06-14T00:00:00+00:00",
+    )
+
+    report = build_runtime_storage_report(policy)
+    candidates = report["cleanup_candidates"]["old_dryrun_artifacts"]
+
+    assert candidates["count"] == 4
+    assert candidates["sample"] == [str(path) for path in files[1:]]
+    assert report["retained_artifacts"]["protected_dryrun_artifacts"]["sample"] == [
+        str(files[0])
+    ]
+    cleanup = cleanup_runtime_storage(policy, dry_run=True)
+    assert cleanup["deleted_by_category"]["old_dryrun_artifacts"]["count"] == 4
+    assert all(path.exists() for path in files)
+
+
+def test_runtime_storage_groups_rehearsal_revisions_as_one_scenario(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".runtime" / "dryrun"
+
+    keys = {
+        runtime_maintenance._dryrun_scenario_key(
+            root / f"binance_blocks_rehearsal{suffix}.db",
+            root,
+        )
+        for suffix in ("", "2", "7")
+    }
+    json_key = runtime_maintenance._dryrun_scenario_key(
+        root / "binance_block_trader_rehearsal7.json",
+        root,
+    )
+
+    assert keys == {"rehearsal"}
+    assert json_key == "rehearsal"
+
+
+def test_runtime_storage_archives_old_dryrun_bundle_before_removal(
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / ".runtime"
+    dryrun_dir = runtime_dir / "dryrun"
+    dryrun_dir.mkdir(parents=True)
+    database = dryrun_dir / "binance_blocks_rehearsal4.db"
+    state = dryrun_dir / "binance_block_trader_rehearsal4.json"
+    with sqlite3.connect(database) as conn:
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO orders (value) VALUES ('preserved')")
+    state.write_text('{"scenario":"rehearsal4"}', encoding="utf-8")
+    old_timestamp = datetime(2026, 7, 9, tzinfo=timezone.utc).timestamp()
+    os.utime(database, (old_timestamp, old_timestamp))
+    os.utime(state, (old_timestamp, old_timestamp))
+    cold_root = tmp_path / ".runtime-cold-archive"
+    policy = RuntimeStoragePolicy(
+        runtime_dir=str(runtime_dir),
+        cold_archive_root=str(cold_root),
+        prune_unreferenced_pdfs=False,
+        prune_extracted_report_pdfs=False,
+        prune_rag_repair_artifacts=False,
+        prune_rag_rebuild_backups=False,
+        prune_old_runtime_logs=False,
+        rotate_large_active_logs=False,
+        prune_repair_backup_artifacts=False,
+        prune_scratch_artifacts=False,
+        prune_old_backtest_artifacts=False,
+        prune_old_ui_check_artifacts=False,
+        prune_zero_byte_runtime_markers=False,
+        prune_retired_state_artifacts=False,
+        prune_retired_log_artifacts=False,
+        prune_retired_db_artifacts=False,
+        now_iso="2026-07-11T00:00:00+00:00",
+    )
+
+    result = cleanup_runtime_storage(policy, dry_run=False)
+
+    assert result["archive_failures"] == []
+    assert len(result["archived"]) == 1
+    assert result["archived"][0]["verified"] is True
+    assert not database.exists()
+    assert not state.exists()
+    restored = RuntimeColdArchiveV1(cold_root).restore(
+        result["archived"][0]["entry_id"],
+        tmp_path / "restored",
+    )
+    assert restored.restored is True
+    restored_database = next(path for path in restored.paths if path.suffix == ".db")
+    with sqlite3.connect(restored_database) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT value FROM orders").fetchone()[0] == "preserved"
+
+
 def test_runtime_storage_cleanup_can_prune_old_repair_backups_and_show_retained(
     tmp_path,
 ) -> None:
@@ -945,6 +1150,7 @@ def test_runtime_storage_cleanup_can_prune_old_repair_backups_and_show_retained(
         scratch_artifact_retention_days=7,
         now_iso="2026-06-14T00:00:00+00:00",
     )
+    assert Path(policy.cold_archive_root) == tmp_path / ".runtime-cold-archive"
 
     report = build_runtime_storage_report(policy)
     repair_candidates = report["cleanup_candidates"]["repair_backup_artifacts"]

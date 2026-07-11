@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import math
 import re
 import sqlite3
 import time
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from tradecraft.services.binance_entry_gate import (
     entry_fill_price_update_fields as build_entry_fill_price_update_fields,
@@ -131,6 +133,7 @@ from tradecraft.services.binance_manager_prompt import (
     manager_response_contract_error as build_manager_response_contract_error,
     manager_run_diagnostics as build_manager_run_diagnostics,
     manager_run_workflow_provenance as build_manager_run_workflow_provenance,
+    _manager_probe_rejection_cites_current_execution_gate as build_rejection_cites_live_gate,
     merge_manager_candidate_price_plan as build_merge_manager_candidate_price_plan,
     normalize_lane_review as build_normalize_lane_review,
     prompt_budget_error as build_prompt_budget_error,
@@ -139,7 +142,31 @@ from tradecraft.services.binance_manager_prompt import (
     validation_repair_note as build_validation_repair_note,
 )
 from tradecraft.services.manager_prompt_budget import attach_jue_wiki_budget_report
+from tradecraft.services.manager_prompt_contract import (
+    ManagerPromptContractViolation,
+    build_manager_prompt_bundle,
+)
+from tradecraft.services.manager_run_telemetry import (
+    ManagerRunTelemetryV1,
+    build_fill_provenance_summary,
+    manager_action_count,
+)
 from tradecraft.services.jue_wiki import normalize_jue_wiki_quality_status
+from tradecraft.services.jue_wiki_risk import (
+    apply_binance_wiki_decision_gate as shared_apply_binance_wiki_decision_gate,
+)
+from tradecraft.services.jue_wiki_shadow import (
+    WikiShadowRecordingV1,
+)
+from tradecraft.services.jue_wiki_prompt_policy import (
+    apply_jue_wiki_prompt_policy,
+    attach_jue_wiki_decision_gate as shared_attach_jue_wiki_decision_gate,
+    preserve_wiki_context_packet,
+)
+from tradecraft.services.jue_wiki_contract import (
+    WIKI_GATE_IDENTITY_MAX_CHARS,
+    WikiDecisionGateV1,
+)
 from tradecraft.services.jue_wiki_application import (
     build_jue_wiki_quality_pressure_action_plan_for_prompt,
     summarize_jue_wiki_quality_pressure_for_prompt,
@@ -292,6 +319,7 @@ from tradecraft.services.binance_snapshot import (
     normalize_account_snapshot as build_normalize_account_snapshot,
     visible_block_rows as build_visible_block_rows,
 )
+from tradecraft.services.binance_status_reader import read_binance_repository_status
 from tradecraft.services.binance_symbol import (
     ALLOWED_MARKETS as BINANCE_ALLOWED_MARKETS,
     UPBIT_SPOT_MARKET,
@@ -343,6 +371,296 @@ ALLOWED_MANAGER_ACTIONS = {
     "update_blocks",
     "close_blocks",
     "pause_blocks",
+}
+
+_WIKI_SIZE_FIELDS = (
+    "qty",
+    "quantity",
+    "qty_open",
+    "qty_initial",
+    "target_qty",
+    "target_quantity",
+    "new_qty",
+    "size",
+    "position_size",
+    "position_qty",
+)
+_WIKI_NOTIONAL_USDT_FIELDS = (
+    "notional_usdt",
+    "target_notional_usdt",
+    "quote_budget_usdt",
+    "max_notional_usdt",
+    "risk_budget_usdt",
+)
+_WIKI_NOTIONAL_KRW_FIELDS = (
+    "notional_krw",
+    "target_notional_krw",
+    "quote_budget_krw",
+    "max_notional_krw",
+    "risk_budget_krw",
+)
+_WIKI_NOTIONAL_NATIVE_FIELDS = (
+    "notional",
+    "target_notional",
+)
+_WIKI_LEVERAGE_FIELDS = ("leverage", "target_leverage", "new_leverage")
+_WIKI_AUDIT_ID_MAX_CHARS = 120
+
+
+def _wiki_gate_payload(gate: WikiDecisionGateV1 | dict[str, Any]) -> dict[str, Any]:
+    return gate.to_dict() if isinstance(gate, WikiDecisionGateV1) else dict(gate)
+
+
+def _trusted_wiki_decision_gate(
+    gate: WikiDecisionGateV1 | dict[str, Any] | None,
+    *,
+    trusted_read_mode: str,
+) -> dict[str, Any]:
+    if trusted_read_mode != "required":
+        return {
+            "allow_new_risk": True,
+            "allow_exit_actions": True,
+            "reason": "wiki_context_advisory",
+            "read_mode": trusted_read_mode,
+            "snapshot_id": "",
+            "version": "wiki_decision_gate_v1",
+        }
+    if not isinstance(gate, (WikiDecisionGateV1, dict)):
+        payload: dict[str, Any] = {}
+    else:
+        payload = _wiki_gate_payload(gate)
+    if not payload:
+        invalid_reason = "wiki_required_gate_missing"
+    elif payload.get("version") != "wiki_decision_gate_v1":
+        invalid_reason = "wiki_required_gate_invalid:version"
+    elif payload.get("read_mode") != "required":
+        invalid_reason = "wiki_required_gate_invalid:read_mode"
+    elif type(payload.get("allow_new_risk")) is not bool:
+        invalid_reason = "wiki_required_gate_invalid:allow_new_risk"
+    elif payload.get("allow_exit_actions") is not True:
+        invalid_reason = "wiki_required_gate_invalid:allow_exit_actions"
+    elif not isinstance(payload.get("reason"), str) or not payload.get("reason"):
+        invalid_reason = "wiki_required_gate_invalid:reason"
+    elif len(payload["reason"]) > WIKI_GATE_IDENTITY_MAX_CHARS:
+        invalid_reason = "wiki_required_gate_invalid:reason"
+    elif not isinstance(payload.get("snapshot_id"), str):
+        invalid_reason = "wiki_required_gate_invalid:snapshot_id"
+    elif len(payload["snapshot_id"]) > WIKI_GATE_IDENTITY_MAX_CHARS:
+        invalid_reason = "wiki_required_gate_invalid:snapshot_id"
+    elif payload.get("allow_new_risk") is True and payload.get("reason") != "wiki_context_eligible":
+        invalid_reason = "wiki_required_gate_invalid:reason"
+    elif payload.get("allow_new_risk") is False and not str(payload.get("reason")).startswith(
+        "wiki_required_"
+    ):
+        invalid_reason = "wiki_required_gate_invalid:reason"
+    elif payload.get("allow_new_risk") is True and (
+        not isinstance(payload.get("snapshot_id"), str)
+        or not str(payload.get("snapshot_id")).strip()
+    ):
+        invalid_reason = "wiki_required_gate_invalid:snapshot_id"
+    else:
+        return {
+            "allow_new_risk": payload["allow_new_risk"],
+            "allow_exit_actions": True,
+            "reason": str(payload["reason"]),
+            "read_mode": "required",
+            "snapshot_id": str(payload.get("snapshot_id") or ""),
+            "version": "wiki_decision_gate_v1",
+        }
+    return {
+        "allow_new_risk": False,
+        "allow_exit_actions": True,
+        "reason": invalid_reason,
+        "read_mode": "required",
+        "snapshot_id": "",
+        "version": "wiki_decision_gate_v1",
+    }
+
+
+def _wiki_current_block_index(
+    current_blocks: dict[str, dict[str, Any]] | list[dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    if isinstance(current_blocks, dict):
+        return {
+            str(block_id): row
+            for block_id, row in current_blocks.items()
+            if isinstance(row, dict)
+        }
+    return {
+        str(row.get("block_id") or ""): row
+        for row in list(current_blocks or [])
+        if isinstance(row, dict) and str(row.get("block_id") or "")
+    }
+
+
+def _wiki_numeric_aliases(
+    row: dict[str, Any],
+    keys: tuple[str, ...],
+) -> tuple[bool, tuple[float, ...], bool]:
+    values: list[float] = []
+    invalid = False
+    for key in keys:
+        if key not in row:
+            continue
+        value = row.get(key)
+        if isinstance(value, bool):
+            invalid = True
+            continue
+        try:
+            parsed = float(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            invalid = True
+            continue
+        if not math.isfinite(parsed) or parsed < 0:
+            invalid = True
+            continue
+        values.append(parsed)
+    return bool(values) or invalid, tuple(values), invalid
+
+
+def _wiki_alias_update_increases(
+    row: dict[str, Any],
+    keys: tuple[str, ...],
+    *,
+    current_value: float,
+) -> bool:
+    present, values, invalid = _wiki_numeric_aliases(row, keys)
+    if not present:
+        return False
+    if invalid or not values:
+        return True
+    first = values[0]
+    if any(not math.isclose(value, first, rel_tol=1e-9, abs_tol=1e-12) for value in values[1:]):
+        return True
+    if current_value <= 0:
+        return first > 0
+    return any(value > current_value for value in values)
+
+
+def _wiki_notional_market_scope(
+    row: dict[str, Any],
+    current: dict[str, Any],
+) -> tuple[str, bool]:
+    current_raw = str(current.get("market") or "").strip()
+    action_raw = str(row.get("market") or "").strip()
+    current_market = explicit_market_scope(current_raw) if current_raw else ""
+    action_market = explicit_market_scope(action_raw) if action_raw else ""
+    invalid = bool(
+        (current_raw and not current_market)
+        or (action_raw and not action_market)
+        or (current_market and action_market and current_market != action_market)
+    )
+    return action_market or current_market, invalid
+
+
+def _wiki_current_alias_value(
+    current: dict[str, Any],
+    keys: tuple[str, ...],
+    *,
+    fallback: float,
+) -> tuple[float, bool]:
+    present, values, invalid = _wiki_numeric_aliases(current, keys)
+    if invalid:
+        return 0.0, True
+    if not present:
+        return fallback, False
+    first = values[0]
+    conflict = any(
+        not math.isclose(value, first, rel_tol=1e-9, abs_tol=1e-12)
+        for value in values[1:]
+    )
+    return first, conflict
+
+
+def _binance_wiki_update_adds_new_risk(
+    row: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    current_size = next(
+        (
+            _safe_float(current.get(key))
+            for key in ("qty_open", "qty", "quantity", "qty_initial")
+            if current.get(key) not in (None, "")
+        ),
+        0.0,
+    )
+    market, market_invalid = _wiki_notional_market_scope(row, current)
+    native_notional = current_size * _safe_float(current.get("entry_price"))
+    row_has_notional = any(
+        key in row
+        for key in (
+            *_WIKI_NOTIONAL_USDT_FIELDS,
+            *_WIKI_NOTIONAL_KRW_FIELDS,
+            *_WIKI_NOTIONAL_NATIVE_FIELDS,
+        )
+    )
+    native_alias_relevant = any(
+        key in row or key in current for key in _WIKI_NOTIONAL_NATIVE_FIELDS
+    )
+    if row_has_notional and (
+        market_invalid or (native_alias_relevant and not market)
+    ):
+        return True
+    usdt_fields = (
+        (*_WIKI_NOTIONAL_USDT_FIELDS, *_WIKI_NOTIONAL_NATIVE_FIELDS)
+        if market in {"spot", "futures"}
+        else _WIKI_NOTIONAL_USDT_FIELDS
+    )
+    krw_fields = (
+        (*_WIKI_NOTIONAL_KRW_FIELDS, *_WIKI_NOTIONAL_NATIVE_FIELDS)
+        if market == UPBIT_SPOT_MARKET
+        else _WIKI_NOTIONAL_KRW_FIELDS
+    )
+    current_usdt_notional, current_usdt_invalid = _wiki_current_alias_value(
+        current,
+        usdt_fields,
+        fallback=native_notional if market in {"spot", "futures"} else 0.0,
+    )
+    current_krw_notional, current_krw_invalid = _wiki_current_alias_value(
+        current,
+        krw_fields,
+        fallback=native_notional if market == UPBIT_SPOT_MARKET else 0.0,
+    )
+    current_leverage = _safe_float(current.get("leverage"))
+    return (
+        _wiki_alias_update_increases(
+            row,
+            _WIKI_LEVERAGE_FIELDS,
+            current_value=current_leverage,
+        )
+        or _wiki_alias_update_increases(
+            row,
+            _WIKI_SIZE_FIELDS,
+            current_value=current_size,
+        )
+        or _wiki_alias_update_increases(
+            row,
+            usdt_fields,
+            current_value=current_usdt_notional,
+        )
+        or _wiki_alias_update_increases(
+            row,
+            krw_fields,
+            current_value=current_krw_notional,
+        )
+        or (row_has_notional and (current_usdt_invalid or current_krw_invalid))
+    )
+
+
+apply_binance_wiki_decision_gate = shared_apply_binance_wiki_decision_gate
+MANAGER_CONTRACT_REPLAYABLE_ERRORS = {
+    "binance_activity_gap_resolution_missing_from_model",
+    "candidate_memory_hint_resolution_missing_from_model",
+    "hold_decision_missing_concrete_trigger",
+    "manager_create_candidate_not_visible",
+    "memory_contract_resolution_missing_from_model",
+    "requested_symbol_coverage_resolution_missing_from_model",
+    "validation_repair_action_missing_from_model",
+    "validation_repair_min_executable_qty_missing_from_model",
+    "validation_repair_probe_design_ignored_from_model",
+    "validation_repair_resolution_missing_from_model",
+    "wiki_action_reference_resolution_missing_from_model",
+    "wiki_context_gap_resolution_missing_from_model",
 }
 SPOT_ADOPTION_MIN_NOTIONAL_USDT = 5.0
 BOOK_MARKET_FEATURES_KEY = "_book_features_by_market"
@@ -399,7 +717,9 @@ class BinanceBlockTraderConfig:
     quote_interval_sec: int = 15
     rule_interval_sec: int = 15
     manager_interval_sec: int = 1800
-    llm_model: str = "gpt-5.5"
+    waiting_entry_max_age_sec: int = 48 * 60 * 60
+    entry_pending_max_age_sec: int = 10 * 60
+    llm_model: str = "gpt-5.6-sol"
     llm_reasoning_effort: str = "xhigh"
     llm_timeout_ms: int = 0
     max_manager_symbols: int = 36
@@ -408,6 +728,7 @@ class BinanceBlockTraderConfig:
     prompt_warn_chars: int = 65_000
     prompt_max_chars: int = 190_000
     jue_wiki_context_max_chars: int = 18_000
+    jue_wiki_read_mode: str = "shadow"
     telegram_alerts_enabled: bool = True
     spot_universe: str = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
     futures_universe: str = "BTCUSDT,ETHUSDT,SOLUSDT"
@@ -1520,6 +1841,10 @@ def _attach_jue_wiki_prompt_context(
         }
     prompt["jue_wiki"] = payload
     prompt["jue_wiki_application"] = _jue_wiki_application_metadata(payload)
+    decision_inputs = list(prompt.get("decision_inputs") or [])
+    if "jue_wiki" not in decision_inputs:
+        decision_inputs.append("jue_wiki")
+    prompt["decision_inputs"] = decision_inputs
     _attach_jue_wiki_requested_symbol_coverage_input(prompt)
     _attach_jue_wiki_memory_card_quality_input(prompt)
     _attach_jue_wiki_validation_repair_effectiveness_input(prompt)
@@ -1531,6 +1856,47 @@ def _attach_jue_wiki_prompt_context(
     _attach_jue_wiki_repair_contract(prompt, payload)
     _attach_jue_wiki_action_pressure_contract(prompt, payload)
     attach_jue_wiki_budget_report(prompt, max_chars=max_chars)
+
+
+def _attach_jue_wiki_decision_gate(
+    prompt: dict[str, Any],
+    jue_wiki: dict[str, Any] | None,
+    *,
+    trusted_read_mode: str,
+) -> None:
+    shared_attach_jue_wiki_decision_gate(
+        prompt,
+        jue_wiki,
+        trusted_read_mode=trusted_read_mode,
+        venue="binance",
+    )
+
+
+def _apply_required_wiki_prompt_read_policy(
+    prompt: dict[str, Any],
+    *,
+    trusted_read_mode: str,
+) -> dict[str, Any]:
+    return apply_jue_wiki_prompt_policy(
+        prompt,
+        target_read_mode=trusted_read_mode,
+    )
+
+
+def _required_wiki_gate_prompt_error(
+    prompt: dict[str, Any],
+    *,
+    trusted_read_mode: str,
+) -> str:
+    if trusted_read_mode != "required":
+        return ""
+    gate = prompt.get("jue_wiki_decision_gate")
+    reason = str(gate.get("reason") or "") if isinstance(gate, dict) else ""
+    if reason == "wiki_required_gate_missing" or reason.startswith(
+        "wiki_required_gate_invalid:"
+    ):
+        return f"jue_wiki_gate_contract_error:{reason}"
+    return ""
 
 
 def _looks_like_signature_type_error(exc: TypeError) -> bool:
@@ -3321,6 +3687,34 @@ def _manager_action_item_count(actions: Any) -> int:
     )
 
 
+def _manager_action_item_is_binance(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    raw_market = row.get("market") or row.get("venue")
+    explicit_market = explicit_market_scope(raw_market)
+    if explicit_market in {"spot", "futures"}:
+        return True
+    if explicit_market == UPBIT_SPOT_MARKET:
+        return False
+    if str(raw_market or "").strip():
+        return False
+    symbol = str(row.get("symbol") or "").upper().strip()
+    if symbol.startswith("KRW-"):
+        return False
+    return symbol.endswith("USDT")
+
+
+def _manager_binance_action_item_count(actions: Any) -> int:
+    if not isinstance(actions, dict):
+        return 0
+    return sum(
+        1
+        for key in ("adopt_existing_blocks", "create_blocks", "update_blocks")
+        for row in _normalize_list(actions.get(key))
+        if _manager_action_item_is_binance(row)
+    )
+
+
 def _compact_latest_wiki_attention_item(source: Any) -> dict[str, Any]:
     row = source if isinstance(source, dict) else {}
     if not row:
@@ -4233,6 +4627,7 @@ class BinanceBlockRepository:
 
     def update_block(self, block_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
         allowed = {
+            "qty_initial",
             "qty_open",
             "entry_price",
             "target_price",
@@ -4822,12 +5217,26 @@ class BinanceBlockRepository:
                     prompt["diagnostics"] = diagnostics
         provenance = build_manager_run_workflow_provenance(prompt)
         priority_candidate_keys = build_manager_action_candidate_keys(actions)
-        stored_prompt = build_compact_manager_storage_payload(
-            prompt,
-            limit=MANAGER_PROMPT_STORAGE_LIMIT,
-            label="binance_manager_prompt",
-            priority_candidate_keys=priority_candidate_keys,
-        )
+        try:
+            prompt_bundle = build_manager_prompt_bundle(
+                prompt,
+                audit_prompt_builder=lambda value: (
+                    build_compact_manager_storage_payload(
+                        value,
+                        limit=MANAGER_PROMPT_STORAGE_LIMIT,
+                        label="binance_manager_prompt",
+                        priority_candidate_keys=priority_candidate_keys,
+                    )
+                ),
+            )
+            stored_prompt = prompt_bundle.audit_prompt
+        except ManagerPromptContractViolation:
+            stored_prompt = build_compact_manager_storage_payload(
+                prompt,
+                limit=MANAGER_PROMPT_STORAGE_LIMIT,
+                label="binance_manager_prompt",
+                priority_candidate_keys=priority_candidate_keys,
+            )
         stored_response = build_compact_manager_storage_payload(
             response,
             limit=MANAGER_RESPONSE_STORAGE_LIMIT,
@@ -4879,6 +5288,64 @@ class BinanceBlockRepository:
             conn.execute(
                 "UPDATE manager_runs SET response_json = ? WHERE id = ?",
                 (_json_dumps(stored_response), int(manager_run_id)),
+            )
+
+    def update_manager_run_shadow_recording_id(
+        self,
+        manager_run_id: int,
+        recording_id: str,
+    ) -> None:
+        clean_recording_id = str(recording_id or "").strip()
+        if not clean_recording_id:
+            return
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT response_json, actions_json FROM manager_runs "
+                "WHERE id = ? LIMIT 1",
+                (int(manager_run_id),),
+            ).fetchone()
+            if row is None:
+                return
+            response = _json_loads(row["response_json"], {})
+            actions = _json_loads(row["actions_json"], {})
+            if not isinstance(response, dict):
+                response = {}
+            if not isinstance(actions, dict):
+                actions = {}
+            response_telemetry = response.get("manager_run_telemetry")
+            if not isinstance(response_telemetry, dict):
+                response_telemetry = {}
+            response["manager_run_telemetry"] = {
+                **response_telemetry,
+                "wiki_shadow_recording_id": clean_recording_id,
+            }
+            actions_telemetry = actions.get("_manager_run_telemetry")
+            if not isinstance(actions_telemetry, dict):
+                actions_telemetry = {}
+            actions["_manager_run_telemetry"] = {
+                **actions_telemetry,
+                "wiki_shadow_recording_id": clean_recording_id,
+            }
+            conn.execute(
+                "UPDATE manager_runs SET response_json = ?, actions_json = ? "
+                "WHERE id = ?",
+                (
+                    _json_dumps(
+                        build_compact_manager_storage_payload(
+                            response,
+                            limit=MANAGER_RESPONSE_STORAGE_LIMIT,
+                            label="binance_manager_response",
+                        )
+                    ),
+                    _json_dumps(
+                        build_compact_manager_storage_payload(
+                            actions,
+                            limit=MANAGER_ACTIONS_STORAGE_LIMIT,
+                            label="binance_manager_actions",
+                        )
+                    ),
+                    int(manager_run_id),
+                ),
             )
 
     def list_blocks(
@@ -5025,6 +5492,62 @@ class BinanceBlockRepository:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [build_row_to_order(row) for row in rows]
+
+    def entry_order_activity(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT market, COUNT(*) AS entry_count, MAX(created_at) AS latest_entry_at
+                FROM block_orders
+                WHERE reason = 'entry_order'
+                GROUP BY market
+                """
+            ).fetchall()
+        markets: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            market = normalize_market(row["market"])
+            latest_entry_at = str(row["latest_entry_at"] or "")
+            entry_count = int(row["entry_count"] or 0)
+            existing = markets.get(market)
+            if existing is None:
+                markets[market] = {
+                    "entry_count": entry_count,
+                    "latest_entry_at": latest_entry_at,
+                }
+                continue
+            existing["entry_count"] = int(existing.get("entry_count") or 0) + entry_count
+            existing_latest = _parse_iso_datetime(existing.get("latest_entry_at"))
+            row_latest = _parse_iso_datetime(latest_entry_at)
+            if row_latest is not None and (
+                existing_latest is None or row_latest > existing_latest
+            ):
+                existing["latest_entry_at"] = latest_entry_at
+
+        def latest_for(target_markets: set[str]) -> dict[str, Any]:
+            latest_market = ""
+            latest_at = ""
+            latest_dt: datetime | None = None
+            entry_count = 0
+            for market, payload in markets.items():
+                if market not in target_markets:
+                    continue
+                entry_count += int(payload.get("entry_count") or 0)
+                parsed = _parse_iso_datetime(payload.get("latest_entry_at"))
+                if parsed is not None and (latest_dt is None or parsed > latest_dt):
+                    latest_dt = parsed
+                    latest_at = str(payload.get("latest_entry_at") or "")
+                    latest_market = market
+            return {
+                "entry_count": entry_count,
+                "latest_entry_at": latest_at,
+                "latest_entry_market": latest_market,
+            }
+
+        return {
+            "markets": markets,
+            "binance": latest_for({"spot", "futures"}),
+            UPBIT_SPOT_MARKET: latest_for({UPBIT_SPOT_MARKET}),
+        }
 
     def list_events(self, block_id: str = "", *, limit: int = 100) -> list[dict[str, Any]]:
         if block_id:
@@ -5642,79 +6165,10 @@ class BinanceBlockRepository:
         return equity
 
     def status(self) -> dict[str, Any]:
-        with self._connect() as conn:
-            block_count = int(conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0])
-            open_count = int(
-                conn.execute(
-                    """
-                    SELECT COUNT(*) FROM blocks
-                    WHERE status IN ('entry_pending','open','exit_pending')
-                    """
-                ).fetchone()[0]
-            )
-            proposed_count = int(
-                conn.execute("SELECT COUNT(*) FROM blocks WHERE status = 'proposed'").fetchone()[0]
-            )
-            order_count = int(conn.execute("SELECT COUNT(*) FROM block_orders").fetchone()[0])
-            manager_count = int(conn.execute("SELECT COUNT(*) FROM manager_runs").fetchone()[0])
-            latest_run = conn.execute(
-                "SELECT run_at, status, mode FROM manager_runs ORDER BY run_at DESC, id DESC LIMIT 1"
-            ).fetchone()
-            latest_error_run = conn.execute(
-                """
-                SELECT run_at, status, mode, error_message
-                FROM manager_runs
-                WHERE status NOT IN ('ok', 'success') OR error_message != ''
-                ORDER BY run_at DESC, id DESC
-                LIMIT 1
-                """
-            ).fetchone()
-        latest_manager_error = (
-            {
-                "run_at": str(latest_error_run["run_at"]),
-                "status": str(latest_error_run["status"]),
-                "mode": str(latest_error_run["mode"]),
-                "error_message": str(latest_error_run["error_message"]),
-            }
-            if latest_error_run
-            else {}
+        return read_binance_repository_status(
+            connect=self._connect,
+            db_path=self.path,
         )
-        latest_manager_error_recovered = bool(
-            latest_run
-            and latest_error_run
-            and str(latest_run["status"]).lower() in {"ok", "success"}
-            and str(latest_run["run_at"]) > str(latest_error_run["run_at"])
-        )
-        latest_unresolved_manager_error = (
-            {}
-            if not latest_manager_error or latest_manager_error_recovered
-            else latest_manager_error
-        )
-        latest_status = str(latest_run["status"]) if latest_run else "missing"
-        if latest_status == "missing":
-            manager_operational_status = "awaiting_first_manager_run"
-        elif latest_status.lower() in {"ok", "success"}:
-            manager_operational_status = "ok"
-        elif latest_unresolved_manager_error:
-            manager_operational_status = "manager_error_pending_next_run"
-        else:
-            manager_operational_status = "review_latest_manager_run"
-        return {
-            "status": "ok",
-            "db_path": str(self.path),
-            "block_count": block_count,
-            "open_block_count": open_count,
-            "proposed_block_count": proposed_count,
-            "order_count": order_count,
-            "manager_run_count": manager_count,
-            "latest_manager_run_at": str(latest_run["run_at"]) if latest_run else "",
-            "latest_manager_status": latest_status,
-            "manager_operational_status": manager_operational_status,
-            "latest_manager_mode": str(latest_run["mode"]) if latest_run else "",
-            "latest_manager_error": latest_manager_error,
-            "latest_manager_error_recovered": latest_manager_error_recovered,
-            "latest_unresolved_manager_error": latest_unresolved_manager_error,
-        }
 
     def _new_block_id(self, symbol: str, market: str) -> str:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
@@ -5740,6 +6194,10 @@ class BinanceBlockTrader:
         live_authority_provider: Callable[[], dict[str, Any] | None] | None = None,
         risk_sizer: Any | None = None,
         telegram: Any | None = None,
+        wiki_shadow_recording_recorder: Callable[[WikiShadowRecordingV1], Any]
+        | None = None,
+        wiki_shadow_envelope_recorder: Callable[[WikiShadowRecordingV1], Any]
+        | None = None,
     ) -> None:
         self.config = config
         self.adapter = adapter or binance
@@ -5754,6 +6212,10 @@ class BinanceBlockTrader:
         self.live_authority_provider = live_authority_provider
         self.risk_sizer = risk_sizer
         self.telegram = telegram
+        self.wiki_shadow_recording_recorder = (
+            wiki_shadow_recording_recorder or wiki_shadow_envelope_recorder
+        )
+        self.wiki_shadow_envelope_recorder = self.wiki_shadow_recording_recorder
         self._last_account_snapshot: dict[str, Any] = {}
         self._runtime_market_universe: dict[str, list[str]] = self._default_market_universe()
         self._last_manager_candidate_index: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -6487,14 +6949,33 @@ class BinanceBlockTrader:
                 source_qty = max(source_qty, from_qty)
             if to_qty > 0:
                 cap_qty = max(cap_qty, to_qty)
-        if source_qty * reference_price < floor:
-            return adjusted_qty
+        normalized_market = normalize_market(market)
         if adjusted_qty * reference_price >= floor:
             return adjusted_qty
         floor_qty = floor / reference_price
-        if floor_qty <= cap_qty + 1e-12:
+        qty_tolerance = max(abs(cap_qty) * 1e-6, 1e-8)
+        source_below_floor = source_qty * reference_price < floor
+        has_notional_budget = any(
+            _safe_float(row.get(field)) > 0
+            for field in (
+                "quote_budget_usdt",
+                "quote_budget_krw",
+                "quote_budget",
+                "quantity_or_quote_budget",
+                "risk_budget_usdt",
+                "risk_budget_krw",
+                "max_notional_usdt",
+                "notional_usdt",
+                "notional_krw",
+                "target_block_value_usdt",
+            )
+        )
+        if (
+            floor_qty <= cap_qty + qty_tolerance
+            or normalized_market == UPBIT_SPOT_MARKET
+            or (source_below_floor and not has_notional_budget)
+        ):
             return floor_qty
-        _ = market
         return adjusted_qty
 
     def _lane_authority_gate_with_recent_recovery_floor(
@@ -6754,6 +7235,43 @@ class BinanceBlockTrader:
             },
         )
 
+    def _entry_activity_status(self) -> dict[str, Any]:
+        activity = self.repository.entry_order_activity()
+
+        def lane(key: str) -> dict[str, Any]:
+            row = activity.get(key) if isinstance(activity.get(key), dict) else {}
+            return {
+                "entry_count": int(row.get("entry_count") or 0),
+                "latest_entry_at": str(row.get("latest_entry_at") or ""),
+                "latest_entry_market": str(row.get("latest_entry_market") or ""),
+            }
+
+        binance = lane("binance")
+        upbit = lane(UPBIT_SPOT_MARKET)
+        latest_binance_at = str(binance.get("latest_entry_at") or "")
+        latest_dt = _parse_iso_datetime(latest_binance_at)
+        stale_hours = 0.0
+        status = "ok"
+        if int(binance.get("entry_count") or 0) <= 0 or latest_dt is None:
+            status = "no_binance_entries"
+        else:
+            stale_hours = max(
+                (datetime.now(timezone.utc) - latest_dt).total_seconds() / 3600.0,
+                0.0,
+            )
+            if stale_hours >= 24.0:
+                status = "stale_binance_entries"
+        return {
+            "version": "binance_entry_activity_v1",
+            "status": status,
+            "latest_binance_entry_at": latest_binance_at,
+            "latest_binance_entry_market": str(binance.get("latest_entry_market") or ""),
+            "latest_upbit_entry_at": str(upbit.get("latest_entry_at") or ""),
+            "binance_entry_stale_hours": round(stale_hours, 3),
+            "binance_entry_count": int(binance.get("entry_count") or 0),
+            "upbit_entry_count": int(upbit.get("entry_count") or 0),
+        }
+
     def status(self) -> dict[str, Any]:
         account = self._status_account_snapshot()
         performance = self.repository.latest_performance_scorecard(limit=20)
@@ -6789,6 +7307,21 @@ class BinanceBlockTrader:
                 ),
             }
         )
+        latest_decision_input = self._latest_decision_input_summary(
+            self.repository.latest_manager_run(include_payload=True),
+        )
+        if (
+            latest_decision_input.get("contract_replay_status")
+            == "stored_error_resolved_by_current_contract"
+            and not str(latest_decision_input.get("current_contract_error") or "").strip()
+            and repository_status.get("latest_manager_error")
+        ):
+            repository_status["latest_manager_error_recovered"] = True
+            repository_status["latest_unresolved_manager_error"] = {}
+            if str(repository_status.get("latest_manager_status") or "").lower() == "error":
+                repository_status["manager_operational_status"] = (
+                    "manager_contract_replay_recovered"
+                )
         return {
             **repository_status,
             "enabled": bool(self.config.enabled),
@@ -6813,13 +7346,12 @@ class BinanceBlockTrader:
             "performance": performance,
             "performance_today": self.repository.today_performance_scorecard(),
             "live_authority": live_authority,
+            "entry_activity": self._entry_activity_status(),
             "adapter_ready": bool(self.adapter is not None),
             "llm_ready": bool(getattr(self.codex_runtime, "ready", False)),
             "model": str(getattr(self.codex_runtime, "resolved_model", self.config.llm_model)),
             "reasoning_effort": str(self.config.llm_reasoning_effort),
-            "latest_decision_input": self._latest_decision_input_summary(
-                self.repository.latest_manager_run(include_payload=True),
-            ),
+            "latest_decision_input": latest_decision_input,
             "config": {
                 "quote_interval_sec": int(self.config.quote_interval_sec),
                 "rule_interval_sec": int(self.config.rule_interval_sec),
@@ -6928,6 +7460,24 @@ class BinanceBlockTrader:
             if isinstance(prompt.get("proactive_decision_pressure"), dict)
             else {}
         )
+        current_replay_pressure = self._current_replay_proactive_pressure(prompt)
+        contract_prompt = self._contract_replay_prompt_with_current_pressure(
+            prompt,
+            current_replay_pressure,
+        )
+        current_replay_gap = (
+            current_replay_pressure.get("binance_market_activity_gap")
+            if isinstance(
+                current_replay_pressure.get("binance_market_activity_gap"),
+                dict,
+            )
+            else {}
+        )
+        binance_activity_gap = (
+            proactive_pressure.get("binance_market_activity_gap")
+            if isinstance(proactive_pressure.get("binance_market_activity_gap"), dict)
+            else {}
+        )
         execution_gate = (
             prompt.get("execution_gate")
             if isinstance(prompt.get("execution_gate"), dict)
@@ -6949,21 +7499,180 @@ class BinanceBlockTrader:
             actions=actions,
             hold_decision=hold_decision,
         )
+        stored_error_message = _clean_text(run.get("error_message"), limit=240)
+        replay_actions = actions
+        replay_action_error = ""
+        validation_repair = (
+            prompt.get("validation_repair")
+            if isinstance(prompt.get("validation_repair"), dict)
+            else {}
+        )
+        if validation_repair:
+            try:
+                replay_actions = self._apply_validation_repair_to_actions(
+                    actions,
+                    validation_repair=validation_repair,
+                    manager_response=response,
+                    prompt=contract_prompt,
+                )
+            except Exception as exc:
+                replay_action_error = f"contract_replay_failed:{exc.__class__.__name__}"
+        if not replay_action_error:
+            try:
+                replay_actions = _attach_prompt_jue_wiki_decision_adjustments_to_actions(
+                    replay_actions,
+                    prompt=prompt,
+                )
+            except Exception as exc:
+                replay_action_error = f"contract_replay_failed:{exc.__class__.__name__}"
+        try:
+            replay_hold_decision = build_normalize_manager_hold_decision(
+                response=response,
+                actions=replay_actions,
+                symbols=[],
+                allowed_actions=ALLOWED_MANAGER_ACTIONS,
+            )
+        except Exception as exc:
+            replay_action_error = (
+                replay_action_error
+                or f"contract_replay_failed:{exc.__class__.__name__}"
+            )
+            replay_hold_decision = hold_decision
+        try:
+            current_contract_error = (
+                replay_action_error
+                or build_manager_response_contract_error(
+                    prompt=contract_prompt,
+                    response=response,
+                    actions=replay_actions,
+                    hold_decision=replay_hold_decision,
+                )
+            )
+        except Exception as exc:
+            current_contract_error = f"contract_replay_failed:{exc.__class__.__name__}"
+        if current_contract_error:
+            contract_replay_status = "current_contract_error"
+        elif stored_error_message and (
+            stored_error_message not in MANAGER_CONTRACT_REPLAYABLE_ERRORS
+        ):
+            contract_replay_status = "stored_non_contract_error"
+        elif stored_error_message:
+            contract_replay_status = "stored_error_resolved_by_current_contract"
+        else:
+            contract_replay_status = "ok"
+        stored_action_count = _manager_action_item_count(actions)
+        current_replay_action_count = _manager_action_item_count(replay_actions)
+        current_replay_action_sections = {
+            key: len(_normalize_list(replay_actions.get(key)))
+            for key in sorted(ALLOWED_MANAGER_ACTIONS)
+            if len(_normalize_list(replay_actions.get(key))) > 0
+        }
+        current_replay_auto_create_preview = (
+            self._current_replay_auto_create_preview(replay_actions)
+        )
         watch_symbols = _normalize_list(hold_decision.get("watch_symbols"))[:12]
+        replay_watch_symbols = _normalize_list(
+            replay_hold_decision.get("watch_symbols")
+        )[:12]
+        replay_next_triggers: list[dict[str, Any]] = []
+        for row in _normalize_list(replay_hold_decision.get("next_triggers"))[:8]:
+            if not isinstance(row, dict):
+                continue
+            trigger = {
+                "symbol": str(row.get("symbol") or "").upper().strip(),
+                "market": normalize_market(row.get("market")),
+                "condition": _clean_text(
+                    row.get("condition") or row.get("trigger"),
+                    limit=240,
+                ),
+                "price": _safe_float(
+                    row.get("price")
+                    or row.get("trigger_price")
+                    or row.get("entry_trigger_price")
+                    or row.get("entry_price")
+                ),
+                "reason": _clean_text(row.get("reason"), limit=240),
+            }
+            if any(
+                trigger.get(key) not in (None, "", [], {})
+                for key in ("symbol", "market", "condition", "reason")
+            ) or _safe_float(trigger.get("price")) > 0:
+                replay_next_triggers.append(trigger)
+        replay_data_gaps = [
+            _clean_text(row, limit=240)
+            for row in _normalize_list(replay_hold_decision.get("data_gaps"))[:8]
+            if _clean_text(row, limit=240)
+        ]
         return {
             key: value
             for key, value in {
                 "status": "ok",
                 "run_id": run.get("id"),
                 "run_at": run.get("run_at"),
+                "manager_run_status": run.get("status"),
                 "mode": run.get("mode"),
                 "model": run.get("model"),
-                "action_count": _manager_action_item_count(actions),
+                "stored_error_message": stored_error_message,
+                "current_contract_error": current_contract_error,
+                "contract_replay_status": contract_replay_status,
+                "action_count": stored_action_count,
+                "current_replay_action_count": current_replay_action_count,
+                "current_replay_auto_action_count": max(
+                    0,
+                    current_replay_action_count - stored_action_count,
+                ),
+                "current_replay_action_sections": current_replay_action_sections,
+                "current_replay_auto_create_preview": (
+                    current_replay_auto_create_preview
+                ),
+                "current_replay_hold_summary": str(
+                    replay_hold_decision.get("summary") or ""
+                )[:500],
+                "current_replay_watch_symbols": replay_watch_symbols,
+                "current_replay_next_triggers": replay_next_triggers,
+                "current_replay_data_gaps": replay_data_gaps,
+                "current_replay_pressure_status": current_replay_pressure.get("status"),
+                "current_replay_pressure_level": current_replay_pressure.get(
+                    "pressure_level"
+                ),
+                "current_replay_pressure_source": current_replay_pressure.get(
+                    "pressure_source"
+                ),
+                "current_replay_zero_action_streak": current_replay_pressure.get(
+                    "zero_action_streak"
+                ),
+                "current_replay_binance_zero_action_streak": (
+                    current_replay_pressure.get("binance_zero_action_streak")
+                ),
+                "current_replay_binance_activity_gap_status": (
+                    current_replay_gap.get("status")
+                ),
+                "current_replay_binance_entry_stale_hours": current_replay_gap.get(
+                    "binance_entry_stale_hours"
+                ),
+                "current_replay_binance_candidate_symbols": _normalize_list(
+                    current_replay_gap.get("candidate_symbols")
+                )[:8],
                 "decision_inputs": list(prompt.get("decision_inputs") or [])[:24],
                 "proactive_pressure_status": proactive_pressure.get("status"),
                 "proactive_pressure_level": proactive_pressure.get("pressure_level"),
                 "proactive_zero_action_streak": proactive_pressure.get(
                     "zero_action_streak"
+                ),
+                "proactive_binance_zero_action_streak": proactive_pressure.get(
+                    "binance_zero_action_streak"
+                ),
+                "proactive_effective_zero_action_streak": proactive_pressure.get(
+                    "effective_zero_action_streak"
+                ),
+                "proactive_pressure_source": proactive_pressure.get(
+                    "pressure_source"
+                ),
+                "proactive_binance_activity_gap_status": binance_activity_gap.get(
+                    "status"
+                ),
+                "proactive_binance_entry_stale_hours": binance_activity_gap.get(
+                    "binance_entry_stale_hours"
                 ),
                 "proactive_candidate_count": proactive_pressure.get(
                     "candidate_count"
@@ -7037,8 +7746,153 @@ class BinanceBlockTrader:
                     in {"status", "total_chars", "target_chars", "warn_chars", "max_chars"}
                 },
             }.items()
-            if value not in (None, "", [], {})
+            if key == "current_contract_error" or value not in (None, "", [], {})
         }
+
+    @staticmethod
+    def _current_replay_auto_create_preview(
+        actions: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(actions, dict):
+            return []
+        previews: list[dict[str, Any]] = []
+        for row in _normalize_list(actions.get("create_blocks")):
+            if not isinstance(row, dict):
+                continue
+            metadata = (
+                row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            )
+            if not metadata.get("auto_materialized_validation_repair_action"):
+                continue
+            preview: dict[str, Any] = {}
+            symbol = str(row.get("symbol") or row.get("code") or "").upper().strip()
+            market = normalize_market(row.get("market") or row.get("venue"))
+            side = normalize_position_side(row.get("side") or row.get("stance"))
+            if symbol:
+                preview["symbol"] = symbol
+            if market:
+                preview["market"] = market
+            if side:
+                preview["side"] = side
+            for key in ("entry_style", "entry_trigger_operator"):
+                value = _clean_text(row.get(key), limit=80)
+                if value:
+                    preview[key] = value
+            numeric_keys = (
+                "entry_trigger_price",
+                "entry_price",
+                "target_price",
+                "stop_price",
+                "qty",
+                "quote_budget_usdt",
+                "quote_budget_krw",
+                "min_executable_notional_usdt",
+                "min_executable_notional_krw",
+                "min_executable_qty",
+            )
+            for key in numeric_keys:
+                value = _safe_float(row.get(key))
+                if value > 0:
+                    preview[key] = value
+            entry_price = _safe_float(
+                row.get("entry_price") or row.get("entry_trigger_price")
+            )
+            qty = _safe_float(row.get("qty"))
+            quote_budget_krw = _safe_float(row.get("quote_budget_krw"))
+            quote_budget_usdt = _safe_float(row.get("quote_budget_usdt"))
+            if entry_price > 0 and qty > 0:
+                estimate_key = (
+                    "notional_estimate_krw"
+                    if market == UPBIT_SPOT_MARKET or quote_budget_krw > 0
+                    else "notional_estimate_usdt"
+                )
+                preview[estimate_key] = entry_price * qty
+            elif quote_budget_krw > 0:
+                preview["notional_estimate_krw"] = quote_budget_krw
+            elif quote_budget_usdt > 0:
+                preview["notional_estimate_usdt"] = quote_budget_usdt
+            reason = _clean_text(metadata.get("auto_materialized_reason"), limit=160)
+            if reason:
+                preview["auto_materialized_reason"] = reason
+            if preview:
+                previews.append(preview)
+            if len(previews) >= 8:
+                break
+        return previews
+
+    @staticmethod
+    def _contract_replay_prompt_with_current_pressure(
+        prompt: dict[str, Any],
+        current_replay_pressure: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(prompt, dict) or not isinstance(current_replay_pressure, dict):
+            return prompt
+        replay_status = str(current_replay_pressure.get("status") or "").strip().lower()
+        if replay_status != "action_required":
+            return prompt
+        return {
+            **prompt,
+            "proactive_decision_pressure": current_replay_pressure,
+        }
+
+    def _current_replay_proactive_pressure(self, prompt: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(prompt, dict) or not prompt:
+            return {}
+        candidates: list[dict[str, Any]] = []
+
+        def add_candidates(source: Any) -> None:
+            rows = source.get("items") if isinstance(source, dict) else source
+            for row in _as_list(rows):
+                if not isinstance(row, dict):
+                    continue
+                symbol = _clean_text(row.get("symbol") or row.get("code"), limit=40)
+                market = normalize_market(row.get("market") or row.get("venue"))
+                marker = (symbol.upper(), market)
+                if symbol and marker in seen:
+                    continue
+                if symbol:
+                    seen.add(marker)
+                candidates.append(row)
+
+        seen: set[tuple[str, str]] = set()
+        add_candidates(prompt.get("candidates"))
+        pressure = (
+            prompt.get("proactive_decision_pressure")
+            if isinstance(prompt.get("proactive_decision_pressure"), dict)
+            else {}
+        )
+        add_candidates(pressure.get("top_candidates"))
+        if not candidates:
+            return {}
+        growth_governor = (
+            prompt.get("growth_governor")
+            if isinstance(prompt.get("growth_governor"), dict)
+            else {"allow_new_blocks": True}
+        )
+        live_authority = (
+            prompt.get("live_authority")
+            if isinstance(prompt.get("live_authority"), dict)
+            else {}
+        )
+        validation_repair = (
+            prompt.get("validation_repair")
+            if isinstance(prompt.get("validation_repair"), dict)
+            else {}
+        )
+        try:
+            return self._proactive_decision_pressure(
+                previous_manager_runs=self.repository.list_manager_runs(
+                    limit=5,
+                    include_payload=True,
+                ),
+                executable_candidates=candidates,
+                growth_governor=growth_governor,
+                live_authority=live_authority,
+                validation_repair=validation_repair,
+            )
+        except Exception:
+            logger.exception("binance status current pressure replay failed")
+            return {"status": "replay_failed"}
 
     async def snapshot(self) -> dict[str, Any]:
         account = build_normalize_account_snapshot(
@@ -7336,16 +8190,23 @@ class BinanceBlockTrader:
         executable_candidates: list[dict[str, Any]],
         growth_governor: dict[str, Any],
         live_authority: dict[str, Any],
+        validation_repair: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         zero_action_streak = 0
+        previous_error_streak = 0
+        binance_zero_action_streak = 0
+        binance_previous_error_streak = 0
         latest_hold: dict[str, Any] = {}
         for run in previous_manager_runs:
             if not isinstance(run, dict):
                 continue
-            if str(run.get("status") or "").lower() == "error":
-                break
             if _manager_action_item_count(run.get("actions")) > 0:
                 break
+            is_error = str(run.get("status") or "").lower() == "error"
+            if is_error and not self._manager_error_counts_as_no_action_pressure(run):
+                break
+            if is_error:
+                previous_error_streak += 1
             zero_action_streak += 1
             response = (
                 run.get("response")
@@ -7360,7 +8221,23 @@ class BinanceBlockTrader:
             if hold:
                 latest_hold = hold
 
-        candidates = self._compact_pressure_candidates(executable_candidates, limit=8)
+        for run in previous_manager_runs:
+            if not isinstance(run, dict):
+                continue
+            if _manager_binance_action_item_count(run.get("actions")) > 0:
+                break
+            is_error = str(run.get("status") or "").lower() == "error"
+            if is_error and not self._manager_error_counts_as_no_action_pressure(run):
+                break
+            if is_error:
+                binance_previous_error_streak += 1
+            binance_zero_action_streak += 1
+
+        candidates = self._compact_pressure_candidates(
+            executable_candidates,
+            limit=8,
+            validation_repair=validation_repair,
+        )
         strong_candidates = [
             row
             for row in candidates
@@ -7369,15 +8246,24 @@ class BinanceBlockTrader:
         ]
         allow_new = bool(growth_governor.get("allow_new_blocks", True))
         live_grade = _clean_text(live_authority.get("live_grade"), limit=40)
+        activity_gap = self._binance_market_activity_gap(executable_candidates)
+        effective_zero_action_streak = zero_action_streak
+        pressure_source = "manager_zero_action_streak"
+        if activity_gap and binance_zero_action_streak >= effective_zero_action_streak:
+            effective_zero_action_streak = binance_zero_action_streak
+            pressure_source = "binance_activity_gap"
+        elif effective_zero_action_streak == 0:
+            pressure_source = "candidate_presence"
+        has_pressure_candidate = bool(candidates) or bool(activity_gap)
         status = "idle"
         pressure_level = "none"
-        if zero_action_streak >= 2 and candidates and allow_new:
+        if effective_zero_action_streak >= 2 and has_pressure_candidate and allow_new:
             status = "action_required"
             pressure_level = "high"
-        elif zero_action_streak >= 1 and candidates:
+        elif effective_zero_action_streak >= 1 and has_pressure_candidate:
             status = "watch"
             pressure_level = "medium"
-        elif candidates:
+        elif has_pressure_candidate:
             status = "candidate_present"
             pressure_level = "low"
         if status == "idle":
@@ -7385,12 +8271,22 @@ class BinanceBlockTrader:
                 "version": "binance_proactive_decision_pressure_v1",
                 "status": "idle",
                 "zero_action_streak": zero_action_streak,
+                "previous_error_streak": previous_error_streak,
+                "binance_zero_action_streak": binance_zero_action_streak,
+                "binance_previous_error_streak": binance_previous_error_streak,
+                "effective_zero_action_streak": effective_zero_action_streak,
+                "pressure_source": pressure_source,
             }
-        return {
+        pressure = {
             "version": "binance_proactive_decision_pressure_v1",
             "status": status,
             "pressure_level": pressure_level,
             "zero_action_streak": zero_action_streak,
+            "previous_error_streak": previous_error_streak,
+            "binance_zero_action_streak": binance_zero_action_streak,
+            "binance_previous_error_streak": binance_previous_error_streak,
+            "effective_zero_action_streak": effective_zero_action_streak,
+            "pressure_source": pressure_source,
             "candidate_count": len(candidates),
             "strong_candidate_count": len(strong_candidates),
             "growth_governor_mode": _clean_text(
@@ -7429,12 +8325,159 @@ class BinanceBlockTrader:
                 "defer_due_to_safety_gate",
             ],
         }
+        if activity_gap:
+            pressure["binance_market_activity_gap"] = activity_gap
+        return pressure
+
+    def _binance_market_activity_gap(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        def candidate_binance_market(row: dict[str, Any]) -> str:
+            raw_market = row.get("market") or row.get("venue")
+            explicit_market = explicit_market_scope(raw_market)
+            if explicit_market in {"spot", "futures"}:
+                return explicit_market
+            if str(raw_market or "").strip():
+                return ""
+            symbol = str(row.get("symbol") or "").upper().strip()
+            if symbol and not symbol.startswith("KRW-") and symbol.endswith("USDT"):
+                return "spot"
+            return ""
+
+        binance_candidates_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in candidates:
+            market = candidate_binance_market(row)
+            symbol = str(row.get("symbol") or "").upper().strip()
+            if market not in {"spot", "futures"} or not symbol:
+                continue
+            binance_candidates_by_key.setdefault((symbol, market), row)
+        binance_candidates = list(binance_candidates_by_key.values())
+        if not binance_candidates:
+            return {}
+        activity = self.repository.entry_order_activity()
+        binance_activity = (
+            activity.get("binance") if isinstance(activity.get("binance"), dict) else {}
+        )
+        latest_binance_at = str(binance_activity.get("latest_entry_at") or "")
+        latest_binance_market = str(binance_activity.get("latest_entry_market") or "")
+        latest_dt = _parse_iso_datetime(latest_binance_at)
+        stale_hours = 0.0
+        status = ""
+        if latest_dt is None:
+            status = "no_binance_entries"
+        else:
+            stale_hours = max(
+                (datetime.now(timezone.utc) - latest_dt).total_seconds() / 3600.0,
+                0.0,
+            )
+            if stale_hours >= 24.0:
+                status = "stale_binance_entries"
+        if not status:
+            return {}
+        upbit_activity = (
+            activity.get(UPBIT_SPOT_MARKET)
+            if isinstance(activity.get(UPBIT_SPOT_MARKET), dict)
+            else {}
+        )
+        candidate_markets = sorted(
+            {
+                candidate_binance_market(row)
+                for row in binance_candidates
+                if candidate_binance_market(row) in {"spot", "futures"}
+            }
+        )
+        candidate_symbols = [
+            symbol
+            for symbol in dict.fromkeys(
+                _clean_text(row.get("symbol"), limit=32) for row in binance_candidates
+            )
+            if symbol
+        ]
+        candidate_snapshots: list[dict[str, Any]] = []
+        for row in binance_candidates[:6]:
+            calculated = (
+                row.get("calculated") if isinstance(row.get("calculated"), dict) else {}
+            )
+            snapshot = {
+                key: value
+                for key, value in {
+                    "symbol": _clean_text(row.get("symbol"), limit=32),
+                    "market": candidate_binance_market(row),
+                    "side": normalize_position_side(row.get("side") or row.get("stance")),
+                    "confidence": _safe_float(row.get("confidence")),
+                    "entry_style": _clean_text(
+                        row.get("entry_style") or calculated.get("entry_style"),
+                        limit=40,
+                    ),
+                    "entry_price": _safe_float(
+                        row.get("entry_price")
+                        or calculated.get("entry_price")
+                        or calculated.get("entry_price_usdt")
+                    ),
+                    "target_price": _safe_float(
+                        row.get("target_price")
+                        or calculated.get("target_price")
+                        or calculated.get("target_price_usdt")
+                    ),
+                    "stop_price": _safe_float(
+                        row.get("stop_price")
+                        or calculated.get("stop_price")
+                        or calculated.get("stop_price_usdt")
+                    ),
+                    "quote_budget_usdt": _safe_float(
+                        row.get("quote_budget_usdt")
+                        or calculated.get("quote_budget_usdt")
+                    ),
+                }.items()
+                if value not in (None, "", [], {}, 0, 0.0)
+            }
+            if snapshot:
+                candidate_snapshots.append(snapshot)
+        return {
+            "version": "binance_market_activity_gap_v1",
+            "status": status,
+            "latest_binance_entry_at": latest_binance_at,
+            "latest_binance_entry_market": latest_binance_market,
+            "latest_upbit_entry_at": str(upbit_activity.get("latest_entry_at") or ""),
+            "binance_entry_stale_hours": round(stale_hours, 3),
+            "binance_candidate_count": len(binance_candidates),
+            "candidate_markets": candidate_markets,
+            "candidate_symbols": candidate_symbols[:6],
+            "candidate_snapshots": candidate_snapshots,
+            "manager_instruction": (
+                "If safety, validation, spread/depth, funding, and reward/risk gates "
+                "are comparable, prefer at least one Binance spot/futures waiting "
+                "probe before another Upbit-only probe; do not bypass validation gates."
+            ),
+        }
+
+    @staticmethod
+    def _manager_error_counts_as_no_action_pressure(run: dict[str, Any]) -> bool:
+        error_message = _clean_text(run.get("error_message"), limit=240).lower()
+        pressure_error_tokens = (
+            "validation_repair_resolution_missing_from_model",
+            "validation_repair_action_missing_from_model",
+            "binance_activity_gap_resolution_missing_from_model",
+        )
+        if not any(token in error_message for token in pressure_error_tokens):
+            return False
+        if "binance_activity_gap_resolution_missing_from_model" in error_message:
+            return True
+        response = run.get("response") if isinstance(run.get("response"), dict) else {}
+        resolution = (
+            response.get("validation_repair_resolution")
+            if isinstance(response.get("validation_repair_resolution"), dict)
+            else {}
+        )
+        return bool(_as_list(resolution.get("resolved_candidates")))
 
     @staticmethod
     def _compact_pressure_candidates(
         candidates: list[dict[str, Any]],
         *,
         limit: int,
+        validation_repair: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for candidate in candidates[: max(int(limit), 0)]:
@@ -7445,8 +8488,25 @@ class BinanceBlockTrader:
                 if isinstance(candidate.get("calculated"), dict)
                 else {}
             )
+            market_inputs = (
+                calculated.get("market_inputs")
+                if isinstance(calculated.get("market_inputs"), dict)
+                else {}
+            )
+            sizing_inputs = (
+                calculated.get("sizing_inputs")
+                if isinstance(calculated.get("sizing_inputs"), dict)
+                else {}
+            )
+            pattern_live_crosscheck = (
+                calculated.get("pattern_live_crosscheck")
+                if isinstance(calculated.get("pattern_live_crosscheck"), dict)
+                else {}
+            )
             market = _clean_text(candidate.get("market"), limit=32)
             if normalize_market(market) == UPBIT_SPOT_MARKET:
+                symbol = str(candidate.get("symbol") or "").upper().strip()
+                generic_price_is_krw = symbol.startswith("KRW-")
                 has_krw_price_context = any(
                     _safe_float(source.get(key)) > 0
                     for source in (candidate, calculated)
@@ -7457,6 +8517,17 @@ class BinanceBlockTrader:
                         "quote_budget_krw",
                     )
                 )
+                if not has_krw_price_context and generic_price_is_krw:
+                    has_krw_price_context = any(
+                        _safe_float(source.get(key)) > 0
+                        for source in (candidate, calculated)
+                        for key in (
+                            "entry_price",
+                            "target_price",
+                            "stop_price",
+                            "quote_budget",
+                        )
+                    )
                 if not has_krw_price_context:
                     continue
                 entry_price = (
@@ -7477,6 +8548,14 @@ class BinanceBlockTrader:
                     or candidate.get("stop_price")
                     or calculated.get("stop_price")
                 )
+                quote_budget_key = "quote_budget_krw"
+                quote_budget = (
+                    candidate.get("quote_budget_krw")
+                    or calculated.get("quote_budget_krw")
+                    or sizing_inputs.get("quote_budget_krw")
+                    or candidate.get("quote_budget")
+                    or calculated.get("quote_budget")
+                )
             else:
                 entry_price = (
                     candidate.get("entry_price")
@@ -7493,6 +8572,27 @@ class BinanceBlockTrader:
                     or calculated.get("stop_price")
                     or calculated.get("stop_price_usdt")
                 )
+                quote_budget_key = "quote_budget_usdt"
+                quote_budget = (
+                    candidate.get("quote_budget_usdt")
+                    or calculated.get("quote_budget_usdt")
+                    or sizing_inputs.get("quote_budget_usdt")
+                    or candidate.get("quote_budget")
+                    or calculated.get("quote_budget")
+                )
+            spread_bps = (
+                candidate.get("spread_bps")
+                or calculated.get("spread_bps")
+                or market_inputs.get("spread_bps")
+                or pattern_live_crosscheck.get("spread_bps")
+            )
+            book_fresh = (
+                candidate.get("book_fresh")
+                if candidate.get("book_fresh") is not None
+                else calculated.get("book_fresh")
+                if calculated.get("book_fresh") is not None
+                else market_inputs.get("book_fresh")
+            )
             payload = {
                 "symbol": _clean_text(candidate.get("symbol"), limit=32),
                 "market": market,
@@ -7509,6 +8609,18 @@ class BinanceBlockTrader:
                 "entry_price": entry_price,
                 "target_price": target_price,
                 "stop_price": stop_price,
+                quote_budget_key: quote_budget,
+                "spread_bps": spread_bps,
+                "book_fresh": book_fresh,
+                "funding_rate": pattern_live_crosscheck.get("funding_rate"),
+                "recommended_entry_mode": _clean_text(
+                    pattern_live_crosscheck.get("recommended_entry_mode"),
+                    limit=40,
+                ),
+                "pattern_status": _clean_text(
+                    pattern_live_crosscheck.get("status"),
+                    limit=40,
+                ),
                 "reason": _clean_text(
                     candidate.get("reason")
                     or candidate.get("reason_md")
@@ -7516,6 +8628,18 @@ class BinanceBlockTrader:
                     limit=220,
                 ),
             }
+            repair_design = (
+                BinanceBlockTrader._validation_repair_probe_design_for_pressure_candidate(
+                    market=market,
+                    side=payload.get("side"),
+                    entry_price=entry_price,
+                    target_price=target_price,
+                    stop_price=stop_price,
+                    validation_repair=validation_repair,
+                )
+            )
+            if repair_design:
+                payload["validation_repair_probe_design"] = repair_design
             compact = {
                 key: value
                 for key, value in payload.items()
@@ -7524,6 +8648,218 @@ class BinanceBlockTrader:
             if compact:
                 rows.append(compact)
         return rows
+
+    @staticmethod
+    def _validation_repair_probe_design_for_pressure_candidate(
+        *,
+        market: Any,
+        side: Any,
+        entry_price: Any,
+        target_price: Any,
+        stop_price: Any,
+        validation_repair: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        repair = validation_repair if isinstance(validation_repair, dict) else {}
+        max_stop_risk_pct = _safe_float(repair.get("max_stop_risk_pct"))
+        min_reward_risk = _safe_float(repair.get("min_reward_risk"))
+        if max_stop_risk_pct <= 0 or min_reward_risk <= 0:
+            return {}
+        entry = _safe_float(entry_price)
+        target = _safe_float(target_price)
+        original_stop = _safe_float(stop_price)
+        if entry <= 0 or target <= 0 or original_stop <= 0:
+            return {}
+        normalized_side = normalize_position_side(side)
+        current_structure = build_crypto_reward_risk(
+            side=normalized_side,
+            entry_price=entry,
+            target_price=target,
+            stop_price=original_stop,
+        )
+        current_stop_risk_pct = _safe_float(current_structure.get("stop_risk_pct"))
+        if str(current_structure.get("status") or "") != "ok":
+            return {}
+        current_reward_risk = _safe_float(current_structure.get("reward_risk"))
+        normalized_market = normalize_market(market)
+
+        def attach_notional_floor(design: dict[str, Any], *, reference_entry: float) -> None:
+            notional_floor = (
+                VALIDATION_REPAIR_MIN_KRW_NOTIONAL_FLOOR
+                if normalized_market == UPBIT_SPOT_MARKET
+                else VALIDATION_REPAIR_MIN_USDT_NOTIONAL_FLOOR
+            )
+            if notional_floor <= 0 or reference_entry <= 0:
+                return
+            notional_key = (
+                "min_executable_notional_krw"
+                if normalized_market == UPBIT_SPOT_MARKET
+                else "min_executable_notional_usdt"
+            )
+            design[notional_key] = round(notional_floor, 8)
+            design["min_executable_qty"] = round(notional_floor / reference_entry, 8)
+
+        if current_stop_risk_pct <= max_stop_risk_pct + 1e-9:
+            if build_reward_risk_meets_minimum(current_reward_risk, min_reward_risk):
+                return {}
+            adjusted_entry = (
+                (target + (min_reward_risk * original_stop))
+                / (1.0 + min_reward_risk)
+            )
+            if normalized_side == "short":
+                valid_trigger = entry < adjusted_entry < original_stop
+                trigger_operator = ">="
+            else:
+                valid_trigger = original_stop < adjusted_entry < entry
+                trigger_operator = "<="
+            if not valid_trigger:
+                return {}
+            adjusted_structure = build_crypto_reward_risk(
+                side=normalized_side,
+                entry_price=adjusted_entry,
+                target_price=target,
+                stop_price=original_stop,
+            )
+            if str(adjusted_structure.get("status") or "") != "ok":
+                return {}
+            reward_risk = _safe_float(adjusted_structure.get("reward_risk"))
+            stop_risk_pct = _safe_float(adjusted_structure.get("stop_risk_pct"))
+            if (
+                stop_risk_pct - 1e-9 > max_stop_risk_pct
+                or not build_reward_risk_meets_minimum(reward_risk, min_reward_risk)
+            ):
+                return {}
+            design = {
+                "resolution": "probe_waiting_block",
+                "entry_price": round(adjusted_entry, 8),
+                "entry_trigger_price": round(adjusted_entry, 8),
+                "entry_trigger_operator": trigger_operator,
+                "target_price": round(target, 8),
+                "stop_price": round(original_stop, 8),
+                "original_entry_price": round(entry, 8),
+                "original_reward_risk": round(current_reward_risk, 6),
+                "stop_risk_pct": round(stop_risk_pct, 6),
+                "max_stop_risk_pct": round(max_stop_risk_pct, 6),
+                "min_reward_risk": round(min_reward_risk, 6),
+                "reward_risk": round(reward_risk, 6),
+                "instruction": (
+                    "repairable: use this waiting entry trigger to satisfy "
+                    "validation repair reward/risk while preserving the current "
+                    "target/stop; create/update only if live spread/depth/funding "
+                    "gates agree."
+                ),
+            }
+            risk_budget_multiplier = _safe_float(repair.get("risk_budget_multiplier"))
+            if risk_budget_multiplier > 0:
+                design["risk_budget_multiplier"] = round(risk_budget_multiplier, 6)
+            attach_notional_floor(design, reference_entry=adjusted_entry)
+            return design
+
+        risk_fraction = max_stop_risk_pct / 100.0
+        if normalized_side == "short":
+            adjusted_stop = entry * (1.0 + risk_fraction)
+        else:
+            adjusted_stop = entry * (1.0 - risk_fraction)
+        adjusted_structure = build_crypto_reward_risk(
+            side=normalized_side,
+            entry_price=entry,
+            target_price=target,
+            stop_price=adjusted_stop,
+        )
+        if str(adjusted_structure.get("status") or "") != "ok":
+            return {}
+        reward_risk = _safe_float(adjusted_structure.get("reward_risk"))
+        if not build_reward_risk_meets_minimum(reward_risk, min_reward_risk):
+            return {}
+        design = {
+            "resolution": "probe_waiting_block",
+            "entry_price": round(entry, 8),
+            "target_price": round(target, 8),
+            "stop_price": round(adjusted_stop, 8),
+            "original_stop_price": round(original_stop, 8),
+            "original_stop_risk_pct": round(current_stop_risk_pct, 6),
+            "max_stop_risk_pct": round(max_stop_risk_pct, 6),
+            "min_reward_risk": round(min_reward_risk, 6),
+            "reward_risk": round(reward_risk, 6),
+            "instruction": (
+                "repairable: use create_blocks/update_blocks with this tightened "
+                "waiting probe geometry if live spread/depth/funding gates agree; "
+                "do not reject only because the original stop was wider."
+            ),
+        }
+        risk_budget_multiplier = _safe_float(repair.get("risk_budget_multiplier"))
+        if risk_budget_multiplier > 0:
+            design["risk_budget_multiplier"] = round(risk_budget_multiplier, 6)
+        attach_notional_floor(design, reference_entry=entry)
+        return design
+
+    @staticmethod
+    def _validation_repair_existing_probe_design_for_candidate(
+        *,
+        market: Any,
+        side: Any,
+        entry_price: Any,
+        target_price: Any,
+        stop_price: Any,
+        validation_repair: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        repair = validation_repair if isinstance(validation_repair, dict) else {}
+        max_stop_risk_pct = _safe_float(repair.get("max_stop_risk_pct"))
+        min_reward_risk = _safe_float(repair.get("min_reward_risk"))
+        if max_stop_risk_pct <= 0 or min_reward_risk <= 0:
+            return {}
+        entry = _safe_float(entry_price)
+        target = _safe_float(target_price)
+        stop = _safe_float(stop_price)
+        if entry <= 0 or target <= 0 or stop <= 0:
+            return {}
+        normalized_side = normalize_position_side(side)
+        structure = build_crypto_reward_risk(
+            side=normalized_side,
+            entry_price=entry,
+            target_price=target,
+            stop_price=stop,
+        )
+        if str(structure.get("status") or "") != "ok":
+            return {}
+        reward_risk = _safe_float(structure.get("reward_risk"))
+        stop_risk_pct = _safe_float(structure.get("stop_risk_pct"))
+        if stop_risk_pct - 1e-9 > max_stop_risk_pct:
+            return {}
+        if not build_reward_risk_meets_minimum(reward_risk, min_reward_risk):
+            return {}
+        design = {
+            "resolution": "probe_waiting_block",
+            "entry_price": round(entry, 8),
+            "target_price": round(target, 8),
+            "stop_price": round(stop, 8),
+            "stop_risk_pct": round(stop_risk_pct, 6),
+            "max_stop_risk_pct": round(max_stop_risk_pct, 6),
+            "min_reward_risk": round(min_reward_risk, 6),
+            "reward_risk": round(reward_risk, 6),
+            "instruction": (
+                "repair-compliant: candidate geometry already satisfies "
+                "validation repair risk/reward constraints; use only as a "
+                "small waiting probe if live spread/depth/funding gates agree."
+            ),
+        }
+        risk_budget_multiplier = _safe_float(repair.get("risk_budget_multiplier"))
+        if risk_budget_multiplier > 0:
+            design["risk_budget_multiplier"] = round(risk_budget_multiplier, 6)
+        normalized_market = normalize_market(market)
+        notional_floor = (
+            VALIDATION_REPAIR_MIN_KRW_NOTIONAL_FLOOR
+            if normalized_market == UPBIT_SPOT_MARKET
+            else VALIDATION_REPAIR_MIN_USDT_NOTIONAL_FLOOR
+        )
+        if notional_floor > 0:
+            notional_key = (
+                "min_executable_notional_krw"
+                if normalized_market == UPBIT_SPOT_MARKET
+                else "min_executable_notional_usdt"
+            )
+            design[notional_key] = round(notional_floor, 8)
+            design["min_executable_qty"] = round(notional_floor / entry, 8)
+        return design
 
     def _execution_status(self) -> dict[str, Any]:
         return {
@@ -8674,23 +10010,48 @@ class BinanceBlockTrader:
             if row.get("status") in {"open", "exit_pending"}
             and _safe_float(row.get("qty_open")) > 0
         ]
+        pending_entry_blocks = [
+            row
+            for row in active_rows
+            if row.get("status") == "entry_pending"
+            and normalize_market(row.get("market")) in {"spot", UPBIT_SPOT_MARKET, "futures"}
+            and _safe_float(row.get("qty_open") or row.get("qty_initial")) > 0
+        ]
         proposed_waiting_blocks = [
             row
             for row in active_rows
             if str(row.get("status") or "") == "proposed"
             and build_is_waiting_entry_block(row)
         ]
+        actions: list[dict[str, Any]] = []
         if proposed_waiting_blocks and self._account_equity_usdt(self._last_account_snapshot) <= 0:
             account = build_normalize_account_snapshot(
                 await self._collect_account_snapshot(),
                 default_upbit_usdt_krw_rate=self.config.upbit_usdt_krw_rate,
             )
             self._last_account_snapshot = account
-        waiting_blocks = [
+        expirable_waiting_blocks = [
             row
             for row in proposed_waiting_blocks
+            if self._execution_enabled(normalize_market(row.get("market")))
+        ]
+        waiting_blocks = [
+            row
+            for row in expirable_waiting_blocks
             if self._execution_enabled(normalize_market(row.get("market")), for_entry=True)
         ]
+        expired_waiting_block_ids: set[str] = set()
+        for block in expirable_waiting_blocks:
+            action = self._maybe_expire_stale_waiting_entry(block)
+            if action:
+                actions.append(action)
+                expired_waiting_block_ids.add(str(block.get("block_id") or ""))
+        if expired_waiting_block_ids:
+            waiting_blocks = [
+                row
+                for row in waiting_blocks
+                if str(row.get("block_id") or "") not in expired_waiting_block_ids
+            ]
         quote_keys = {
             (
                 normalize_market(row.get("market")),
@@ -8701,13 +10062,20 @@ class BinanceBlockTrader:
         }
         quotes = await self._collect_quotes([*open_blocks, *waiting_blocks])
         self.repository.save_quotes(list(quotes.values()))
-        actions: list[dict[str, Any]] = []
         for block in reconciliation_blocks:
             action = await self._maybe_reconcile_missing_spot_asset_block(block)
             if action:
                 actions.append(action)
+        for block in pending_entry_blocks:
+            action = await self._maybe_reconcile_pending_entry_block(block)
+            if action:
+                actions.append(action)
+        waiting_entry_checks: list[dict[str, Any]] = []
         for block in waiting_blocks:
-            action = await self._maybe_create_entry(block)
+            action = await self._maybe_create_entry(
+                block,
+                waiting_entry_checks=waiting_entry_checks,
+            )
             if action:
                 actions.append(action)
         for block in open_blocks:
@@ -8720,7 +10088,102 @@ class BinanceBlockTrader:
             "action_count": len(actions),
             "quote_count": len(quote_keys),
             "aux_quote_count": max(len(quotes) - len(quote_keys), 0),
+            "waiting_entry_checks": waiting_entry_checks,
         }
+
+    def _maybe_expire_stale_waiting_entry(
+        self,
+        block: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        max_age_sec = max(int(getattr(self.config, "waiting_entry_max_age_sec", 0)), 0)
+        if max_age_sec <= 0:
+            return None
+        if str(block.get("status") or "") != "proposed":
+            return None
+        if not build_is_waiting_entry_block(block):
+            return None
+        created_at = _parse_iso_datetime(block.get("created_at"))
+        updated_at = _parse_iso_datetime(block.get("updated_at"))
+        age_anchor_at = max(
+            candidate for candidate in (created_at, updated_at) if candidate is not None
+        ) if created_at is not None or updated_at is not None else None
+        if age_anchor_at is None:
+            return None
+        now = datetime.now(timezone.utc)
+        age_sec = max((now - age_anchor_at).total_seconds(), 0.0)
+        if age_sec < max_age_sec:
+            return None
+        block_id = str(block.get("block_id") or "")
+        symbol = str(block.get("symbol") or "").upper().strip()
+        market = normalize_market(block.get("market"))
+        metadata = dict(block.get("metadata") if isinstance(block.get("metadata"), dict) else {})
+        expiration = {
+            "status": "expired",
+            "symbol": symbol,
+            "market": market,
+            "age_sec": round(age_sec, 3),
+            "max_age_sec": max_age_sec,
+            "expired_at": now.isoformat(),
+            "created_at": str(block.get("created_at") or ""),
+            "updated_at": str(block.get("updated_at") or ""),
+            "age_anchor_at": age_anchor_at.isoformat(),
+        }
+        metadata["waiting_entry_expired"] = expiration
+        message = (
+            f"waiting entry expired after {age_sec / 3600:.1f}h "
+            f"(max {max_age_sec / 3600:.1f}h)"
+        )
+        updated = self.repository.update_block(
+            block_id,
+            {
+                "status": "closed",
+                "qty_open": 0.0,
+                "force_exit_requested": 0,
+                "closed_at": now.isoformat(),
+                "risk_note": message,
+                "metadata": metadata,
+            },
+        )
+        self.repository.add_event(
+            block_id,
+            "waiting_entry_expired",
+            message,
+            expiration,
+        )
+        return {
+            "status": "expired_waiting_entry",
+            "block_id": block_id,
+            "symbol": symbol,
+            "market": market,
+            "side": normalize_position_side(block.get("side")),
+            "qty": 0.0,
+            "requested_qty": _safe_float(block.get("qty_initial")),
+            "age_sec": age_sec,
+            "max_age_sec": max_age_sec,
+            "reason": "waiting_entry_expired",
+            "block": updated,
+        }
+
+    def _is_stale_waiting_entry_block(
+        self,
+        block: dict[str, Any],
+    ) -> bool:
+        max_age_sec = max(int(getattr(self.config, "waiting_entry_max_age_sec", 0)), 0)
+        if max_age_sec <= 0:
+            return False
+        if str(block.get("status") or "") != "proposed":
+            return False
+        if not build_is_waiting_entry_block(block):
+            return False
+        created_at = _parse_iso_datetime(block.get("created_at"))
+        updated_at = _parse_iso_datetime(block.get("updated_at"))
+        age_anchor_at = max(
+            candidate for candidate in (created_at, updated_at) if candidate is not None
+        ) if created_at is not None or updated_at is not None else None
+        if age_anchor_at is None:
+            return False
+        age_sec = max((datetime.now(timezone.utc) - age_anchor_at).total_seconds(), 0.0)
+        return age_sec >= max_age_sec
 
     @staticmethod
     def _is_missing_spot_asset_reconciliation_block(block: dict[str, Any]) -> bool:
@@ -8735,43 +10198,58 @@ class BinanceBlockTrader:
         error_payload = error if isinstance(error, dict) else {}
         quantity_context = error_payload.get("quantity_context")
         context = quantity_context if isinstance(quantity_context, dict) else {}
+        retry_context = (
+            context.get("insufficient_balance_retry_context")
+            if isinstance(context.get("insufficient_balance_retry_context"), dict)
+            else {}
+        )
         balance_source = str(context.get("balance_source") or "").strip().lower()
+        retry_balance_source = str(
+            retry_context.get("balance_source") or ""
+        ).strip().lower()
         message = " ".join(
             str(value or "")
             for value in (
                 block.get("risk_note"),
                 error_payload.get("message"),
                 context.get("error_message"),
+                context.get("insufficient_balance_retry_error"),
+                retry_context.get("error_message"),
             )
         ).lower()
-        return balance_source == "missing_asset" or "spot asset missing" in message
+        return (
+            balance_source == "missing_asset"
+            or retry_balance_source == "missing_asset"
+            or "spot asset missing" in message
+        )
 
-    async def _maybe_reconcile_missing_spot_asset_block(
+    def _reconcile_missing_spot_asset_block(
         self,
         block: dict[str, Any],
+        *,
+        account_status: str = "",
+        quantity_context: dict[str, Any] | None = None,
+        extra_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         market = normalize_market(block.get("market"))
         symbol = str(block.get("symbol") or "").upper().strip()
         block_id = str(block.get("block_id") or "")
         if not block_id or not symbol or market not in {"spot", UPBIT_SPOT_MARKET}:
             return None
-        account = await self._spot_exit_account_snapshot()
-        if not account:
-            return None
-        asset = self._spot_asset_for_symbol(account, symbol, market=market)
-        if asset is not None:
-            return None
         previous_qty = _safe_float(block.get("qty_open"))
         now = utc_now_iso()
         metadata = dict(block.get("metadata") if isinstance(block.get("metadata"), dict) else {})
+        context = quantity_context if isinstance(quantity_context, dict) else {}
         reconciliation = {
             "status": "missing_asset_confirmed",
             "symbol": symbol,
             "market": market,
             "previous_qty_open": previous_qty,
             "confirmed_at": now,
-            "account_status": str(account.get("status") or ""),
+            "account_status": str(account_status or ""),
         }
+        if context:
+            reconciliation["quantity_context"] = context
         metadata["exit_reconciled_missing_asset"] = reconciliation
         message = (
             f"reconciled missing spot asset for {symbol}; account snapshot has no "
@@ -8794,7 +10272,13 @@ class BinanceBlockTrader:
             message,
             reconciliation,
         )
-        return {
+        result_quantity_context = {
+            **context,
+            "balance_checked": True,
+            "balance_source": "missing_asset",
+            "reconciled": True,
+        }
+        result = {
             "status": "reconciled_missing_asset",
             "block_id": block_id,
             "symbol": symbol,
@@ -8802,13 +10286,299 @@ class BinanceBlockTrader:
             "side": build_binance_exit_order_side(block),
             "qty": 0.0,
             "requested_qty": previous_qty,
-            "quantity_context": {
-                "balance_checked": True,
-                "balance_source": "missing_asset",
-                "reconciled": True,
-            },
+            "quantity_context": result_quantity_context,
             "reason": "missing_spot_asset_reconciliation",
             "block": updated,
+        }
+        if extra_fields:
+            result.update(extra_fields)
+        return result
+
+    async def _maybe_reconcile_missing_spot_asset_block(
+        self,
+        block: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        market = normalize_market(block.get("market"))
+        symbol = str(block.get("symbol") or "").upper().strip()
+        block_id = str(block.get("block_id") or "")
+        if not block_id or not symbol or market not in {"spot", UPBIT_SPOT_MARKET}:
+            return None
+        account = await self._spot_exit_account_snapshot()
+        if not account:
+            return None
+        asset = self._spot_asset_for_symbol(account, symbol, market=market)
+        if asset is not None:
+            return None
+        return self._reconcile_missing_spot_asset_block(
+            block,
+            account_status=str(account.get("status") or ""),
+        )
+
+    def _pending_entry_order_evidence(self, block: dict[str, Any]) -> dict[str, Any]:
+        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        pending = (
+            metadata.get("entry_order_pending")
+            if isinstance(metadata.get("entry_order_pending"), dict)
+            else {}
+        )
+        order_id = str(pending.get("order_id") or "").strip()
+        response_status = str(pending.get("status") or "").strip().upper()
+        order_created_at = ""
+        order_updated_at = ""
+        for order in self.repository.list_orders(
+            block_id=str(block.get("block_id") or ""),
+            limit=20,
+        ):
+            if str(order.get("reason") or "") != "entry_order":
+                continue
+            response = order.get("response") if isinstance(order.get("response"), dict) else {}
+            filled_qty = build_response_filled_qty(response, requested_qty=0.0)
+            if filled_qty > 0:
+                return {
+                    "order_id": order_id or build_response_order_id(response),
+                    "status": str(response.get("status") or "").upper(),
+                    "fill_qty": filled_qty,
+                    "fill_price": build_filled_order_price(order),
+                    "order_created_at": str(order.get("created_at") or ""),
+                    "order_updated_at": str(order.get("updated_at") or ""),
+                }
+            order_id = order_id or build_response_order_id(response)
+            response_status = response_status or str(response.get("status") or "").upper()
+            if response_status:
+                order_created_at = str(order.get("created_at") or "")
+                order_updated_at = str(order.get("updated_at") or "")
+                break
+        if response_status != "NEW":
+            return {}
+        return {
+            "order_id": order_id,
+            "status": response_status,
+            "order_created_at": order_created_at,
+            "order_updated_at": order_updated_at,
+        }
+
+    def _maybe_release_stale_pending_entry(
+        self,
+        block: dict[str, Any],
+        *,
+        pending_order: dict[str, Any],
+        account_status: str,
+    ) -> dict[str, Any] | None:
+        market = normalize_market(block.get("market"))
+        if market not in {"spot", "futures"}:
+            return None
+        if str(pending_order.get("status") or "").strip().upper() != "NEW":
+            return None
+        max_age_sec = max(int(getattr(self.config, "entry_pending_max_age_sec", 0)), 0)
+        if max_age_sec <= 0:
+            return None
+        anchors = [
+            parsed
+            for parsed in (
+                _parse_iso_datetime(block.get("created_at")),
+                _parse_iso_datetime(block.get("updated_at")),
+                _parse_iso_datetime(pending_order.get("order_created_at")),
+                _parse_iso_datetime(pending_order.get("order_updated_at")),
+            )
+            if parsed is not None
+        ]
+        if not anchors:
+            return None
+        age_anchor_at = max(anchors)
+        now = datetime.now(timezone.utc)
+        age_sec = max((now - age_anchor_at).total_seconds(), 0.0)
+        if age_sec < max_age_sec:
+            return None
+        block_id = str(block.get("block_id") or "")
+        symbol = str(block.get("symbol") or "").upper().strip()
+        metadata = dict(block.get("metadata") if isinstance(block.get("metadata"), dict) else {})
+        release = {
+            "status": "released",
+            "symbol": symbol,
+            "market": market,
+            "order_id": str(pending_order.get("order_id") or ""),
+            "order_status": str(pending_order.get("status") or ""),
+            "age_sec": round(age_sec, 3),
+            "max_age_sec": max_age_sec,
+            "released_at": now.isoformat(),
+            "account_status": str(account_status or ""),
+            "age_anchor_at": age_anchor_at.isoformat(),
+        }
+        metadata["entry_order_stale_release"] = release
+        message = (
+            f"released stale pending entry for {symbol}; no account asset detected "
+            f"after {age_sec / 60:.1f}m"
+        )
+        updated = self.repository.update_block(
+            block_id,
+            {
+                "status": "closed",
+                "qty_open": 0.0,
+                "force_exit_requested": 0,
+                "closed_at": now.isoformat(),
+                "risk_note": message,
+                "metadata": metadata,
+            },
+        )
+        self.repository.add_event(
+            block_id,
+            "entry_pending_released",
+            message,
+            release,
+        )
+        return {
+            "status": "stale_pending_entry_released",
+            "block_id": block_id,
+            "symbol": symbol,
+            "market": market,
+            "side": build_entry_order_side(block),
+            "qty": 0.0,
+            "requested_qty": _safe_float(block.get("qty_initial") or block.get("qty_open")),
+            "age_sec": age_sec,
+            "max_age_sec": max_age_sec,
+            "reason": "stale_pending_entry_without_fill_or_asset",
+            "block": updated,
+            "entry_order_stale_release": release,
+        }
+
+    async def _maybe_reconcile_pending_entry_block(
+        self,
+        block: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        market = normalize_market(block.get("market"))
+        symbol = str(block.get("symbol") or "").upper().strip()
+        block_id = str(block.get("block_id") or "")
+        if (
+            str(block.get("status") or "") != "entry_pending"
+            or not block_id
+            or not symbol
+            or market not in {"spot", UPBIT_SPOT_MARKET, "futures"}
+        ):
+            return None
+        pending_order = self._pending_entry_order_evidence(block)
+        if not pending_order:
+            return None
+        asset_qty = 0.0
+        futures_position_amt = 0.0
+        account_status = ""
+        update_fields: dict[str, Any] = {}
+        fill_qty = _safe_float(pending_order.get("fill_qty"))
+        fill_price = _safe_float(pending_order.get("fill_price"))
+        if fill_qty > 0:
+            asset_qty = fill_qty
+            account_status = "order_fill_evidence"
+            if fill_price > 0:
+                update_fields["entry_price"] = fill_price
+        else:
+            account = await self._spot_exit_account_snapshot()
+            if not account or str(account.get("status") or "").lower() == "error":
+                return None
+            account_status = str(account.get("status") or "")
+            if market == "futures":
+                asset = self._futures_position_for_symbol(account, symbol=symbol)
+                if asset is None:
+                    release = self._maybe_release_stale_pending_entry(
+                        block,
+                        pending_order=pending_order,
+                        account_status=account_status,
+                    )
+                    if release:
+                        return release
+                    return None
+                position_side = self._futures_position_side(asset)
+                if position_side != normalize_position_side(block.get("side")):
+                    return None
+                futures_position_amt = self._futures_position_amt(asset)
+                asset_qty = abs(futures_position_amt)
+                if asset_qty <= 0:
+                    release = self._maybe_release_stale_pending_entry(
+                        block,
+                        pending_order=pending_order,
+                        account_status=account_status,
+                    )
+                    if release:
+                        return release
+                    return None
+                position_entry_price = _safe_float(
+                    asset.get("entry_price") or asset.get("entryPrice")
+                )
+                if position_entry_price > 0:
+                    update_fields["entry_price"] = position_entry_price
+            else:
+                asset = self._spot_asset_for_symbol(account, symbol, market=market)
+                if asset is None:
+                    release = self._maybe_release_stale_pending_entry(
+                        block,
+                        pending_order=pending_order,
+                        account_status=account_status,
+                    )
+                    if release:
+                        return release
+                    return None
+                asset_qty = _safe_float(asset.get("qty"))
+                if asset_qty <= 0:
+                    asset_qty = _safe_float(asset.get("available")) + _safe_float(asset.get("locked"))
+                if asset_qty <= 0:
+                    release = self._maybe_release_stale_pending_entry(
+                        block,
+                        pending_order=pending_order,
+                        account_status=account_status,
+                    )
+                    if release:
+                        return release
+                    return None
+        requested_qty = _safe_float(block.get("qty_initial") or block.get("qty_open"))
+        reconciled_qty = min(asset_qty, requested_qty) if requested_qty > 0 else asset_qty
+        if reconciled_qty <= 0:
+            return None
+        now = utc_now_iso()
+        metadata = dict(block.get("metadata") if isinstance(block.get("metadata"), dict) else {})
+        reconciliation = {
+            "status": "asset_detected",
+            "symbol": symbol,
+            "market": market,
+            "order_id": pending_order.get("order_id") or "",
+            "order_status": pending_order.get("status") or "",
+            "asset_qty": asset_qty,
+            "reconciled_qty": reconciled_qty,
+            "confirmed_at": now,
+            "account_status": account_status,
+        }
+        if fill_qty > 0:
+            reconciliation["fill_qty"] = fill_qty
+        if fill_price > 0:
+            reconciliation["fill_price"] = fill_price
+        if market == "futures":
+            reconciliation["position_amt"] = futures_position_amt
+        metadata["entry_order_reconciliation"] = reconciliation
+        message = f"reconciled pending entry for {symbol}; account asset detected"
+        updated = self.repository.update_block(
+            block_id,
+            {
+                **update_fields,
+                "status": "open",
+                "qty_open": reconciled_qty,
+                "opened_at": now,
+                "risk_note": message,
+                "metadata": metadata,
+            },
+        )
+        self.repository.add_event(
+            block_id,
+            "entry_reconciled_open",
+            message,
+            reconciliation,
+        )
+        return {
+            "status": "entry_reconciled_open",
+            "block_id": block_id,
+            "symbol": symbol,
+            "market": market,
+            "side": build_entry_order_side(block),
+            "qty": reconciled_qty,
+            "reason": "pending_entry_asset_detected",
+            "block": updated,
+            "entry_order_reconciliation": reconciliation,
         }
 
     @staticmethod
@@ -8983,19 +10753,37 @@ class BinanceBlockTrader:
             lane_balance=lane_balance,
         )
 
+    @staticmethod
+    def _manager_prompt_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        visible = build_visible_block_rows(
+            blocks,
+            visible_statuses=VISIBLE_BLOCK_STATUSES,
+        )
+        return [
+            row
+            for row in visible
+            if not (
+                str(row.get("status") or "") == "paused"
+                and _safe_float(row.get("qty_open")) <= 0
+            )
+        ]
+
     async def run_manager_once(
         self,
         *,
         candidates: list[dict[str, Any]] | None = None,
         universe: list[str] | None = None,
     ) -> dict[str, Any]:
+        manager_started = time.perf_counter()
         if self.kill_switch().get("enabled"):
             return {
                 "status": "blocked",
                 "reason": "kill_switch_enabled",
                 "applied": {"created": [], "updated": [], "closed": [], "paused": []},
             }
-        blocks = self.repository.list_blocks(include_closed=False)
+        blocks = self._manager_prompt_blocks(
+            self.repository.list_blocks(include_closed=False)
+        )
         base_symbols = self._manager_symbols(
             blocks=blocks,
             candidates=candidates,
@@ -9175,7 +10963,11 @@ class BinanceBlockTrader:
             compact_value=build_compact_prompt_value,
         )
         prompt_candidates = [
-            self._compact_manager_candidate_for_prompt(row)
+            self._compact_manager_candidate_for_prompt(
+                row,
+                validation_repair=validation_repair,
+                entry_gate_policy=entry_gate_policy,
+            )
             for row in executable_candidates
             if isinstance(row, dict)
         ]
@@ -9235,6 +11027,7 @@ class BinanceBlockTrader:
             executable_candidates=executable_candidates,
             growth_governor=growth_governor,
             live_authority=live_authority,
+            validation_repair=validation_repair,
         )
         if str(proactive_pressure.get("status") or "") != "idle":
             prompt["proactive_decision_pressure"] = proactive_pressure
@@ -9242,33 +11035,79 @@ class BinanceBlockTrader:
             if "proactive_decision_pressure" not in decision_inputs:
                 decision_inputs.append("proactive_decision_pressure")
             prompt["decision_inputs"] = decision_inputs
+        legacy_manager_input = json.loads(_json_dumps(prompt))
         _attach_jue_wiki_prompt_context(
             prompt,
             jue_wiki,
             max_chars=self.config.prompt_max_chars,
         )
-        prompt["native_thread_mode"] = "ephemeral"
+        prompt["native_thread_mode"] = "daily"
+        prompt["native_thread_key"] = "binance:block_manager:{date}"
         latency_guard = build_manager_latency_guard_from_runs(
             self.repository.list_manager_runs(limit=6, include_payload=False),
             target_chars=self.config.prompt_target_chars,
         )
+        if bool(latency_guard.get("active")):
+            prompt["native_thread_mode"] = "ephemeral"
+            prompt.pop("native_thread_key", None)
         build_apply_manager_latency_guard(
             prompt,
             latency_guard=latency_guard,
             target_chars=self.config.prompt_target_chars,
         )
+        raw_prompt_chars = len(_json_dumps(prompt))
         build_finalize_prompt_budget(
             prompt,
             target_chars=self.config.prompt_target_chars,
             warn_chars=self.config.prompt_warn_chars,
             max_chars=self.config.prompt_max_chars,
         )
+        _attach_jue_wiki_decision_gate(
+            prompt,
+            jue_wiki,
+            trusted_read_mode=self.config.jue_wiki_read_mode,
+        )
+        prompt = _apply_required_wiki_prompt_read_policy(
+            prompt,
+            trusted_read_mode=self.config.jue_wiki_read_mode,
+        )
+        wiki_gate_error = _required_wiki_gate_prompt_error(
+            prompt,
+            trusted_read_mode=self.config.jue_wiki_read_mode,
+        )
         response: dict[str, Any] = {}
+        actions: dict[str, list[dict[str, Any]]] = {
+            key: [] for key in sorted(ALLOWED_MANAGER_ACTIONS)
+        }
+        wiki_suppression_audit: dict[str, Any] = {}
+        context_generation_ms = (time.perf_counter() - manager_started) * 1000.0
+        llm_latency_ms = 0.0
         try:
+            if wiki_gate_error:
+                raise RuntimeError(wiki_gate_error)
+            prompt = build_manager_prompt_bundle(
+                prompt,
+                audit_prompt_builder=lambda value: (
+                    build_compact_manager_storage_payload(
+                        value,
+                        limit=MANAGER_PROMPT_STORAGE_LIMIT,
+                        label="binance_manager_prompt",
+                    )
+                ),
+            ).runtime_prompt
+            preserve_wiki_context_packet(prompt, jue_wiki)
+            prompt = apply_jue_wiki_prompt_policy(
+                prompt,
+                target_read_mode=self.config.jue_wiki_read_mode,
+            )
             budget_error = build_prompt_budget_error(prompt)
             if budget_error:
                 raise RuntimeError(budget_error)
-            response = await self._complete_manager_json(prompt)
+            llm_started = time.perf_counter()
+            try:
+                response = await self._complete_manager_json(prompt)
+            finally:
+                llm_latency_ms = (time.perf_counter() - llm_started) * 1000.0
             actions = build_validate_manager_actions(
                 response,
                 normalize_create_payload=self._normalize_manager_contract_create_payload,
@@ -9277,6 +11116,8 @@ class BinanceBlockTrader:
             actions = self._apply_validation_repair_to_actions(
                 actions,
                 validation_repair=validation_repair,
+                manager_response=response,
+                prompt=prompt,
             )
             actions = _attach_prompt_jue_wiki_decision_adjustments_to_actions(
                 actions,
@@ -9303,32 +11144,105 @@ class BinanceBlockTrader:
             )
             if contract_error:
                 raise RuntimeError(contract_error)
+            actions, wiki_suppression_audit = apply_binance_wiki_decision_gate(
+                actions,
+                prompt.get("jue_wiki_decision_gate", {}),
+                trusted_read_mode=self.config.jue_wiki_read_mode,
+                current_blocks=blocks,
+            )
+            telemetry = ManagerRunTelemetryV1(
+                venue="binance",
+                context_generation_ms=round(context_generation_ms, 3),
+                prompt_chars=len(_json_dumps(prompt)),
+                llm_latency_ms=round(llm_latency_ms, 3),
+                raw_prompt_chars=raw_prompt_chars,
+                action_count=manager_action_count(actions),
+                result_status="ok",
+                fill_provenance=build_fill_provenance_summary(actions=actions),
+            ).to_dict()
+            response = {
+                **response,
+                "jue_wiki_suppression_audit": wiki_suppression_audit,
+                "manager_run_telemetry": telemetry,
+            }
             manager_run_id = self.repository.save_manager_run(
                 prompt=prompt,
                 response=response,
                 actions=actions,
                 model=str(getattr(self.codex_runtime, "resolved_model", self.config.llm_model)),
             )
+            wiki_shadow_recording_id = ""
+            if (
+                self.wiki_shadow_recording_recorder is not None
+                and self.config.jue_wiki_read_mode in {"shadow", "prefer"}
+                and isinstance(prompt.get("jue_wiki"), dict)
+            ):
+                try:
+                    shadow_recording = WikiShadowRecordingV1.from_run(
+                        venue="binance",
+                        run_id=f"binance:{uuid4().hex}:{manager_run_id}",
+                        manager_run_id=manager_run_id,
+                        legacy_manager_input=legacy_manager_input,
+                        source_runtime_prompt=prompt,
+                        final_actions=actions,
+                        wiki_suppression_count=int(
+                            wiki_suppression_audit.get("suppressed_new_risk_count") or 0
+                        ),
+                    )
+                    wiki_shadow_recording_id = str(
+                        self.wiki_shadow_recording_recorder(shadow_recording) or ""
+                    )
+                    telemetry["wiki_shadow_recording_id"] = wiki_shadow_recording_id
+                except Exception as exc:
+                    logger.warning("Binance Wiki shadow recording failed: %s", exc)
+            if wiki_shadow_recording_id:
+                self.repository.update_manager_run_shadow_recording_id(
+                    manager_run_id,
+                    wiki_shadow_recording_id,
+                )
             applied = await self._apply_manager_actions(
                 actions,
                 manager_run_id=manager_run_id,
             )
-            response = {**response, "applied": applied}
+            telemetry["fill_provenance"] = build_fill_provenance_summary(
+                actions=actions,
+                applied=applied,
+            )
+            response = {
+                **response,
+                "applied": applied,
+                "manager_run_telemetry": telemetry,
+            }
             self.repository.update_manager_run_response(manager_run_id, response)
             return {
                 "status": "ok",
                 "manager_run_id": manager_run_id,
                 "actions": actions,
+                "jue_wiki_suppression_audit": wiki_suppression_audit,
                 "hold_decision": hold_decision,
                 "lane_review": lane_review,
                 "applied": applied,
+                "wiki_shadow_recording_id": wiki_shadow_recording_id,
             }
         except Exception as exc:
             logger.warning("binance block manager failed: %s", exc)
+            response = {
+                **response,
+                "manager_run_telemetry": ManagerRunTelemetryV1(
+                    venue="binance",
+                    context_generation_ms=round(context_generation_ms, 3),
+                    prompt_chars=len(_json_dumps(prompt)),
+                    llm_latency_ms=round(llm_latency_ms, 3),
+                    raw_prompt_chars=raw_prompt_chars,
+                    action_count=manager_action_count(actions),
+                    result_status="error",
+                    fill_provenance=build_fill_provenance_summary(actions=actions),
+                ).to_dict(),
+            }
             manager_run_id = self.repository.save_manager_run(
                 prompt=prompt,
                 response=response,
-                actions={key: [] for key in sorted(ALLOWED_MANAGER_ACTIONS)},
+                actions=actions,
                 status="error",
                 error_message=str(exc),
                 model=str(getattr(self.codex_runtime, "resolved_model", self.config.llm_model)),
@@ -9343,6 +11257,8 @@ class BinanceBlockTrader:
                 "status": "error",
                 "manager_run_id": manager_run_id,
                 "error_message": str(exc),
+                "actions": actions,
+                "jue_wiki_suppression_audit": wiki_suppression_audit,
                 "applied": {
                     "adopted": [],
                     "created": [],
@@ -10758,6 +12674,27 @@ class BinanceBlockTrader:
             retry_error = str(retry_context.get("error_message") or "").strip()
             if retry_error:
                 quantity_context["insufficient_balance_retry_error"] = retry_error
+            if (
+                retry_qty <= 0
+                and str(retry_context.get("balance_source") or "").strip().lower()
+                == "missing_asset"
+                and bool(retry_context.get("balance_checked"))
+            ):
+                reconciliation_context = {
+                    "balance_checked": True,
+                    "balance_source": "missing_asset",
+                    "requested_qty": requested_qty,
+                    "insufficient_balance_retry": False,
+                    "insufficient_balance_retry_error": retry_error,
+                    "initial_quantity_context": quantity_context,
+                    "retry_quantity_context": retry_context,
+                }
+                return self._reconcile_missing_spot_asset_block(
+                    block,
+                    account_status=str(retry_context.get("account_status") or ""),
+                    quantity_context=reconciliation_context,
+                    extra_fields={"initial_order": initial_order},
+                )
             return None
         retry_context = {
             **retry_context,
@@ -11960,7 +13897,12 @@ class BinanceBlockTrader:
                 break
         return {token for token in tokens if token}
 
-    async def _maybe_create_entry(self, block: dict[str, Any]) -> dict[str, Any] | None:
+    async def _maybe_create_entry(
+        self,
+        block: dict[str, Any],
+        *,
+        waiting_entry_checks: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
         market = normalize_market(block.get("market"))
         symbol = str(block.get("symbol") or "").upper()
         side = build_entry_order_side(block)
@@ -11971,12 +13913,28 @@ class BinanceBlockTrader:
         )
         price = _safe_float(reference.get("execution_price"))
         if price <= 0:
+            self._append_waiting_entry_check(
+                waiting_entry_checks,
+                block=block,
+                reference=reference,
+                side=side,
+                status="unavailable",
+                reason="entry_reference_unavailable",
+            )
             return None
         if not build_entry_trigger_fired(
             block,
             price=price,
             order_side=build_entry_order_side(block),
         ):
+            self._append_waiting_entry_check(
+                waiting_entry_checks,
+                block=block,
+                reference=reference,
+                side=side,
+                status="waiting",
+                reason="entry_trigger_not_reached",
+            )
             return None
         block_id = str(block.get("block_id") or "")
         exchange_min_preflight = await self._exchange_min_order_preflight_rejection(block)
@@ -12052,6 +14010,40 @@ class BinanceBlockTrader:
         action.setdefault("reason", "entry_triggered")
         return action
 
+    @staticmethod
+    def _append_waiting_entry_check(
+        checks: list[dict[str, Any]] | None,
+        *,
+        block: dict[str, Any],
+        reference: dict[str, Any],
+        side: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        if checks is None:
+            return
+        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        operator = build_normalize_entry_trigger_operator(
+            metadata.get("entry_trigger_operator"),
+            default="<=" if str(side or "").strip().lower() == "buy" else ">=",
+        )
+        checks.append(
+            {
+                "block_id": str(block.get("block_id") or ""),
+                "symbol": str(block.get("symbol") or "").upper(),
+                "market": normalize_market(block.get("market")),
+                "side": side,
+                "status": status,
+                "reason": reason,
+                "entry_trigger_price": _safe_float(
+                    metadata.get("entry_trigger_price") or block.get("entry_price")
+                ),
+                "entry_trigger_operator": operator,
+                "execution_price": _safe_float(reference.get("execution_price")),
+                "execution_source": str(reference.get("execution_source") or ""),
+            }
+        )
+
     async def _preflight_waiting_entry(
         self,
         block: dict[str, Any],
@@ -12061,6 +14053,51 @@ class BinanceBlockTrader:
         block_id = str(block.get("block_id") or "")
         market = normalize_market(block.get("market"))
         symbol = str(block.get("symbol") or "").upper()
+        if market == "futures" and (
+            _safe_float(block.get("entry_price")) <= 0
+            or _safe_float(block.get("liquidation_price")) <= 0
+        ):
+            reason = "preflight_liquidation_price_missing"
+            metadata = dict(
+                block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+            )
+            metadata.update(
+                {
+                    "entry_trigger_status": "blocked",
+                    "entry_trigger_reason": reason,
+                    "last_entry_preflight": {
+                        "reason": reason,
+                        "symbol": symbol,
+                        "market": market,
+                    },
+                }
+            )
+            updated = self.repository.update_block(
+                block_id,
+                {
+                    "status": "paused",
+                    "qty_open": 0.0,
+                    "llm_reason": reason,
+                    "risk_note": reason,
+                    "metadata": metadata,
+                },
+            )
+            self.repository.add_event(
+                block_id,
+                "entry_preflight_blocked",
+                reason,
+                {"reason": reason, "symbol": symbol, "market": market},
+            )
+            return {
+                "status": "blocked",
+                "reason": reason,
+                "preflight": {
+                    "reason": reason,
+                    "symbol": symbol,
+                    "market": market,
+                },
+                "block": updated,
+            }
         book = (
             reference
             if isinstance(reference, dict) and reference
@@ -12917,16 +14954,35 @@ class BinanceBlockTrader:
         actions: dict[str, list[dict[str, Any]]],
         *,
         validation_repair: dict[str, Any],
+        manager_response: dict[str, Any] | None = None,
+        prompt: dict[str, Any] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         metadata = build_validation_repair_action_metadata(validation_repair)
         repair = metadata.get("validation_repair") if metadata else None
+        if not isinstance(repair, dict) and isinstance(validation_repair, dict):
+            compact_repair_is_action_payload = (
+                validation_repair.get("version") == "validation_repair_action_v1"
+                or _safe_int(validation_repair.get("repair_item_count")) > 0
+                or _safe_int(validation_repair.get("constraint_count")) > 0
+            )
+            if compact_repair_is_action_payload:
+                repair = dict(validation_repair)
         if not isinstance(repair, dict):
             return actions
         adjusted: dict[str, list[dict[str, Any]]] = {}
         note = build_validation_repair_note(repair)
+        auto_create_rows = BinanceBlockTrader._auto_materialized_validation_repair_creates(
+            actions,
+            validation_repair=repair,
+            manager_response=manager_response,
+            prompt=prompt,
+        )
         for key in sorted(ALLOWED_MANAGER_ACTIONS):
             rows: list[dict[str, Any]] = []
-            for row in actions.get(key, []):
+            source_rows = list(actions.get(key, []))
+            if key == "create_blocks" and auto_create_rows:
+                source_rows.extend(auto_create_rows)
+            for row in source_rows:
                 if not isinstance(row, dict):
                     continue
                 copied = dict(row)
@@ -12947,6 +15003,27 @@ class BinanceBlockTrader:
                         **evidence_plan,
                         **existing_evidence,
                     }
+                response_resolution = (
+                    BinanceBlockTrader._validation_repair_response_resolution_for_row(
+                        copied,
+                        manager_response=manager_response,
+                        prompt=prompt,
+                    )
+                )
+                if response_resolution:
+                    row_metadata["validation_repair_resolution"] = response_resolution
+                    row_metadata["validation_repair_resolution_source"] = (
+                        "manager_response"
+                    )
+                    repair_pressure = (
+                        BinanceBlockTrader._validation_repair_response_wiki_repair_note(
+                            response_resolution,
+                            prompt=prompt,
+                        )
+                    )
+                    if repair_pressure:
+                        row_metadata["jue_wiki_repair_pressure"] = repair_pressure
+                        row_metadata["jue_wiki_repair_resolution"] = repair_pressure
                 copied["metadata"] = row_metadata
                 copied["validation_repair"] = repair
                 if key == "create_blocks":
@@ -12974,6 +15051,552 @@ class BinanceBlockTrader:
                 rows.append(copied)
             adjusted[key] = rows
         return adjusted
+
+    @staticmethod
+    def _auto_materialized_validation_repair_creates(
+        actions: dict[str, list[dict[str, Any]]],
+        *,
+        validation_repair: dict[str, Any],
+        manager_response: dict[str, Any] | None,
+        prompt: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(manager_response, dict) or not isinstance(prompt, dict):
+            return []
+        validation_repair_resolution = manager_response.get(
+            "validation_repair_resolution"
+        )
+        if not isinstance(validation_repair_resolution, dict):
+            return []
+        candidates = BinanceBlockTrader._prompt_repair_candidate_rows(prompt)
+        if not candidates:
+            return []
+
+        existing = BinanceBlockTrader._action_symbol_market_pairs(actions)
+        existing_blocks = BinanceBlockTrader._prompt_block_symbol_market_pairs(prompt)
+        rows: list[dict[str, Any]] = []
+        for item in _as_list(validation_repair_resolution.get("resolved_candidates")):
+            if not isinstance(item, dict):
+                continue
+            resolution = str(item.get("resolution") or "").strip().lower()
+            if resolution not in {
+                "probe_waiting_block",
+                "small_waiting_block",
+                "one_share_probe",
+                "updated_price_geometry",
+                "candidate_rejected",
+            }:
+                continue
+            symbol = str(item.get("symbol") or item.get("code") or "").upper().strip()
+            market = normalize_market(item.get("market") or item.get("venue"))
+            if not symbol or market not in {"spot", "futures", UPBIT_SPOT_MARKET}:
+                continue
+            if (symbol, market) in existing:
+                continue
+            if resolution == "updated_price_geometry" and (symbol, market) in existing_blocks:
+                continue
+            candidate = BinanceBlockTrader._matching_prompt_repair_candidate(
+                candidates,
+                symbol=symbol,
+                market=market,
+            )
+            if not candidate:
+                continue
+            if (
+                resolution in {"updated_price_geometry", "candidate_rejected"}
+                and not (
+                    isinstance(candidate.get("validation_repair_probe_design"), dict)
+                    and candidate.get("validation_repair_probe_design")
+                )
+            ):
+                continue
+            if (
+                resolution == "candidate_rejected"
+                and build_rejection_cites_live_gate(item)
+            ):
+                continue
+            row = BinanceBlockTrader._create_row_from_repair_candidate(
+                candidate,
+                validation_repair=validation_repair,
+                resolution=item,
+            )
+            if row:
+                rows.append(row)
+                existing.add((symbol, market))
+        return rows
+
+    @staticmethod
+    def _action_symbol_market_pairs(
+        actions: dict[str, list[dict[str, Any]]],
+    ) -> set[tuple[str, str]]:
+        pairs: set[tuple[str, str]] = set()
+        for key in ("create_blocks", "update_blocks"):
+            for row in _as_list(actions.get(key)):
+                if not isinstance(row, dict):
+                    continue
+                symbol = str(row.get("symbol") or row.get("code") or "").upper().strip()
+                market = normalize_market(row.get("market") or row.get("venue"))
+                if symbol and market:
+                    pairs.add((symbol, market))
+        return pairs
+
+    @staticmethod
+    def _prompt_block_symbol_market_pairs(prompt: dict[str, Any]) -> set[tuple[str, str]]:
+        pairs: set[tuple[str, str]] = set()
+        for section in ("blocks", "open_blocks", "active_blocks"):
+            for row in _as_list(prompt.get(section)):
+                if not isinstance(row, dict):
+                    continue
+                symbol = str(row.get("symbol") or row.get("code") or "").upper().strip()
+                market = normalize_market(row.get("market") or row.get("venue"))
+                if symbol and market:
+                    pairs.add((symbol, market))
+        return pairs
+
+    @staticmethod
+    def _prompt_repair_candidate_rows(prompt: dict[str, Any]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        candidates = prompt.get("candidates")
+        if isinstance(candidates, dict):
+            rows.extend(row for row in _as_list(candidates.get("items")) if isinstance(row, dict))
+            for value in candidates.values():
+                if isinstance(value, list):
+                    rows.extend(row for row in value if isinstance(row, dict))
+        else:
+            rows.extend(row for row in _as_list(candidates) if isinstance(row, dict))
+        pressure = prompt.get("proactive_decision_pressure")
+        pressure = pressure if isinstance(pressure, dict) else {}
+        pressure_rows = pressure.get("top_candidates")
+        if isinstance(pressure_rows, dict):
+            pressure_rows = pressure_rows.get("items")
+        rows.extend(row for row in _as_list(pressure_rows) if isinstance(row, dict))
+
+        unique: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for row in rows:
+            marker = id(row)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique.append(row)
+        return unique
+
+    @staticmethod
+    def _matching_prompt_repair_candidate(
+        candidates: list[dict[str, Any]],
+        *,
+        symbol: str,
+        market: str,
+    ) -> dict[str, Any]:
+        fallback: dict[str, Any] = {}
+        for row in candidates:
+            candidate_symbol = str(row.get("symbol") or row.get("code") or "").upper().strip()
+            candidate_market = normalize_market(row.get("market") or row.get("venue"))
+            if candidate_symbol == symbol and candidate_market == market:
+                design = row.get("validation_repair_probe_design")
+                if isinstance(design, dict) and design:
+                    return row
+                if not fallback:
+                    fallback = row
+        return fallback
+
+    @staticmethod
+    def _create_row_from_repair_candidate(
+        candidate: dict[str, Any],
+        *,
+        validation_repair: dict[str, Any],
+        resolution: dict[str, Any],
+    ) -> dict[str, Any]:
+        calculated = (
+            candidate.get("calculated")
+            if isinstance(candidate.get("calculated"), dict)
+            else candidate.get("calculated_price_plan")
+            if isinstance(candidate.get("calculated_price_plan"), dict)
+            else {}
+        )
+        symbol = str(candidate.get("symbol") or "").upper().strip()
+        market = normalize_market(candidate.get("market") or candidate.get("venue"))
+        side = normalize_position_side(candidate.get("side") or candidate.get("stance"))
+        if not symbol or market not in {"spot", "futures", UPBIT_SPOT_MARKET} or not side:
+            return {}
+        upbit_spot = market == UPBIT_SPOT_MARKET
+
+        def first_positive(*values: Any) -> float:
+            for value in values:
+                parsed = _safe_float(value)
+                if parsed > 0:
+                    return parsed
+            return 0.0
+
+        def price_values(field: str) -> tuple[Any, ...]:
+            if upbit_spot:
+                return (
+                    calculated.get(f"{field}_krw"),
+                    candidate.get(f"{field}_krw"),
+                    calculated.get(field),
+                    candidate.get(field),
+                    calculated.get(f"{field}_usdt"),
+                    candidate.get(f"{field}_usdt"),
+                )
+            return (
+                calculated.get(field),
+                candidate.get(field),
+                calculated.get(f"{field}_usdt"),
+                candidate.get(f"{field}_usdt"),
+                calculated.get(f"{field}_krw"),
+                candidate.get(f"{field}_krw"),
+            )
+
+        design = (
+            dict(candidate.get("validation_repair_probe_design"))
+            if isinstance(candidate.get("validation_repair_probe_design"), dict)
+            else {}
+        )
+        synthesized_design = False
+        existing_valid_design = False
+        if not design:
+            base_entry = first_positive(
+                *price_values("entry_price"),
+                *price_values("entry_trigger_price"),
+            )
+            base_target = first_positive(
+                *price_values("target_price"),
+            )
+            base_stop = first_positive(
+                *price_values("stop_price"),
+            )
+            design = BinanceBlockTrader._validation_repair_probe_design_for_pressure_candidate(
+                market=market,
+                side=side,
+                entry_price=base_entry,
+                target_price=base_target,
+                stop_price=base_stop,
+                validation_repair=validation_repair,
+            )
+            synthesized_design = bool(design)
+            if not design:
+                design = (
+                    BinanceBlockTrader._validation_repair_existing_probe_design_for_candidate(
+                        market=market,
+                        side=side,
+                        entry_price=base_entry,
+                        target_price=base_target,
+                        stop_price=base_stop,
+                        validation_repair=validation_repair,
+                    )
+                )
+                existing_valid_design = bool(design)
+        if not design:
+            return {}
+
+        entry_price = first_positive(
+            design.get("entry_price"),
+            design.get("entry_trigger_price"),
+            *price_values("entry_price"),
+        )
+        target_price = first_positive(
+            design.get("target_price"),
+            *price_values("target_price"),
+        )
+        stop_price = first_positive(
+            design.get("stop_price"),
+            *price_values("stop_price"),
+        )
+        if entry_price <= 0 or target_price <= 0 or stop_price <= 0:
+            return {}
+
+        min_notional = first_positive(
+            design.get("min_executable_notional_krw")
+            if upbit_spot
+            else design.get("min_executable_notional_usdt"),
+            candidate.get("min_executable_notional_krw")
+            if upbit_spot
+            else candidate.get("min_executable_notional_usdt"),
+            design.get("min_notional_krw")
+            if upbit_spot
+            else design.get("min_notional_usdt"),
+        )
+        quote_budget = first_positive(
+            design.get("quote_budget_krw") if upbit_spot else design.get("quote_budget_usdt"),
+            candidate.get("quote_budget_krw") if upbit_spot else candidate.get("quote_budget_usdt"),
+            calculated.get("quote_budget_krw") if upbit_spot else calculated.get("quote_budget_usdt"),
+            candidate.get("quote_budget"),
+            calculated.get("quote_budget"),
+            min_notional,
+        )
+        qty = first_positive(
+            design.get("qty"),
+            candidate.get("qty"),
+            design.get("min_executable_qty"),
+            candidate.get("min_executable_qty"),
+        )
+        if quote_budget <= 0 and qty <= 0:
+            return {}
+        if min_notional > 0 and quote_budget > 0:
+            quote_budget = max(quote_budget, min_notional)
+
+        trigger_price = first_positive(
+            design.get("entry_trigger_price"),
+            candidate.get("entry_trigger_price_krw") if upbit_spot else candidate.get("entry_trigger_price"),
+            calculated.get("entry_trigger_price_krw") if upbit_spot else calculated.get("entry_trigger_price"),
+            candidate.get("entry_trigger_price"),
+            calculated.get("entry_trigger_price"),
+            entry_price,
+        )
+        operator = build_normalize_entry_trigger_operator(
+            design.get("entry_trigger_operator")
+            or candidate.get("entry_trigger_operator"),
+            default=">=" if side == "short" else "<=",
+        )
+        resolution_kind = str(resolution.get("resolution") or "").strip().lower()
+        metadata = {
+            "auto_materialized_validation_repair_action": True,
+            "auto_materialized_reason": (
+                "manager_selected_updated_price_geometry_with_probe_design_without_action"
+                if resolution_kind == "updated_price_geometry"
+                else "manager_rejected_probe_design_without_current_execution_gate"
+                if resolution_kind == "candidate_rejected"
+                else "manager_selected_probe_waiting_block_without_create_action"
+            ),
+            "validation_repair_resolution": {
+                key: _clean_text(resolution.get(key), limit=500)
+                for key in (
+                    "symbol",
+                    "market",
+                    "resolution",
+                    "next_trigger",
+                    "evidence_gap",
+                    "memory_contract_resolution",
+                )
+                if resolution.get(key) not in (None, "", [], {})
+            },
+            "source_candidate": build_compact_prompt_value_bounded(
+                candidate,
+                string_limit=120,
+                list_limit=4,
+                dict_limit=24,
+            ),
+        }
+        if synthesized_design:
+            metadata["synthesized_validation_repair_probe_design"] = True
+        if existing_valid_design:
+            metadata["validated_existing_repair_probe_geometry"] = True
+        if calculated:
+            metadata["candidate_execution_plan"] = calculated
+
+        row: dict[str, Any] = {
+            "symbol": symbol,
+            "market": market,
+            "side": side,
+            "horizon": normalize_binance_horizon(candidate.get("horizon"), market=market),
+            "entry_style": "wait_for_price",
+            "entry_trigger_price": trigger_price,
+            "entry_trigger_operator": operator,
+            "entry_price": entry_price,
+            "target_price": target_price,
+            "stop_price": stop_price,
+            "thesis": _clean_text(
+                resolution.get("memory_contract_resolution")
+                or resolution.get("next_trigger")
+                or candidate.get("thesis")
+                or candidate.get("reason_md")
+                or "validation repair waiting probe",
+                limit=1200,
+            ),
+            "risk_note": _clean_text(
+                resolution.get("evidence_gap")
+                or "auto-materialized from validation repair probe design",
+                limit=1200,
+            ),
+            "metadata": metadata,
+        }
+        if quote_budget > 0 and upbit_spot:
+            row["quote_budget_krw"] = quote_budget
+        elif quote_budget > 0:
+            row["quote_budget_usdt"] = quote_budget
+        if qty > 0:
+            row["qty"] = qty
+        carried_keys = (
+            "confidence",
+            "lane",
+            "entry_quality",
+            "min_executable_notional_usdt",
+            "min_executable_notional_krw",
+            "min_executable_qty",
+        )
+        for key in carried_keys:
+            value = design.get(key, candidate.get(key))
+            if value not in (None, "", [], {}):
+                row[key] = value
+        if market == "futures":
+            row["margin_type"] = (
+                design.get("margin_type")
+                or calculated.get("margin_type")
+                or candidate.get("margin_type")
+                or "isolated"
+            )
+            leverage = _safe_int(
+                design.get("leverage")
+                or calculated.get("leverage")
+                or candidate.get("leverage")
+            )
+            row["leverage"] = leverage if leverage > 0 else 1
+            liquidation = first_positive(
+                design.get("liquidation_price"),
+                calculated.get("liquidation_price"),
+                candidate.get("liquidation_price"),
+            )
+            if liquidation > 0:
+                row["liquidation_price"] = liquidation
+        return row
+
+    @staticmethod
+    def _validation_repair_response_resolution_for_row(
+        row: dict[str, Any],
+        *,
+        manager_response: dict[str, Any] | None,
+        prompt: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(row, dict) or not isinstance(manager_response, dict):
+            return {}
+        validation_repair_resolution = manager_response.get(
+            "validation_repair_resolution"
+        )
+        if not isinstance(validation_repair_resolution, dict):
+            return {}
+        action_symbols = {
+            str(value or "").strip().upper()
+            for value in (
+                row.get("symbol"),
+                row.get("code"),
+                row.get("ticker"),
+            )
+            if str(value or "").strip()
+        }
+        raw_action_market = row.get("market") or row.get("venue")
+        action_markets = {
+            normalize_market(raw_action_market)
+        } if raw_action_market not in (None, "") else set()
+        block_id_values = [
+            row.get("block_id"),
+            row.get("id"),
+            *_as_list(row.get("block_ids")),
+        ]
+        block_ids = {
+            str(value or "").strip().lower()
+            for value in block_id_values
+            if str(value or "").strip()
+        }
+        if block_ids and isinstance(prompt, dict):
+            for section in ("blocks", "open_blocks", "active_blocks"):
+                for block in _as_list(prompt.get(section)):
+                    if not isinstance(block, dict):
+                        continue
+                    block_id = str(
+                        block.get("block_id") or block.get("id") or ""
+                    ).strip().lower()
+                    if block_id not in block_ids:
+                        continue
+                    block_symbol = str(
+                        block.get("symbol")
+                        or block.get("code")
+                        or block.get("ticker")
+                        or ""
+                    ).strip().upper()
+                    if block_symbol:
+                        action_symbols.add(block_symbol)
+                    raw_block_market = block.get("market") or block.get("venue")
+                    if raw_block_market not in (None, ""):
+                        action_markets.add(normalize_market(raw_block_market))
+        if not action_symbols:
+            return {}
+        for item in _as_list(validation_repair_resolution.get("resolved_candidates")):
+            if not isinstance(item, dict):
+                continue
+            symbol = str(
+                item.get("symbol")
+                or item.get("code")
+                or item.get("ticker")
+                or ""
+            ).strip().upper()
+            if symbol not in action_symbols:
+                continue
+            item_market = normalize_market(item.get("market") or item.get("venue"))
+            if item_market and action_markets and item_market not in action_markets:
+                continue
+            compact = {
+                key: _clean_text(item.get(key), limit=500)
+                for key in (
+                    "symbol",
+                    "market",
+                    "resolution",
+                    "evidence_gap",
+                    "memory_contract",
+                    "memory_contract_error",
+                    "memory_contract_resolution",
+                    "next_trigger",
+                )
+                if item.get(key) not in ({}, [], "", None)
+            }
+            return compact
+        return {}
+
+    @staticmethod
+    def _validation_repair_response_wiki_repair_note(
+        response_resolution: dict[str, Any],
+        *,
+        prompt: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not isinstance(response_resolution, dict) or not response_resolution:
+            return {}
+        degraded_page_ids = BinanceBlockTrader._degraded_wiki_page_ids_for_prompt(
+            prompt,
+        )
+        if not degraded_page_ids:
+            return {}
+        return {
+            "source": "validation_repair_resolution",
+            "degraded_wiki_page_ids": degraded_page_ids,
+            "resolution": {
+                key: value
+                for key, value in response_resolution.items()
+                if key
+                not in {
+                    "memory_contract_error",
+                }
+            },
+        }
+
+    @staticmethod
+    def _degraded_wiki_page_ids_for_prompt(
+        prompt: dict[str, Any] | None,
+    ) -> list[str]:
+        if not isinstance(prompt, dict):
+            return []
+        wiki = prompt.get("jue_wiki") if isinstance(prompt.get("jue_wiki"), dict) else {}
+        page_ids: list[str] = []
+
+        def add_page_id(value: Any) -> None:
+            page_id = _clean_text(value, limit=160)
+            if page_id and page_id not in page_ids:
+                page_ids.append(page_id)
+
+        for key in ("pages", "requested_symbol_summaries"):
+            for item in _as_list(wiki.get(key)):
+                if not isinstance(item, dict):
+                    continue
+                effectiveness = (
+                    item.get("effectiveness")
+                    if isinstance(item.get("effectiveness"), dict)
+                    else {}
+                )
+                if str(effectiveness.get("status") or "").strip().lower() == "degraded":
+                    add_page_id(item.get("page_id"))
+        for item in _as_list(wiki.get("effectiveness_attention_items")):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("status") or "").strip().lower() == "degraded":
+                add_page_id(item.get("page_id"))
+        return page_ids[:6]
 
     @staticmethod
     def _validation_repair_create_enforcement(
@@ -14268,6 +16891,38 @@ class BinanceBlockTrader:
                 or row.get("trigger_price")
                 or metadata.get("entry_trigger_price")
             ) > 0
+        validation_repair_resolution = (
+            metadata.get("validation_repair_resolution")
+            if isinstance(metadata.get("validation_repair_resolution"), dict)
+            else {}
+        )
+        repair_enforcement = (
+            row.get("validation_repair_enforcement")
+            if isinstance(row.get("validation_repair_enforcement"), dict)
+            else metadata.get("validation_repair_enforcement")
+            if isinstance(metadata.get("validation_repair_enforcement"), dict)
+            else {}
+        )
+        validation_repair_probe_confidence_relaxed = (
+            waiting_entry
+            and bool(repair_enforcement)
+            and not bool(repair_enforcement.get("rejected"))
+            and str(
+                metadata.get("validation_repair_resolution_source") or ""
+            ).strip().lower()
+            == "manager_response"
+            and (
+                bool(metadata.get("auto_materialized_validation_repair_action"))
+                or str(
+                    validation_repair_resolution.get("resolution") or ""
+                ).strip().lower()
+                in {
+                    "probe_waiting_block",
+                    "small_waiting_block",
+                    "one_share_probe",
+                }
+            )
+        )
         has_output_evidence = bool(row.get("evidence_refs")) or bool(
             row.get("conviction_upgrade_reason")
         )
@@ -14286,9 +16941,18 @@ class BinanceBlockTrader:
         watch_like = "watch" in raw_stance
         if hold_like and not explicit_upgrade:
             reasons.append("candidate_stance_is_hold_without_upgrade")
-        if confidence > 0 and confidence < min_confidence:
+        if (
+            confidence > 0
+            and confidence < min_confidence
+            and not validation_repair_probe_confidence_relaxed
+        ):
             reasons.append("candidate_confidence_too_low")
-        if watch_like and confidence > 0 and confidence < min_confidence:
+        if (
+            watch_like
+            and confidence > 0
+            and confidence < min_confidence
+            and not validation_repair_probe_confidence_relaxed
+        ):
             reasons.append("watch_candidate_below_confidence_gate")
         return {
             "stance": raw_stance,
@@ -14298,6 +16962,9 @@ class BinanceBlockTrader:
             "confidence_source": confidence_source,
             "min_confidence": min_confidence,
             "explicit_upgrade": explicit_upgrade,
+            "validation_repair_probe_confidence_relaxed": (
+                validation_repair_probe_confidence_relaxed
+            ),
             "reasons": reasons,
         }
 
@@ -14774,6 +17441,7 @@ class BinanceBlockTrader:
                 if policy_repair_rejection is not None:
                     applied["created"].append(policy_repair_rejection)
                     continue
+                row = self._apply_candidate_execution_plan_to_row(row)
                 row = self._apply_candidate_budget_cap_to_row(row)
                 waiting_entry = self._is_waiting_entry_payload(row)
                 live_authority_context = (
@@ -15051,6 +17719,80 @@ class BinanceBlockTrader:
                 )
         return applied
 
+    def _apply_candidate_execution_plan_to_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        symbol = str(row.get("symbol") or "").upper().strip()
+        market = normalize_market(row.get("market") or row.get("venue"))
+        side = normalize_position_side(row.get("side"))
+        horizon = normalize_binance_horizon(row.get("horizon"), market=market)
+        candidate = self._entry_gate_candidate(
+            symbol=symbol,
+            market=market,
+            side=side,
+            horizon=horizon,
+        )
+        if not candidate:
+            return row
+        calculated = (
+            candidate.get("calculated")
+            if isinstance(candidate.get("calculated"), dict)
+            else candidate.get("calculated_price_plan")
+            if isinstance(candidate.get("calculated_price_plan"), dict)
+            else {}
+        )
+        if market != "futures" or not calculated:
+            return row
+
+        adjusted = dict(row)
+        metadata = dict(
+            adjusted.get("metadata")
+            if isinstance(adjusted.get("metadata"), dict)
+            else {}
+        )
+        plan: dict[str, Any] = {
+            key: value
+            for key, value in metadata.get("candidate_execution_plan", {}).items()
+        } if isinstance(metadata.get("candidate_execution_plan"), dict) else {}
+
+        liquidation_price = _safe_float(
+            adjusted.get("liquidation_price")
+            or calculated.get("liquidation_price")
+            or candidate.get("liquidation_price")
+        )
+        if (
+            _safe_float(adjusted.get("liquidation_price")) <= 0
+            and liquidation_price > 0
+        ):
+            adjusted["liquidation_price"] = liquidation_price
+            plan["liquidation_price"] = liquidation_price
+
+        margin_type = str(
+            adjusted.get("margin_type")
+            or calculated.get("margin_type")
+            or candidate.get("margin_type")
+            or ""
+        ).strip().lower()
+        if not adjusted.get("margin_type") and margin_type:
+            adjusted["margin_type"] = margin_type
+            plan["margin_type"] = margin_type
+
+        leverage = _safe_int(
+            adjusted.get("leverage")
+            or calculated.get("leverage")
+            or candidate.get("leverage")
+        )
+        if _safe_int(adjusted.get("leverage")) <= 0 and leverage > 0:
+            adjusted["leverage"] = leverage
+            plan["leverage"] = leverage
+
+        if not plan:
+            return row
+        plan.setdefault("source", "candidate_calculated_plan")
+        metadata["candidate_execution_plan"] = plan
+        if "calculated_price_plan" not in metadata:
+            metadata["calculated_price_plan"] = calculated
+        adjusted["metadata"] = metadata
+        return adjusted
+
     def _apply_candidate_budget_cap_to_row(self, row: dict[str, Any]) -> dict[str, Any]:
         symbol = str(row.get("symbol") or "").upper().strip()
         market = normalize_market(row.get("market") or row.get("venue"))
@@ -15089,11 +17831,23 @@ class BinanceBlockTrader:
         if market == UPBIT_SPOT_MARKET:
             cap = cap_krw
             cap_field = "quote_budget_krw"
+            min_executable_notional = _safe_float(
+                row.get("min_executable_notional_krw")
+            )
         else:
             cap = cap_usdt
             cap_field = "quote_budget_usdt"
+            min_executable_notional = _safe_float(
+                row.get("min_executable_notional_usdt")
+            )
         if cap <= 0:
             return row
+        if min_executable_notional > 0 and cap < min_executable_notional:
+            cap = min_executable_notional
+            if market == UPBIT_SPOT_MARKET:
+                cap_krw = cap
+            else:
+                cap_usdt = cap
 
         adjusted = dict(row)
         metadata = dict(adjusted.get("metadata") if isinstance(adjusted.get("metadata"), dict) else {})
@@ -15147,6 +17901,9 @@ class BinanceBlockTrader:
 
         if reference_price > 0:
             cap_qty = cap / reference_price
+            min_executable_qty = _safe_float(adjusted.get("min_executable_qty"))
+            if min_executable_qty > 0 and cap_qty < min_executable_qty:
+                cap_qty = min_executable_qty
             for field in ("qty", "qty_initial", "quantity"):
                 original_qty = _safe_float(adjusted.get(field))
                 if original_qty <= 0 or original_qty <= cap_qty:
@@ -15184,6 +17941,8 @@ class BinanceBlockTrader:
         for block in self.repository.list_blocks(include_closed=False):
             status = str(block.get("status") or "").strip().lower()
             if status not in {"proposed", "entry_pending", "open", "exit_pending"}:
+                continue
+            if self._is_stale_waiting_entry_block(block):
                 continue
             if str(block.get("symbol") or "").upper().strip() != symbol:
                 continue
@@ -15890,6 +18649,14 @@ class BinanceBlockTrader:
             )
             if _safe_float(normalized.get("quantity")) > qty:
                 block["qty_initial"] = normalized["quantity"]
+                block_id = str(block.get("block_id") or "")
+                if block_id:
+                    persisted = self.repository.update_block(
+                        block_id,
+                        {"qty_initial": normalized["quantity"]},
+                    )
+                    if persisted is not None:
+                        block.update(persisted)
         except ValueError as exc:
             message = str(exc)
             if "below min" in message or "below minimum" in message:
@@ -15964,13 +18731,26 @@ class BinanceBlockTrader:
                 "block": response.get("block"),
             }
 
+        raw_response = response.get("raw") if isinstance(response.get("raw"), dict) else {}
+        submitted_qty = _safe_float(
+            response.get("quantity")
+            or response.get("origQty")
+            or response.get("orig_qty")
+            or response.get("qty")
+            or raw_response.get("quantity")
+            or raw_response.get("origQty")
+            or raw_response.get("orig_qty")
+            or raw_response.get("qty")
+        )
+        filled_qty = build_response_filled_qty(response, requested_qty=qty)
+        effective_order_qty = max(qty, submitted_qty, filled_qty)
         order = self.repository.add_order(
             {
                 "block_id": block_id,
                 "symbol": symbol,
                 "market": market,
                 "side": side,
-                "qty": qty,
+                "qty": effective_order_qty,
                 "order_type": "LIMIT_IOC",
                 "status": status,
                 "reason": "entry_order",
@@ -15978,7 +18758,6 @@ class BinanceBlockTrader:
             }
         )
 
-        filled_qty = build_response_filled_qty(response, requested_qty=qty)
         if response_status in {"ENTRY_WAITING", "WAITING_ENTRY"}:
             updated = self.repository.update_block(
                 block_id,
@@ -16016,6 +18795,28 @@ class BinanceBlockTrader:
                 },
             )
             return {"status": "waiting_entry", "order": order, "block": updated}
+        if status == "sent" and response_status == "NEW" and filled_qty <= 0:
+            order_id = build_response_order_id(response)
+            reason = "entry order pending: NEW; accepted without fill evidence"
+            metadata = dict(
+                block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+            )
+            metadata["entry_order_pending"] = {
+                "status": response_status,
+                "order_id": order_id,
+                "qty": effective_order_qty,
+                "reason": reason,
+            }
+            updated = self.repository.update_block(
+                block_id,
+                {
+                    "status": "entry_pending",
+                    "qty_open": effective_order_qty,
+                    "risk_note": reason,
+                    "metadata": metadata,
+                },
+            )
+            return {"status": "entry_pending", "order": order, "block": updated}
         if status == "sent" and (response_status == "FILLED" or filled_qty > 0):
             fill_price_fields = build_entry_fill_price_update_fields(
                 block,
@@ -16023,8 +18824,8 @@ class BinanceBlockTrader:
                 min_candidate_stop_pct=_safe_float(self.config.min_candidate_stop_pct),
             )
             risk_note = (
-                f"partial entry fill: {filled_qty}/{qty}"
-                if filled_qty < qty
+                f"partial entry fill: {filled_qty}/{effective_order_qty}"
+                if filled_qty < effective_order_qty
                 else str(block.get("risk_note") or "")
             )
             if fill_price_fields.get("target_price") or fill_price_fields.get("stop_price"):
@@ -16033,10 +18834,12 @@ class BinanceBlockTrader:
                 ) + "target/stop rebased to actual entry fill"
             update_fields = {
                 "status": "open",
-                "qty_open": min(filled_qty, qty),
+                "qty_open": min(filled_qty, effective_order_qty),
                 "opened_at": utc_now_iso(),
                 "risk_note": risk_note,
             }
+            if effective_order_qty > qty:
+                update_fields["qty_initial"] = effective_order_qty
             update_fields.update(fill_price_fields)
             updated = self.repository.update_block(
                 block_id,
@@ -17208,13 +20011,175 @@ class BinanceBlockTrader:
         }
 
     @staticmethod
-    def _compact_manager_candidate_for_prompt(row: dict[str, Any]) -> dict[str, Any]:
-        return build_compact_manager_candidate_for_prompt(
+    def _candidate_waiting_entry_gate_hint(
+        row: dict[str, Any],
+        *,
+        compact: dict[str, Any],
+        entry_gate_policy: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not isinstance(entry_gate_policy, dict):
+            return {}
+        waiting_policy = entry_gate_policy.get("waiting_entry_policy")
+        if not isinstance(waiting_policy, dict) or not bool(waiting_policy.get("enabled")):
+            return {}
+
+        immediate_min_confidence = _safe_float(entry_gate_policy.get("min_confidence"))
+        waiting_min_confidence = (
+            _safe_float(waiting_policy.get("min_confidence"))
+            or _safe_float(entry_gate_policy.get("base_min_confidence"))
+        )
+        confidence = _safe_float(compact.get("confidence") or row.get("confidence"))
+        if (
+            confidence <= 0
+            or immediate_min_confidence <= 0
+            or waiting_min_confidence <= 0
+            or confidence < waiting_min_confidence
+            or confidence >= immediate_min_confidence
+            or immediate_min_confidence <= waiting_min_confidence
+        ):
+            return {}
+
+        calculated = row.get("calculated") if isinstance(row.get("calculated"), dict) else {}
+        compact_calculated = (
+            compact.get("calculated") if isinstance(compact.get("calculated"), dict) else {}
+        )
+        entry_style = str(
+            compact.get("entry_style")
+            or row.get("entry_style")
+            or calculated.get("entry_style")
+            or compact_calculated.get("entry_style")
+            or ""
+        ).strip().lower()
+        entry_price = _safe_float(
+            compact.get("entry_trigger_price")
+            or row.get("entry_trigger_price")
+            or calculated.get("entry_trigger_price")
+            or compact_calculated.get("entry_trigger_price")
+            or compact.get("entry_price")
+            or row.get("entry_price")
+            or calculated.get("entry_price")
+            or compact_calculated.get("entry_price")
+        )
+        target_price = _safe_float(
+            compact.get("target_price")
+            or row.get("target_price")
+            or calculated.get("target_price")
+            or compact_calculated.get("target_price")
+        )
+        stop_price = _safe_float(
+            compact.get("stop_price")
+            or row.get("stop_price")
+            or calculated.get("stop_price")
+            or compact_calculated.get("stop_price")
+        )
+        has_waiting_entry_plan = (
+            entry_style in {"wait_for_price", "waiting_entry", "triggered_entry"}
+            or entry_price > 0
+        )
+        if bool(waiting_policy.get("requires_price_trigger")) and not has_waiting_entry_plan:
+            return {}
+        if bool(waiting_policy.get("requires_executable_entry_target_stop")) and not (
+            entry_price > 0 and target_price > 0 and stop_price > 0
+        ):
+            return {}
+
+        return {
+            "status": "waiting_entry_base_gate_available",
+            "mode": waiting_policy.get("mode") or "small_exploratory_after_losses",
+            "candidate_confidence": round(confidence, 4),
+            "immediate_min_confidence": round(immediate_min_confidence, 4),
+            "waiting_entry_min_confidence": round(waiting_min_confidence, 4),
+            "requires_price_trigger": bool(waiting_policy.get("requires_price_trigger")),
+            "requires_executable_entry_target_stop": bool(
+                waiting_policy.get("requires_executable_entry_target_stop")
+            ),
+            "max_new_waiting_blocks_per_run": _safe_int(
+                waiting_policy.get("max_new_waiting_blocks_per_run")
+            ),
+            "entry_price": entry_price,
+            "target_price": target_price,
+            "stop_price": stop_price,
+            "instruction": (
+                "Meets waiting-entry base gate; create wait_for_price only if "
+                "live gates pass, else cite current blocker."
+            ),
+        }
+
+    @staticmethod
+    def _compact_manager_candidate_for_prompt(
+        row: dict[str, Any],
+        *,
+        validation_repair: dict[str, Any] | None = None,
+        entry_gate_policy: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        compact = build_compact_manager_candidate_for_prompt(
             row,
             compact_value=build_compact_prompt_value,
             clean_text=lambda value, limit: _clean_text(value, limit=limit),
             score_candidate=score_crypto_candidate,
         )
+        if compact.get("validation_repair_probe_design") in (None, "", [], {}):
+            calculated = (
+                row.get("calculated") if isinstance(row.get("calculated"), dict) else {}
+            )
+            market = row.get("market") or compact.get("market")
+            normalized_market = normalize_market(market)
+            if normalized_market == UPBIT_SPOT_MARKET:
+                entry_price = (
+                    row.get("entry_price_krw")
+                    or calculated.get("entry_price_krw")
+                    or row.get("entry_price")
+                    or calculated.get("entry_price")
+                )
+                target_price = (
+                    row.get("target_price_krw")
+                    or calculated.get("target_price_krw")
+                    or row.get("target_price")
+                    or calculated.get("target_price")
+                )
+                stop_price = (
+                    row.get("stop_price_krw")
+                    or calculated.get("stop_price_krw")
+                    or row.get("stop_price")
+                    or calculated.get("stop_price")
+                )
+            else:
+                entry_price = (
+                    row.get("entry_price")
+                    or calculated.get("entry_price")
+                    or calculated.get("entry_price_usdt")
+                )
+                target_price = (
+                    row.get("target_price")
+                    or calculated.get("target_price")
+                    or calculated.get("target_price_usdt")
+                )
+                stop_price = (
+                    row.get("stop_price")
+                    or calculated.get("stop_price")
+                    or calculated.get("stop_price_usdt")
+                )
+            repair_design = (
+                BinanceBlockTrader._validation_repair_probe_design_for_pressure_candidate(
+                    market=market,
+                    side=row.get("side") or compact.get("side"),
+                    entry_price=entry_price,
+                    target_price=target_price,
+                    stop_price=stop_price,
+                    validation_repair=validation_repair,
+                )
+            )
+            if repair_design:
+                compact["validation_repair_probe_design"] = repair_design
+        if compact.get("waiting_entry_gate_hint") in (None, "", [], {}):
+            hint = BinanceBlockTrader._candidate_waiting_entry_gate_hint(
+                row,
+                compact=compact,
+                entry_gate_policy=entry_gate_policy,
+            )
+            if hint:
+                compact["waiting_entry_gate_hint"] = hint
+        return compact
 
     def _manager_candidate_packets(
         self,
@@ -17902,10 +20867,7 @@ class BinanceBlockTrader:
         if leverage > max(int(self.config.max_futures_leverage), 1):
             raise ValueError("futures leverage exceeds configured maximum")
         status = str(payload.get("status") or "proposed").strip().lower()
-        if (
-            status in {"open", "entry_pending", "exit_pending"}
-            or self.config.execute_futures_orders
-        ) and (
+        if status in {"open", "entry_pending", "exit_pending"} and (
             _safe_float(payload.get("entry_price")) <= 0
             or _safe_float(payload.get("liquidation_price")) <= 0
         ):

@@ -118,6 +118,7 @@ class CoreAppRouteGroupDeps:
     memory_activate_policy_revision: Callable[[str], dict[str, Any]]
     memory_reject_policy_revision: Callable[[str], dict[str, Any]]
     build_ops_restart_readiness: Callable[[], dict[str, Any]] | None = None
+    build_compact_ops_readiness: Callable[[], dict[str, Any]] | None = None
     wiki_service: Any | None = None
 
 
@@ -132,6 +133,7 @@ class ObservabilityRouteGroupDeps:
     runtime_storage_policy: Callable[[], Any]
     build_runtime_storage_report: Callable[[Any], dict[str, Any]]
     cleanup_runtime_storage: Callable[..., dict[str, Any]]
+    refresh_cold_archive_status: Callable[[], dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -232,6 +234,9 @@ def build_observability_route_specs(
                     runtime_storage_policy=deps.runtime_storage_policy,
                     build_runtime_storage_report=deps.build_runtime_storage_report,
                     cleanup_runtime_storage=deps.cleanup_runtime_storage,
+                    refresh_cold_archive_status=(
+                        deps.refresh_cold_archive_status
+                    ),
                     storage_report_file_cache_enabled=True,
                     storage_report_file_cache_ttl_sec=1800,
                 ),
@@ -350,6 +355,7 @@ def build_core_app_route_specs(
                 build_settings_catalog=deps.build_settings_catalog,
                 update_settings_env=deps.update_settings_env,
                 build_ops_restart_readiness=deps.build_ops_restart_readiness,
+                build_compact_ops_readiness=deps.build_compact_ops_readiness,
             ),
         ),
         RouteFactorySpec(

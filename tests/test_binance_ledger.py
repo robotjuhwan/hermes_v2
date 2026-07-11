@@ -109,6 +109,33 @@ def test_row_order_payload_decodes_response_json_and_numeric_quantity() -> None:
     assert payload["market"] == "spot"
 
 
+def test_row_order_payload_exposes_effective_fill_from_binance_response() -> None:
+    payload = row_order_payload(
+        {
+            "block_id": "blk_1",
+            "symbol": "MEGAUSDT",
+            "market": "spot",
+            "side": "buy",
+            "qty": "371.609067261241",
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+            "response_json": (
+                '{"status":"FILLED","executed_qty":"371.60000000",'
+                '"cum_quote":"19.91776000","raw":{"avgPrice":"0.0536"}}'
+            ),
+            "created_at": "2026-07-05T07:25:25+00:00",
+            "updated_at": "2026-07-05T07:25:25+00:00",
+        }
+    )
+
+    assert payload["status"] == "sent"
+    assert payload["execution_status"] == "filled"
+    assert payload["filled_qty"] == 371.6
+    assert payload["filled_quote"] == 19.91776
+    assert payload["effective_fill"] is True
+
+
 def test_row_to_order_and_event_add_database_ids() -> None:
     order = row_to_order(
         {

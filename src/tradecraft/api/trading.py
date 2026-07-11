@@ -306,7 +306,12 @@ def _compact_trading_validation_response(payload: dict[str, Any]) -> dict[str, A
             for venue, venue_payload in venues.items()
             if isinstance(venue_payload, dict)
         }
-    return {key: value for key, value in compact.items() if value not in (None, [], {})}
+    stable_list_fields = {"failed_discipline_ids", "warned_discipline_ids"}
+    return {
+        key: value
+        for key, value in compact.items()
+        if value not in (None, [], {}) or key in stable_list_fields
+    }
 
 
 def _discipline_ids(rows: list[Any], status: str) -> list[str]:

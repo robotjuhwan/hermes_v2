@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from tradecraft import main
@@ -14,7 +15,34 @@ def _admin_headers(monkeypatch) -> dict[str, str]:
     return {"Authorization": "Bearer test-admin"}
 
 
-def test_research_citation_eval_cases(monkeypatch) -> None:
+def test_research_citation_eval_cases(monkeypatch, tmp_path: Path) -> None:
+    async def fail_llm_with_source_fallback(**_: object) -> dict[str, object]:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "error",
+                "mode": "pytest_source_only",
+                "error_message": "citation eval does not call external LLMs",
+            },
+        )
+
+    monkeypatch.setattr(main, "_build_helper_llm_answer", fail_llm_with_source_fallback)
+    monkeypatch.setattr(main, "_collect_helper_rag_rows", lambda **_: [])
+    monkeypatch.setattr(
+        main,
+        "_collect_helper_strategy_context",
+        lambda query, limit: {
+            "status": "ok",
+            "query": query,
+            "candidates": [],
+            "source_status": [],
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "RESEARCH_QUERY_LOG_PATH",
+        tmp_path / "research_query.log.jsonl",
+    )
     monkeypatch.setattr(
         main.naver_report_repository,
         "search",

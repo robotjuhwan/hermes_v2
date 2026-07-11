@@ -8,26 +8,32 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23111827'/%3E%3Cpath d='M8 18h16M10 13h12M12 23h8' stroke='%23f5c542' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/style.css?v=20260701_kis_cache_status_v1" />
+  <link rel="stylesheet" href="/static/style.css?v=20260710_operator_shell_v3" />
 </head>
 <body>
+  <a class="skip-link" href="#mainWorkspace">본문 바로가기</a>
   <div class="bg-mesh"></div>
   <section id="authBanner" class="auth-banner" hidden aria-live="polite">
-    <div>
-      <strong>운영 토큰 필요</strong>
-      <span id="authMessage">국장/KIS 계좌와 블록 정보는 브라우저 세션 운영 토큰이 있어야 표시됩니다. KIS 데이터가 비어 있는 상태와 인증 대기를 구분하세요.</span>
+    <div class="auth-banner-summary">
+      <div>
+        <strong>운영 토큰 필요</strong>
+        <span id="authMessage">국장/KIS 계좌와 블록 정보는 브라우저 세션 운영 토큰이 있어야 표시됩니다. KIS 데이터가 비어 있는 상태와 인증 대기를 구분하세요.</span>
+      </div>
+      <button id="authBannerToggleBtn" class="btn warm" type="button" aria-expanded="false" aria-controls="authTokenControls">토큰 입력</button>
     </div>
-    <label class="auth-token-field">
-      <span>Admin token</span>
-      <input id="authTokenInput" type="password" autocomplete="off" placeholder="TRADECRAFT_ADMIN_TOKEN" />
-    </label>
-    <button id="authTokenSaveBtn" class="btn warm" type="button">인증</button>
-    <button id="authTokenClearBtn" class="btn ghost" type="button">지우기</button>
+    <div id="authTokenControls" class="auth-token-controls">
+      <label class="auth-token-field">
+        <span>운영 토큰</span>
+        <input id="authTokenInput" type="password" autocomplete="off" placeholder="TRADECRAFT_ADMIN_TOKEN" />
+      </label>
+      <button id="authTokenSaveBtn" class="btn warm" type="button">인증</button>
+      <button id="authTokenClearBtn" class="btn ghost" type="button">지우기</button>
+    </div>
   </section>
   <section id="opsBanner" class="ops-banner" hidden aria-live="polite"></section>
   <main class="app">
     <div class="product-shell">
-      <aside class="nav-rail card" aria-label="HERMES 주요 화면">
+      <aside id="primaryNavRail" class="nav-rail card" aria-label="HERMES 주요 화면">
         <div class="nav-brand">
           <span class="brand-mark">H</span>
           <div>
@@ -36,50 +42,70 @@
           </div>
         </div>
         <nav class="nav-stack" aria-label="주요 내비게이션">
-          <button id="mainNavBtn" class="nav-item active" type="button">
-            <span>Dashboard</span>
-            <strong>자산 대시보드</strong>
-          </button>
-          <button class="nav-item" type="button" data-nav-helper-tab="ask">
-            <span>Ask</span>
-            <strong>AI 질문</strong>
-          </button>
-          <button class="nav-item" type="button" data-nav-helper-tab="strategy_intel">
-            <span>Research</span>
-            <strong>전략·리서치</strong>
-          </button>
-          <button class="nav-item" type="button" data-nav-helper-tab="kis_memory">
-            <span>KIS Memory</span>
-            <strong>국장 쥬 메모리</strong>
-          </button>
-          <button class="nav-item" type="button" data-nav-helper-tab="binance_memory">
-            <span>Binance Memory</span>
-            <strong>크립토 쥬 메모리</strong>
-          </button>
-          <button class="nav-item" type="button" data-nav-helper-tab="jue_wiki">
-            <span>Jue Wiki</span>
-            <strong>쥬 위키</strong>
-          </button>
-          <button class="nav-item" type="button" data-nav-helper-tab="kis_trader">
-            <span>KIS</span>
-            <strong>국장 블록</strong>
-          </button>
-          <button class="nav-item" type="button" data-nav-helper-tab="binance_trader">
-            <span>Binance</span>
-            <strong>크립토 블록</strong>
-          </button>
-          <button class="nav-item" type="button" data-nav-helper-tab="crypto_research">
-            <span>Crypto Lab</span>
-            <strong>크립토 리서치</strong>
-          </button>
-          <button class="nav-item" type="button" data-nav-helper-tab="runtime">
-            <span>System</span>
-            <strong>데이터·실행</strong>
-          </button>
-          <button class="nav-item" type="button" data-nav-helper-tab="settings">
-            <span>Settings</span>
-            <strong>운영 설정</strong>
-          </button>
+          <section class="nav-group" aria-labelledby="navGroupOperations">
+            <span id="navGroupOperations" class="nav-group-label">운용</span>
+            <div class="nav-group-items">
+              <button id="mainNavBtn" class="nav-item active" type="button" aria-current="page">
+                <span>Dashboard</span>
+                <strong>자산 대시보드</strong>
+              </button>
+              <button class="nav-item" type="button" data-nav-helper-tab="kis_trader">
+                <span>KIS</span>
+                <strong>국장 블록</strong>
+              </button>
+              <button class="nav-item" type="button" data-nav-helper-tab="binance_trader">
+                <span>Binance</span>
+                <strong>크립토 블록</strong>
+              </button>
+            </div>
+          </section>
+          <section class="nav-group" aria-labelledby="navGroupIntelligence">
+            <span id="navGroupIntelligence" class="nav-group-label">판단·리서치</span>
+            <div class="nav-group-items">
+              <button class="nav-item" type="button" data-nav-helper-tab="ask">
+                <span>Ask</span>
+                <strong>AI 질문</strong>
+              </button>
+              <button class="nav-item" type="button" data-nav-helper-tab="strategy_intel">
+                <span>Research</span>
+                <strong>전략·리서치</strong>
+              </button>
+              <button class="nav-item" type="button" data-nav-helper-tab="crypto_research">
+                <span>Crypto Lab</span>
+                <strong>크립토 리서치</strong>
+              </button>
+            </div>
+          </section>
+          <section class="nav-group" aria-labelledby="navGroupLearning">
+            <span id="navGroupLearning" class="nav-group-label">학습</span>
+            <div class="nav-group-items">
+              <button class="nav-item" type="button" data-nav-helper-tab="kis_memory">
+                <span>KIS Memory</span>
+                <strong>국장 쥬 메모리</strong>
+              </button>
+              <button class="nav-item" type="button" data-nav-helper-tab="binance_memory">
+                <span>Binance Memory</span>
+                <strong>크립토 쥬 메모리</strong>
+              </button>
+              <button class="nav-item" type="button" data-nav-helper-tab="jue_wiki">
+                <span>Jue Wiki</span>
+                <strong>쥬 위키</strong>
+              </button>
+            </div>
+          </section>
+          <section class="nav-group" aria-labelledby="navGroupSystem">
+            <span id="navGroupSystem" class="nav-group-label">시스템</span>
+            <div class="nav-group-items">
+              <button class="nav-item" type="button" data-nav-helper-tab="runtime">
+                <span>System</span>
+                <strong>데이터·실행</strong>
+              </button>
+              <button class="nav-item" type="button" data-nav-helper-tab="settings">
+                <span>Settings</span>
+                <strong>운영 설정</strong>
+              </button>
+            </div>
+          </section>
         </nav>
         <div class="nav-foot">
           <span>현재 모드</span>
@@ -87,12 +113,12 @@
         </div>
       </aside>
 
-      <div class="product-workspace">
+      <div id="mainWorkspace" class="product-workspace" tabindex="-1">
         <header class="hero card">
           <div>
-            <p class="eyebrow">HERMES BOT</p>
-            <h1>Investment Operations Cockpit</h1>
-            <p class="sub">잔고, 리서치 지식, 전략 힌트를 한 화면에서 조용하게 검토하는 반다크 금융 워크스페이스</p>
+            <p class="eyebrow">HERMES · 쥬 운영실</p>
+            <h1>투자 운영 현황</h1>
+            <p class="sub">실행 안전, 계좌, 진행 블록을 먼저 확인합니다.</p>
           </div>
           <div class="pillbox">
             <span id="healthPill" class="pill">API checking...</span>
@@ -105,6 +131,13 @@
         </header>
 
         <div id="mainDashboardPage" class="dashboard-page">
+          <section id="homeOpsSummary" class="home-ops-summary" aria-label="거래 운영 요약">
+            <article class="home-ops-card card muted">
+              <span class="section-kicker">Readiness</span>
+              <strong>운영 상태 확인 중</strong>
+              <p>실행 모드와 차단 요인을 불러오고 있습니다.</p>
+            </article>
+          </section>
           <section id="mainMetricsSection" class="metrics">
             <article class="metric metric-primary card">
               <p>전체 자산 합계</p>
@@ -339,19 +372,27 @@
   </main>
 
   <div id="helperModalRoot"></div>
+  <nav id="mobileNavDock" class="mobile-nav-dock" aria-label="모바일 주요 내비게이션">
+    <button type="button" data-mobile-page="main" aria-current="page"><span>⌂</span><strong>홈</strong></button>
+    <button type="button" data-mobile-helper-tab="kis_trader"><span>K</span><strong>국장</strong></button>
+    <button type="button" data-mobile-helper-tab="binance_trader"><span>B</span><strong>크립토</strong></button>
+    <button type="button" data-mobile-helper-tab="strategy_intel"><span>R</span><strong>리서치</strong></button>
+    <button id="mobileNavMoreBtn" type="button" aria-expanded="false" aria-controls="primaryNavRail"><span>＋</span><strong>더보기</strong></button>
+  </nav>
   <section id="systemMetricsWidget" class="system-metrics-widget collapsed" aria-live="polite"></section>
-  <script src="/static/tabs.js?v=20260621_split_memory_tabs_v1"></script>
+  <script src="/static/tabs.js?v=20260710_operator_shell_v3"></script>
   <script src="/static/ui_shared.js?v=20260701_strategy_blocked_advisory_v1"></script>
   <script src="/static/ui_formatters.js?v=20260621_ui_formatters_v1"></script>
   <script src="/static/ui_ops.js?v=20260630_ops_bottlenecks_v1"></script>
   <script src="/static/ui_auth.js?v=20260630_ui_auth_v2"></script>
+  <script src="/static/ui_shell.js?v=20260710_operator_shell_v3"></script>
   <script src="/static/system_metrics_widget.js?v=20260630_system_metrics_widget_v1"></script>
   <script src="/static/kis_quick_view.js?v=20260701_kis_cache_status_v1"></script>
   <script src="/static/ui_live_authority.js?v=20260621_ui_live_authority_v1"></script>
-  <script src="/static/binance_tab.js?v=20260701_binance_lane_labels_v1"></script>
+  <script src="/static/binance_tab.js?v=20260710_operator_shell_v3"></script>
   <script src="/static/settings_tab.js?v=20260630_settings_lazy_all_v1"></script>
   <script src="/static/crypto_research_tab.js?v=20260701_crypto_ai_research_label_v1"></script>
-  <script src="/static/kis_trader_tab.js?v=20260630_kis_allocation_noise_v1"></script>
+  <script src="/static/kis_trader_tab.js?v=20260710_operator_shell_v3"></script>
   <script src="/static/etf_tab.js?v=20260620_etf_tab_v1"></script>
   <script src="/static/memory_tab.js?v=20260621_memory_tab_v1"></script>
   <script src="/static/strategy_intel_tab.js?v=20260621_strategy_intel_tab_v1"></script>
@@ -359,6 +400,6 @@
   <script src="/static/runtime_tab.js?v=20260701_archive_retention_status_v1"></script>
   <script src="/static/rebalance_tab.js?v=20260621_rebalance_tab_v1"></script>
   <script src="/static/backtest_tab.js?v=20260621_backtest_tab_v1"></script>
-  <script src="/static/app.js?v=20260701_kis_auth_session_hint_v1"></script>
+  <script src="/static/app.js?v=20260710_operator_shell_v3"></script>
 </body>
 </html>

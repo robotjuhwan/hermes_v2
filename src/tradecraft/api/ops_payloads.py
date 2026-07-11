@@ -9,6 +9,7 @@ from tradecraft.services.live_authority import (
     EXPECTED_TRADING_VALIDATION_DISCIPLINE_COUNT,
     compact_live_authority_for_status,
 )
+from tradecraft.services.jue_wiki_context import wiki_eligibility_freshness_reason
 
 LLM_FAILURE_STATUSES = {"error", "llm_unavailable", "llm_error", "llm_empty"}
 TRADING_VALIDATION_ADVISORY_PREFIXES = (
@@ -165,6 +166,105 @@ def _compact_trader_status(status: dict[str, Any]) -> dict[str, Any]:
     if isinstance(live_authority, dict):
         compact["live_authority"] = compact_live_authority_for_status(live_authority)
     return compact
+
+
+def _has_unresolved_manager_error(
+    status: dict[str, Any],
+    process_status: dict[str, Any] | None = None,
+) -> bool:
+    if not isinstance(status, dict):
+        return False
+    if bool(status.get("latest_manager_error_recovered")):
+        return False
+    if _manager_contract_replay_resolved_stored_error(status):
+        return False
+    unresolved = status.get("latest_unresolved_manager_error")
+    if isinstance(unresolved, dict) and unresolved:
+        attempt = {
+            "run_at": str(unresolved.get("run_at") or ""),
+            "status": str(unresolved.get("status") or ""),
+            "mode": str(unresolved.get("mode") or ""),
+            "error_message": str(unresolved.get("error_message") or ""),
+        }
+    else:
+        attempt = {
+            "run_at": str(status.get("latest_manager_run_at") or ""),
+            "status": str(status.get("latest_manager_status") or ""),
+            "mode": str(status.get("latest_manager_mode") or ""),
+        }
+    if _llm_attempt_stale_after_process_restart(attempt, process_status):
+        return False
+    latest_status = str(status.get("latest_manager_status") or "").strip().lower()
+    if latest_status in LLM_FAILURE_STATUSES:
+        return True
+    if not isinstance(unresolved, dict) or not unresolved:
+        return False
+    unresolved_status = str(unresolved.get("status") or "").strip().lower()
+    return unresolved_status in LLM_FAILURE_STATUSES or bool(
+        str(unresolved.get("error_message") or "").strip()
+    )
+
+
+def _manager_contract_replay_resolved_stored_error(status: dict[str, Any]) -> bool:
+    latest = status.get("latest_decision_input")
+    if not isinstance(latest, dict):
+        return False
+    return (
+        latest.get("contract_replay_status")
+        == "stored_error_resolved_by_current_contract"
+        and not str(latest.get("current_contract_error") or "").strip()
+    )
+
+
+def _manager_error_stale_after_restart(
+    status: dict[str, Any],
+    process_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(status, dict) or bool(status.get("latest_manager_error_recovered")):
+        return {}
+    unresolved = (
+        status.get("latest_unresolved_manager_error")
+        if isinstance(status.get("latest_unresolved_manager_error"), dict)
+        else {}
+    )
+    if isinstance(unresolved, dict) and unresolved:
+        attempt = {
+            "run_at": str(unresolved.get("run_at") or ""),
+            "status": str(unresolved.get("status") or ""),
+            "mode": str(unresolved.get("mode") or ""),
+            "error_message": str(unresolved.get("error_message") or ""),
+        }
+    else:
+        latest_error = (
+            status.get("latest_manager_error")
+            if isinstance(status.get("latest_manager_error"), dict)
+            else {}
+        )
+        attempt = {
+            "run_at": str(
+                latest_error.get("run_at")
+                or status.get("latest_manager_run_at")
+                or ""
+            ),
+            "status": str(
+                latest_error.get("status")
+                or status.get("latest_manager_status")
+                or ""
+            ),
+            "mode": str(
+                latest_error.get("mode")
+                or status.get("latest_manager_mode")
+                or ""
+            ),
+            "error_message": str(latest_error.get("error_message") or ""),
+        }
+    if not _llm_attempt_stale_after_process_restart(attempt, process_status):
+        return {}
+    return {
+        key: value
+        for key, value in attempt.items()
+        if value not in (None, "", [], {})
+    }
 
 
 def _latest_manager_run_diagnostics(status: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
@@ -394,6 +494,55 @@ def build_disk_space_status(
     }
 
 
+def _runtime_storage_size_bytes(runtime_dir: Path) -> int:
+    if not runtime_dir.exists():
+        return 0
+    if runtime_dir.is_file():
+        return int(runtime_dir.stat().st_size)
+    total = 0
+    for item in runtime_dir.rglob("*"):
+        if not item.is_file():
+            continue
+        try:
+            total += int(item.stat().st_size)
+        except OSError:
+            continue
+    return total
+
+
+def build_runtime_storage_size_status(
+    *,
+    runtime_state_path: str,
+    size_reader: Callable[[Path], int] | None = None,
+    warn_bytes: int = 4 * 1024 * 1024 * 1024,
+    risk_bytes: int = 6 * 1024 * 1024 * 1024,
+) -> dict[str, Any]:
+    runtime_dir = Path(runtime_state_path).parent or Path(".runtime")
+    try:
+        total_bytes = int((size_reader or _runtime_storage_size_bytes)(runtime_dir))
+    except OSError as exc:
+        return {
+            "status": "error",
+            "path": str(runtime_dir),
+            "error_message": str(exc),
+            "warn_bytes": int(warn_bytes),
+            "risk_bytes": int(risk_bytes),
+        }
+    status = "ok"
+    if total_bytes >= int(risk_bytes):
+        status = "risk"
+    elif total_bytes >= int(warn_bytes):
+        status = "warning"
+    return {
+        "status": status,
+        "path": str(runtime_dir),
+        "total_bytes": total_bytes,
+        "total_size_gb": round(total_bytes / 1024**3, 3),
+        "warn_bytes": int(warn_bytes),
+        "risk_bytes": int(risk_bytes),
+    }
+
+
 def _iso_to_utc(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -445,6 +594,7 @@ def _llm_attempt_stale_after_process_restart(
 def build_llm_operational_status(
     *,
     block_status: dict[str, Any],
+    binance_block_status: dict[str, Any] | None = None,
     market_schedule: dict[str, Any],
     processes: dict[str, dict[str, Any]] | None = None,
     configured: bool = False,
@@ -452,16 +602,14 @@ def build_llm_operational_status(
     reasoning_effort: str = "",
     native_mode: str = "",
 ) -> dict[str, Any]:
-    kis_status = str(block_status.get("latest_manager_status") or "missing")
-    kis_payload = {
-        "run_at": str(block_status.get("latest_manager_run_at") or ""),
-        "status": kis_status,
-        "mode": str(block_status.get("latest_manager_mode") or ""),
-    }
     process_payload = processes or {}
-    kis_payload["stale_after_restart"] = _llm_attempt_stale_after_process_restart(
-        kis_payload,
+    kis_payload = _block_manager_llm_payload(
+        block_status,
         process_payload.get("kis_block_trader"),
+    )
+    binance_payload = _block_manager_llm_payload(
+        binance_block_status or {},
+        process_payload.get("binance_block_trader"),
     )
     market_payload = _latest_llm_attempt_from_runs(
         market_schedule.get("recent_runs") if isinstance(market_schedule, dict) else []
@@ -477,9 +625,62 @@ def build_llm_operational_status(
         "native_mode": str(native_mode or ""),
         "critical": {
             "kis_block_manager": kis_payload,
+            "binance_block_manager": binance_payload,
             "market_judge": market_payload,
         },
     }
+
+
+def _block_manager_llm_payload(
+    status: dict[str, Any],
+    process_status: dict[str, Any] | None,
+) -> dict[str, Any]:
+    latest_status = str(status.get("latest_manager_status") or "missing")
+    if bool(status.get("latest_manager_error_recovered")):
+        payload = {
+            "run_at": str(status.get("latest_manager_run_at") or ""),
+            "status": "recovered",
+            "mode": str(status.get("latest_manager_mode") or ""),
+            "latest_manager_status": latest_status,
+            "latest_manager_error_recovered": True,
+        }
+        payload["stale_after_restart"] = _llm_attempt_stale_after_process_restart(
+            payload,
+            process_status,
+        )
+        return payload
+    unresolved = (
+        status.get("latest_unresolved_manager_error")
+        if isinstance(status.get("latest_unresolved_manager_error"), dict)
+        else {}
+    )
+    if (
+        unresolved
+        and not bool(status.get("latest_manager_error_recovered"))
+        and (
+            str(unresolved.get("status") or "").strip().lower()
+            in LLM_FAILURE_STATUSES
+            or bool(str(unresolved.get("error_message") or "").strip())
+        )
+    ):
+        payload = {
+            "run_at": str(unresolved.get("run_at") or ""),
+            "status": str(unresolved.get("status") or "error"),
+            "mode": str(unresolved.get("mode") or ""),
+            "error_message": str(unresolved.get("error_message") or "")[:400],
+            "latest_manager_status": latest_status,
+        }
+    else:
+        payload = {
+            "run_at": str(status.get("latest_manager_run_at") or ""),
+            "status": latest_status,
+            "mode": str(status.get("latest_manager_mode") or ""),
+        }
+    payload["stale_after_restart"] = _llm_attempt_stale_after_process_restart(
+        payload,
+        process_status,
+    )
+    return payload
 
 
 def append_trading_validation_ops_signals(
@@ -885,6 +1086,37 @@ def build_ops_environment_signals(
         warnings.append("disk_space_low")
     elif disk_status == "error":
         warnings.append("disk_space_status_error")
+    runtime_storage = (
+        disk_space_status.get("runtime_storage")
+        if isinstance(disk_space_status.get("runtime_storage"), dict)
+        else {}
+    )
+    runtime_storage_status = str(runtime_storage.get("status") or "").lower()
+    if runtime_storage_status == "risk":
+        blockers.append("runtime_storage_risk")
+    elif runtime_storage_status == "warning":
+        warnings.append("runtime_storage_warning")
+    elif runtime_storage_status == "error":
+        warnings.append("runtime_storage_status_error")
+    cold_archive = (
+        runtime_storage.get("cold_archive")
+        if isinstance(runtime_storage.get("cold_archive"), dict)
+        else {}
+    )
+    cold_archive_status = str(cold_archive.get("status") or "").lower()
+    cold_snapshot = (
+        cold_archive.get("verification_snapshot")
+        if isinstance(cold_archive.get("verification_snapshot"), dict)
+        else {}
+    )
+    if cold_archive_status == "corrupt" or list(
+        cold_archive.get("corrupt_entry_ids") or []
+    ):
+        warnings.append("runtime_cold_archive_corrupt")
+    elif cold_archive_status in {"warning", "error"} or str(
+        cold_snapshot.get("status") or ""
+    ).lower() in {"missing", "stale", "invalid"}:
+        warnings.append("runtime_cold_archive_unverified")
 
     readiness_checks = {
         "kis": ("kis_primary", "kis_primary_not_ready_for_live_orders"),
@@ -931,6 +1163,36 @@ def build_ops_environment_signals(
     }
 
 
+def _split_readiness_actions(
+    *,
+    blockers: list[str],
+    warnings: list[str],
+    advisories: list[str],
+    stale_processes: list[str],
+    missing_processes: list[str],
+    duplicate_processes: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    operational = build_ops_remediation_actions(
+        blockers=blockers,
+        warnings=warnings,
+        stale_processes=stale_processes,
+        missing_processes=missing_processes,
+        duplicate_processes=duplicate_processes,
+    )
+    advisory = build_ops_remediation_actions(
+        blockers=[],
+        warnings=advisories,
+        stale_processes=[],
+        missing_processes=[],
+        duplicate_processes=[],
+    )
+    return {
+        "operational_remediation_actions": operational,
+        "advisory_actions": advisory,
+        "remediation_actions": [*operational, *advisory],
+    }
+
+
 def finalize_ops_readiness_signals(
     *,
     environment_signals: dict[str, Any],
@@ -965,17 +1227,17 @@ def finalize_ops_readiness_signals(
         llm_operational.get("critical") if isinstance(llm_operational, dict) else {}
     )
     critical_llm = critical_llm if isinstance(critical_llm, dict) else {}
-    kis_block_manager_status = critical_llm.get("kis_block_manager")
-    kis_block_manager_status = (
-        kis_block_manager_status
-        if isinstance(kis_block_manager_status, dict)
-        else {}
-    )
-    if (
-        str(kis_block_manager_status.get("status")) in LLM_FAILURE_STATUSES
-        and not bool(kis_block_manager_status.get("stale_after_restart"))
+    for manager_key, warning in (
+        ("kis_block_manager", "kis_block_manager_last_run_failed"),
+        ("binance_block_manager", "binance_block_manager_last_run_failed"),
     ):
-        add_unique(warnings, "kis_block_manager_last_run_failed")
+        manager_status = critical_llm.get(manager_key)
+        manager_status = manager_status if isinstance(manager_status, dict) else {}
+        if (
+            str(manager_status.get("status")) in LLM_FAILURE_STATUSES
+            and not bool(manager_status.get("stale_after_restart"))
+        ):
+            add_unique(warnings, warning)
     market_llm_status = critical_llm.get("market_judge")
     market_llm_status = market_llm_status if isinstance(market_llm_status, dict) else {}
     if (
@@ -1009,9 +1271,10 @@ def finalize_ops_readiness_signals(
         "stale_processes": stale_processes,
         "missing_processes": missing_processes,
         "duplicate_processes": duplicate_processes,
-        "remediation_actions": build_ops_remediation_actions(
+        **_split_readiness_actions(
             blockers=blockers,
-            warnings=[*warnings, *advisories],
+            warnings=warnings,
+            advisories=advisories,
             stale_processes=stale_processes,
             missing_processes=missing_processes,
             duplicate_processes=duplicate_processes,
@@ -1382,9 +1645,18 @@ def build_ops_binance_block_trader_payload(
     min_reward_risk: Any,
     next_manager_run_at: str,
 ) -> dict[str, Any]:
+    compact_status = _compact_binance_trader_status(status)
+    stale_manager_error = _manager_error_stale_after_restart(status, runner)
+    if stale_manager_error:
+        compact_status["latest_manager_error_stale_after_restart"] = True
+        compact_status["latest_stale_manager_error"] = _compact_json_value(
+            stale_manager_error
+        )
+        compact_status.pop("latest_manager_error", None)
+        compact_status.pop("latest_unresolved_manager_error", None)
     payload = {
         "enabled": bool(enabled),
-        "status": _compact_binance_trader_status(status),
+        "status": compact_status,
         "execution": {
             "spot_mode": "live" if bool(spot_live) else "paper",
             "futures_mode": "live" if bool(futures_live) else "paper",
@@ -1401,11 +1673,258 @@ def build_ops_binance_block_trader_payload(
         },
         "next_manager_run_at": next_manager_run_at,
     }
+    warnings: list[str] = []
+    if isinstance(runner, dict) and bool(runner.get("stale_process")):
+        warnings.append("binance_runner_stale_restart_required")
+    if _has_unresolved_manager_error(status, runner):
+        warnings.append("binance_block_manager_last_run_failed")
+    entry_activity = _compact_binance_entry_activity(status)
+    if entry_activity:
+        payload["entry_activity"] = entry_activity
+    pressure = _compact_binance_activity_pressure(status)
+    if pressure:
+        payload["activity_pressure"] = pressure
+        if str(pressure.get("status") or "") == "action_required":
+            warnings.append("binance_activity_pressure_open")
+        repair_actions = _compact_binance_activity_repair_actions(pressure)
+        if repair_actions:
+            payload["activity_repair_actions"] = repair_actions
+    contract_replay = _compact_binance_contract_replay_recovery(status)
+    if contract_replay:
+        payload["manager_contract_replay"] = contract_replay
+        if _binance_contract_replay_recovered_warning(contract_replay):
+            warnings.append("binance_manager_contract_replay_recovered")
+        if _binance_contract_replay_current_error_warning(contract_replay):
+            warnings.append("binance_manager_contract_replay_current_error")
     gap = _wiki_action_reference_gap(status)
     if gap:
         payload["wiki_action_reference_gap"] = gap
-        payload["warnings"] = ["binance_jue_wiki_action_reference_gap_unresolved"]
+        warnings.append("binance_jue_wiki_action_reference_gap_unresolved")
+    if warnings:
+        payload["warnings"] = warnings
     return payload
+
+
+def _compact_binance_entry_activity(status: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(status, dict):
+        return {}
+    activity = status.get("entry_activity")
+    if not isinstance(activity, dict):
+        return {}
+    field_names = (
+        "version",
+        "status",
+        "latest_binance_entry_at",
+        "latest_binance_entry_market",
+        "latest_upbit_entry_at",
+        "binance_entry_stale_hours",
+        "binance_entry_count",
+        "upbit_entry_count",
+    )
+    return {
+        key: _compact_json_value(activity.get(key))
+        for key in field_names
+        if activity.get(key) not in (None, "", [], {})
+    }
+
+
+def _compact_binance_activity_pressure(status: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(status, dict):
+        return {}
+    latest = status.get("latest_decision_input")
+    source_payload = (
+        {**status, **latest}
+        if isinstance(latest, dict)
+        else status
+    )
+    field_map = {
+        "current_replay_pressure_status": "status",
+        "current_replay_pressure_level": "level",
+        "current_replay_pressure_source": "source",
+        "current_replay_zero_action_streak": "zero_action_streak",
+        "current_replay_binance_zero_action_streak": "binance_zero_action_streak",
+        "current_replay_binance_activity_gap_status": "activity_gap_status",
+        "current_replay_binance_entry_stale_hours": "entry_stale_hours",
+        "current_replay_binance_candidate_symbols": "candidate_symbols",
+    }
+    return {
+        target: _compact_json_value(source_payload.get(source))
+        for source, target in field_map.items()
+        if source_payload.get(source) not in (None, "", [], {})
+    }
+
+
+def _compact_binance_activity_repair_actions(
+    pressure: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not isinstance(pressure, dict):
+        return []
+    if str(pressure.get("status") or "") != "action_required":
+        return []
+    candidate_symbols = _binance_activity_candidate_symbols(
+        pressure.get("candidate_symbols")
+    )
+    symbol_payload = {"symbols": candidate_symbols} if candidate_symbols else None
+    actions = [
+        {
+            "id": "refresh_binance_crypto_research_context",
+            "label": "Binance 후보 리서치 갱신",
+            "detail": (
+                "활동 공백 후보의 최신 뉴스, 구조, 근거를 다시 수집해 "
+                "research_only/insufficient gate를 줄입니다."
+            ),
+            "severity": "warn",
+            "endpoint": "/api/crypto/research/run-once",
+            "method": "POST",
+            "signals": ["binance_activity_pressure_open"],
+        },
+        {
+            "id": "collect_binance_market_structure",
+            "label": "Binance 시장 구조 수집",
+            "detail": (
+                "후보 심볼의 kline/market-structure 근거를 갱신해 "
+                "pattern prior와 live crosscheck 결손을 줄입니다."
+            ),
+            "severity": "warn",
+            "endpoint": "/api/crypto/research/collect",
+            "method": "POST",
+            "signals": ["binance_activity_pressure_open"],
+        },
+        {
+            "id": "refresh_binance_alpha_context",
+            "label": "Binance 알파 컨텍스트 갱신",
+            "detail": (
+                "알파 컨텍스트를 새로 수집해 confidence/live-authority "
+                "판정에 최신 후보 근거를 반영합니다."
+            ),
+            "severity": "warn",
+            "endpoint": "/api/crypto/alpha/collect",
+            "method": "POST",
+            "signals": ["binance_activity_pressure_open"],
+        },
+    ]
+    if symbol_payload:
+        for action in actions[:2]:
+            action["request_payload"] = dict(symbol_payload)
+    return actions
+
+
+def _binance_activity_candidate_symbols(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    symbols: list[str] = []
+    for raw_symbol in value:
+        symbol = str(raw_symbol or "").strip().upper()
+        if not symbol or symbol in symbols:
+            continue
+        symbols.append(symbol)
+        if len(symbols) >= 8:
+            break
+    return symbols
+
+
+def _compact_binance_contract_replay_recovery(
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(status, dict):
+        return {}
+    latest = status.get("latest_decision_input")
+    if not isinstance(latest, dict):
+        return {}
+    replay_status = str(latest.get("contract_replay_status") or "").strip()
+    if replay_status not in {
+        "stored_error_resolved_by_current_contract",
+        "current_contract_error",
+    }:
+        return {}
+    field_names = (
+        "contract_replay_status",
+        "stored_error_message",
+        "current_contract_error",
+        "action_count",
+        "current_replay_action_count",
+        "current_replay_auto_action_count",
+        "current_replay_action_sections",
+        "current_replay_hold_summary",
+        "current_replay_watch_symbols",
+        "current_replay_next_triggers",
+        "current_replay_data_gaps",
+        "current_replay_auto_create_preview",
+    )
+    return {
+        key: _compact_binance_contract_replay_value(key, latest.get(key))
+        for key in field_names
+        if latest.get(key) not in (None, "", [], {})
+    }
+
+
+def _compact_binance_contract_replay_value(key: str, value: Any) -> Any:
+    if key == "current_replay_auto_create_preview":
+        return _compact_binance_contract_replay_auto_create_preview(value)
+    return _compact_json_value(value)
+
+
+def _compact_binance_contract_replay_auto_create_preview(
+    value: Any,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    text_keys = {
+        "symbol",
+        "market",
+        "side",
+        "entry_style",
+        "entry_trigger_operator",
+        "auto_materialized_reason",
+    }
+    numeric_keys = {
+        "entry_trigger_price",
+        "entry_price",
+        "target_price",
+        "stop_price",
+        "qty",
+        "quote_budget_usdt",
+        "quote_budget_krw",
+        "min_executable_notional_usdt",
+        "min_executable_notional_krw",
+        "min_executable_qty",
+        "notional_estimate_usdt",
+        "notional_estimate_krw",
+    }
+    previews: list[dict[str, Any]] = []
+    for row in value[:8]:
+        if not isinstance(row, dict):
+            continue
+        preview: dict[str, Any] = {}
+        for item_key in text_keys:
+            item = row.get(item_key)
+            if item not in (None, "", [], {}):
+                preview[item_key] = _short_text(item, limit=160)
+        for item_key in numeric_keys:
+            item = row.get(item_key)
+            if item not in (None, "", [], {}):
+                parsed = _safe_float(item)
+                if parsed > 0:
+                    preview[item_key] = parsed
+        if preview:
+            previews.append(preview)
+    return previews
+
+
+def _binance_contract_replay_recovered_warning(replay: dict[str, Any]) -> bool:
+    if not replay:
+        return False
+    if replay.get("contract_replay_status") != "stored_error_resolved_by_current_contract":
+        return False
+    return _safe_int(replay.get("current_replay_action_count")) > _safe_int(
+        replay.get("action_count")
+    )
+
+
+def _binance_contract_replay_current_error_warning(replay: dict[str, Any]) -> bool:
+    if not replay:
+        return False
+    return replay.get("contract_replay_status") == "current_contract_error"
 
 
 def _compact_binance_trader_status(status: dict[str, Any]) -> dict[str, Any]:
@@ -1649,6 +2168,249 @@ def build_ops_crypto_alpha_payload(
     }
 
 
+def _stored_wiki_publication_age(
+    status: dict[str, Any],
+    v3: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> tuple[int, str]:
+    explicit = v3.get("publication_age_sec")
+    if explicit is None:
+        explicit = status.get("publication_age_sec")
+    if explicit is not None:
+        try:
+            parsed = int(explicit)
+        except (TypeError, ValueError):
+            return 0, "invalid"
+        return (parsed, "ok") if parsed >= 0 else (0, "invalid")
+    ops_snapshot = (
+        status.get("ops_snapshot")
+        if isinstance(status.get("ops_snapshot"), dict)
+        else {}
+    )
+    generated_at = str(ops_snapshot.get("generated_at") or "").strip()
+    if not generated_at:
+        return 0, "missing"
+    try:
+        published = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return 0, "invalid"
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return max(int((current - published).total_seconds()), 0), "ok"
+
+
+def build_stored_jue_wiki_readiness_status(
+    status: dict[str, Any],
+    *,
+    configured_read_mode: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Normalize an already-persisted Wiki status without running projections."""
+
+    payload = dict(status) if isinstance(status, dict) else {}
+    v3 = dict(payload.get("v3")) if isinstance(payload.get("v3"), dict) else {}
+    stored_read_mode = str(
+        v3.get("active_read_mode") or payload.get("active_read_mode") or ""
+    ).strip().lower()
+    configured_mode = str(configured_read_mode or "").strip().lower()
+    if configured_mode not in {"shadow", "prefer", "required"}:
+        configured_mode = ""
+    active_read_mode = configured_mode or (
+        stored_read_mode
+        if stored_read_mode in {"shadow", "prefer", "required"}
+        else "shadow"
+    )
+    active_read_mode_status = (
+        "ok"
+        if stored_read_mode in {"shadow", "prefer", "required"}
+        else "missing"
+        if not stored_read_mode
+        else "invalid"
+    )
+    current = now or datetime.now(timezone.utc)
+    raw_eligibility = (
+        v3.get("mode_eligibility")
+        if isinstance(v3.get("mode_eligibility"), dict)
+        else {}
+    )
+    eligibility_by_venue: dict[str, dict[str, Any]] = {}
+    eligibility_failures: dict[str, list[str]] = {}
+    for venue in ("kis", "binance"):
+        raw_row = raw_eligibility.get(venue)
+        row = dict(raw_row) if isinstance(raw_row, dict) else {}
+        failures: list[str] = []
+        if not row:
+            failures.append("eligibility_missing")
+        else:
+            if row.get("version") != "wiki_shadow_eligibility_v1":
+                failures.append("eligibility_version_invalid")
+            if str(row.get("venue") or "").strip().lower() != venue:
+                failures.append("eligibility_venue_mismatch")
+            if type(row.get("required_eligible")) is not bool:
+                failures.append("eligibility_flag_invalid")
+            sample = row.get("complete_sample_count")
+            if type(sample) is not int or sample < 0:
+                failures.append("eligibility_sample_invalid")
+                sample = 0
+            elif sample < 500:
+                failures.append("eligibility_sample_insufficient")
+            blocker_values = row.get("blockers")
+            if not isinstance(blocker_values, list):
+                failures.append("eligibility_blockers_invalid")
+                blocker_values = []
+            elif blocker_values:
+                failures.extend(
+                    f"eligibility_{str(value).strip()}"
+                    for value in blocker_values
+                    if str(value).strip()
+                )
+            freshness = wiki_eligibility_freshness_reason(row, now=current)
+            if freshness:
+                failures.append(freshness)
+            if row.get("required_eligible") is not True:
+                failures.append("eligibility_not_eligible")
+            row["complete_sample_count"] = sample
+            row["blockers"] = list(
+                dict.fromkeys([*blocker_values, *failures])
+            )
+            row["required_eligible"] = not failures
+        eligibility_failures[venue] = list(dict.fromkeys(failures))
+        eligibility_by_venue[venue] = row
+    comparison_count_by_venue = {
+        venue: row.get("complete_sample_count")
+        if type(row.get("complete_sample_count")) is int
+        else 0
+        for venue, row in eligibility_by_venue.items()
+    }
+    by_scope = v3.get("by_scope") if isinstance(v3.get("by_scope"), dict) else {}
+    publication_age_sec, publication_status = _stored_wiki_publication_age(
+        payload,
+        v3,
+        now=current,
+    )
+    warnings = list(payload.get("warnings") or [])
+    blockers = list(payload.get("blockers") or [])
+    advisories = list(payload.get("advisories") or [])
+    scope_failures: dict[str, list[str]] = {}
+    for venue in ("kis", "binance"):
+        row = by_scope.get(venue) if isinstance(by_scope.get(venue), dict) else {}
+        failures: list[str] = []
+        if not row:
+            failures.append("scope_missing")
+        else:
+            if not str(row.get("snapshot_id") or "").strip():
+                failures.append("snapshot_missing")
+            created_raw = str(row.get("snapshot_created_at") or "").strip()
+            try:
+                created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            except ValueError:
+                created_at = None
+            if created_at is None or created_at.tzinfo is None:
+                failures.append("snapshot_timestamp_invalid")
+            else:
+                age = (current - created_at).total_seconds()
+                if age < 0:
+                    failures.append("snapshot_timestamp_future")
+                elif age > 3600:
+                    failures.append("snapshot_stale")
+            for key, label in (
+                ("last_ingest_status", "ingest"),
+                ("last_compile_status", "compile"),
+                ("last_lint_status", "lint"),
+                ("last_publish_status", "publish"),
+            ):
+                value = str(row.get(key) or "missing").lower()
+                if value != "ok":
+                    failures.append(f"{label}_{value}")
+            projection = str(row.get("last_projection_status") or "missing").lower()
+            cleanup_only = (
+                projection == "warning"
+                and row.get("projection_warning_reason") == "cleanup_only"
+            )
+            if projection != "ok" and not cleanup_only:
+                failures.append(f"projection_{projection}")
+            index = row.get("index_rebuild")
+            index_status = str(
+                index.get("status") if isinstance(index, dict) else "missing"
+            ).lower()
+            if index_status != "ok":
+                failures.append(f"index_{index_status}")
+            for key, label in (
+                ("stale_count", "stale_knowledge"),
+                ("conflicted_count", "conflicted_knowledge"),
+                ("orphan_page_count", "orphan_pages"),
+                ("repair_backlog_count", "repair_backlog"),
+            ):
+                value = row.get(key)
+                if type(value) is not int or value < 0:
+                    failures.append(f"{label}_invalid")
+                elif value:
+                    failures.append(label)
+        scope_failures[venue] = list(dict.fromkeys(failures))
+    degraded = bool(v3) and (
+        any(scope_failures.values()) or any(eligibility_failures.values())
+    )
+    if degraded:
+        target = warnings if active_read_mode in {"prefer", "required"} else advisories
+        target.append(f"jue_wiki_{active_read_mode}_knowledge_degraded")
+    if active_read_mode == "required":
+        root_status = str(payload.get("status") or "missing").lower()
+        if root_status != "ok":
+            blockers.append(f"jue_wiki_required_status_{root_status}")
+        if not v3:
+            blockers.append("jue_wiki_required_v3_missing")
+        if stored_read_mode != "required":
+            stored_reason = (
+                f"mismatch_{stored_read_mode}"
+                if stored_read_mode in {"shadow", "prefer"}
+                else active_read_mode_status
+            )
+            blockers.append(f"jue_wiki_required_stored_read_mode_{stored_reason}")
+        for venue in ("kis", "binance"):
+            blockers.extend(
+                f"jue_wiki_required_{venue}_{reason}"
+                for reason in [
+                    *scope_failures[venue],
+                    *eligibility_failures[venue],
+                ]
+            )
+    payload.update(
+        {
+            "v3": v3,
+            "active_read_mode": active_read_mode,
+            "configured_read_mode": configured_mode,
+            "stored_read_mode": stored_read_mode,
+            "read_mode_mismatch": bool(
+                configured_mode and configured_mode != stored_read_mode
+            ),
+            "active_read_mode_status": active_read_mode_status,
+            "publication_age_sec": publication_age_sec,
+            "publication_status": publication_status,
+            "scope_health_by_venue": {
+                venue: dict(by_scope.get(venue))
+                if isinstance(by_scope.get(venue), dict)
+                else {}
+                for venue in ("kis", "binance")
+            },
+            "index_rebuild": (
+                dict(v3.get("index_rebuild"))
+                if isinstance(v3.get("index_rebuild"), dict)
+                else {}
+            ),
+            "comparison_count_by_venue": comparison_count_by_venue,
+            "eligibility_by_venue": eligibility_by_venue,
+            "warnings": list(dict.fromkeys(str(row) for row in warnings if str(row))),
+            "blockers": list(dict.fromkeys(str(row) for row in blockers if str(row))),
+            "advisories": list(
+                dict.fromkeys(str(row) for row in advisories if str(row))
+            ),
+        }
+    )
+    return payload
+
+
 def build_ops_jue_wiki_payload(
     *,
     enabled: bool,
@@ -1656,7 +2418,13 @@ def build_ops_jue_wiki_payload(
     runner: dict[str, Any],
     state_path: str,
     interval_sec: Any,
+    configured_read_mode: str | None = None,
 ) -> dict[str, Any]:
+    stored_status = build_stored_jue_wiki_readiness_status(
+        status,
+        configured_read_mode=configured_read_mode,
+    )
+    v3 = stored_status["v3"]
     runner_state = runner.get("state") if isinstance(runner.get("state"), dict) else {}
     latest_selection = (
         status.get("latest_selection")
@@ -1689,15 +2457,26 @@ def build_ops_jue_wiki_payload(
         if isinstance(status.get("repair_queue"), dict)
         else 0
     )
-    repair_queue = (
-        _compact_json_value(status.get("repair_queue"))
+    raw_repair_queue = (
+        status.get("repair_queue")
         if isinstance(status.get("repair_queue"), dict)
         else {
             "open_count": wiki_repair_queue_open_count,
             "resolved_count": wiki_repair_queue_resolved_count,
         }
     )
+    repair_queue = _compact_json_value(raw_repair_queue)
     repair_pressure = _wiki_repair_pressure(repair_queue)
+    repair_health = (
+        _compact_json_value(repair_queue.get("repair_health"))
+        if isinstance(repair_queue.get("repair_health"), dict)
+        else {}
+    )
+    repair_lanes = (
+        raw_repair_queue.get("by_lane")
+        if isinstance(raw_repair_queue.get("by_lane"), dict)
+        else {}
+    )
     active_page_count = _safe_int(
         status.get("active_page_count")
         if status.get("active_page_count") is not None
@@ -1742,8 +2521,8 @@ def build_ops_jue_wiki_payload(
         if isinstance(raw_application.get("latest_recommendation"), dict)
         else {},
     }
-    blockers: list[str] = []
-    warnings = _jue_wiki_readiness_warnings(
+    blockers = list(stored_status["blockers"])
+    readiness_signals = _jue_wiki_readiness_signals(
         enabled=enabled,
         runner=runner,
         wiki_open_lint_count=wiki_open_lint_count,
@@ -1751,9 +2530,10 @@ def build_ops_jue_wiki_payload(
         active_page_count=active_page_count,
         prompt_pressure=prompt_pressure,
         application=application,
-        wiki_repair_queue_open_count=wiki_repair_queue_open_count,
         requested_symbol_coverage=requested_symbol_coverage,
         repair_pressure=repair_pressure,
+        repair_health=repair_health,
+        repair_lanes=repair_lanes,
         research_coverage=research_coverage,
     )
     return {
@@ -1768,14 +2548,36 @@ def build_ops_jue_wiki_payload(
         "wiki_repair_queue_resolved_count": wiki_repair_queue_resolved_count,
         "repair_queue": repair_queue,
         "repair_pressure": repair_pressure,
+        "repair_health": repair_health,
         "wiki_last_selection_at": wiki_last_selection_at,
         "wiki_last_repair_at": wiki_last_repair_at,
         "wiki_prompt_pressure": prompt_pressure,
         "requested_symbol_coverage": requested_symbol_coverage,
         "research_coverage": research_coverage,
         "application": application,
+        "v3": v3,
+        "active_read_mode": stored_status["active_read_mode"],
+        "configured_read_mode": stored_status["configured_read_mode"],
+        "stored_read_mode": stored_status["stored_read_mode"],
+        "read_mode_mismatch": stored_status["read_mode_mismatch"],
+        "publication_age_sec": stored_status["publication_age_sec"],
+        "index_rebuild": stored_status["index_rebuild"],
+        "scope_health_by_venue": stored_status["scope_health_by_venue"],
+        "comparison_count_by_venue": stored_status[
+            "comparison_count_by_venue"
+        ],
+        "eligibility_by_venue": stored_status["eligibility_by_venue"],
         "blockers": blockers,
-        "warnings": warnings,
+        "warnings": list(
+            dict.fromkeys(
+                [*stored_status["warnings"], *readiness_signals["warnings"]]
+            )
+        ),
+        "advisories": list(
+            dict.fromkeys(
+                [*stored_status["advisories"], *readiness_signals["advisories"]]
+            )
+        ),
         "status_endpoint": "/api/wiki/status",
         "rebuild_endpoint": "/api/wiki/rebuild",
         "lint_endpoint": "/api/wiki/lint",
@@ -1956,7 +2758,7 @@ def _jue_wiki_runner_active(runner: dict[str, Any]) -> bool:
     return bool(runner.get("alive"))
 
 
-def _jue_wiki_readiness_warnings(
+def _jue_wiki_readiness_signals(
     *,
     enabled: bool,
     runner: dict[str, Any],
@@ -1965,12 +2767,14 @@ def _jue_wiki_readiness_warnings(
     active_page_count: int,
     prompt_pressure: dict[str, Any],
     application: dict[str, Any] | None = None,
-    wiki_repair_queue_open_count: int = 0,
     requested_symbol_coverage: dict[str, Any] | None = None,
     repair_pressure: dict[str, Any] | None = None,
+    repair_health: dict[str, Any] | None = None,
+    repair_lanes: dict[str, Any] | None = None,
     research_coverage: dict[str, Any] | None = None,
-) -> list[str]:
+) -> dict[str, list[str]]:
     warnings: list[str] = []
+    advisories: list[str] = []
     if bool(enabled) and not _jue_wiki_runner_active(runner):
         warnings.append("jue_wiki_runner_stopped")
     if wiki_open_lint_count > 20:
@@ -1988,9 +2792,39 @@ def _jue_wiki_readiness_warnings(
     degraded_ratio = degraded_count / effectiveness_count if effectiveness_count > 0 else 0.0
     if degraded_count > 10 and degraded_ratio >= 0.5:
         warnings.append("jue_wiki_effectiveness_degraded_high")
-    if wiki_repair_queue_open_count > 0:
-        warnings.append("jue_wiki_repair_queue_open")
+    health = repair_health or {}
+    warnings.extend(
+        str(signal).strip()
+        for signal in list(health.get("warning_signals") or [])
+        if str(signal).strip()
+    )
+    advisories.extend(
+        str(signal).strip()
+        for signal in list(health.get("advisory_signals") or [])
+        if str(signal).strip()
+    )
+    lanes = repair_lanes or {}
+    for lane_name in ("evidence", "strategy"):
+        lane = lanes.get(lane_name) if isinstance(lanes.get(lane_name), dict) else {}
+        lane_health = (
+            lane.get("repair_health")
+            if isinstance(lane.get("repair_health"), dict)
+            else {}
+        )
+        for signal in list(lane_health.get("warning_signals") or []):
+            clean_signal = str(signal).strip()
+            if not clean_signal:
+                continue
+            advisories.append(
+                clean_signal.replace(
+                    "jue_wiki_repair_",
+                    f"jue_wiki_{lane_name}_repair_",
+                    1,
+                )
+            )
     pressure = repair_pressure or {}
+    if _safe_int(pressure.get("open_count")) > 0:
+        advisories.append("jue_wiki_repair_queue_open")
     pressure_warnings = (
         pressure.get("open_by_warning")
         if isinstance(pressure.get("open_by_warning"), dict)
@@ -2000,20 +2834,28 @@ def _jue_wiki_readiness_warnings(
         _safe_int(pressure_warnings.get("requested_symbol_summary_missing")) > 0
         or _safe_int(pressure_warnings.get("requested_symbol_summary_degraded")) > 0
     ):
-        warnings.append("jue_wiki_requested_symbol_repair_pressure_open")
+        advisories.append("jue_wiki_requested_symbol_repair_pressure_open")
     if _safe_int(pressure_warnings.get("financials_missing")) > 0:
-        warnings.append("jue_wiki_financials_repair_pressure_open")
+        advisories.append("jue_wiki_financials_repair_pressure_open")
     coverage = requested_symbol_coverage or {}
     if _safe_int(coverage.get("missing_summary_count")) > 0:
-        warnings.append("jue_wiki_requested_symbol_summaries_missing")
+        target = (
+            advisories
+            if str(health.get("status") or "") == "progressing"
+            else warnings
+        )
+        target.append("jue_wiki_requested_symbol_summaries_missing")
     if _safe_int(coverage.get("prompt_omitted_count")) > 0:
-        warnings.append("jue_wiki_requested_symbol_summaries_prompt_omitted")
+        advisories.append("jue_wiki_requested_symbol_summaries_prompt_omitted")
     if _safe_int(coverage.get("degraded_summary_count")) > 0:
-        warnings.append("jue_wiki_requested_symbol_summaries_degraded")
+        advisories.append("jue_wiki_requested_symbol_summaries_degraded")
     research = research_coverage or {}
     if _safe_int(research.get("warning_count")) > 0:
         warnings.append("jue_wiki_research_coverage_unhealthy")
-    return warnings
+    return {
+        "warnings": list(dict.fromkeys(warnings)),
+        "advisories": list(dict.fromkeys(advisories)),
+    }
 
 
 def merge_section_readiness_signals(
@@ -2023,6 +2865,7 @@ def merge_section_readiness_signals(
     payload = dict(readiness_signals)
     blockers = list(payload.get("blockers") or [])
     warnings = list(payload.get("warnings") or [])
+    advisories = list(payload.get("advisories") or [])
 
     def add_unique(target: list[str], value: Any) -> None:
         clean = str(value or "").strip()
@@ -2033,20 +2876,28 @@ def merge_section_readiness_signals(
         add_unique(blockers, blocker)
     for warning in list(section_payload.get("warnings") or []):
         add_unique(warnings, warning)
+    for advisory in list(section_payload.get("advisories") or []):
+        add_unique(advisories, advisory)
 
     payload["blockers"] = blockers
     payload["warnings"] = warnings
-    payload["remediation_actions"] = build_ops_remediation_actions(
-        blockers=blockers,
-        warnings=warnings,
-        stale_processes=list(payload.get("stale_processes") or []),
-        missing_processes=list(payload.get("missing_processes") or []),
-        duplicate_processes=list(payload.get("duplicate_processes") or []),
+    payload["advisories"] = advisories
+    payload.update(
+        _split_readiness_actions(
+            blockers=blockers,
+            warnings=warnings,
+            advisories=advisories,
+            stale_processes=list(payload.get("stale_processes") or []),
+            missing_processes=list(payload.get("missing_processes") or []),
+            duplicate_processes=list(payload.get("duplicate_processes") or []),
+        )
     )
     if blockers:
         payload["status"] = "red"
-    elif warnings and str(payload.get("status") or "green") == "green":
+    elif warnings:
         payload["status"] = "yellow"
+    else:
+        payload["status"] = "green"
     return payload
 
 
@@ -2071,20 +2922,28 @@ def build_ops_remediation_actions(
         endpoint: str = "",
         method: str = "GET",
         matched_signals: list[str] | None = None,
+        request_payload: dict[str, Any] | None = None,
+        requires_confirmation: bool = False,
+        follow_up_actions: list[dict[str, Any]] | None = None,
     ) -> None:
         if any(row.get("id") == action_id for row in actions):
             return
-        actions.append(
-            {
-                "id": action_id,
-                "label": label,
-                "detail": detail,
-                "severity": severity,
-                "endpoint": endpoint,
-                "method": method,
-                "signals": matched_signals or [],
-            }
-        )
+        action = {
+            "id": action_id,
+            "label": label,
+            "detail": detail,
+            "severity": severity,
+            "endpoint": endpoint,
+            "method": method,
+            "signals": matched_signals or [],
+        }
+        if request_payload:
+            action["request_payload"] = request_payload
+        if requires_confirmation:
+            action["requires_confirmation"] = True
+        if follow_up_actions:
+            action["follow_up_actions"] = follow_up_actions
+        actions.append(action)
 
     stale_validation_signals = [
         signal for signal in signals if signal.startswith("trading_validation_stale")
@@ -2193,6 +3052,87 @@ def build_ops_remediation_actions(
             endpoint="/api/trading/validation/status",
             method="GET",
             matched_signals=lane_authority_signals,
+        )
+
+    binance_recovery_signals = [
+        signal
+        for signal in signals
+        if signal
+        in {
+            "binance_activity_pressure_open",
+            "binance_manager_contract_replay_recovered",
+            "binance_manager_contract_replay_current_error",
+        }
+    ]
+    if binance_recovery_signals:
+        add_action(
+            "review_binance_activity_pressure",
+            label="Binance 활동 압력 확인",
+            detail=(
+                "현재 코드 replay가 Binance 신규 진입 공백과 후보 심볼을 감지했습니다. "
+                "상태 payload에서 후보, 공백 시간, manager 오류, runner stale 여부를 확인합니다."
+            ),
+            severity="warn",
+            endpoint="/api/binance/blocks/status",
+            method="GET",
+            matched_signals=binance_recovery_signals,
+        )
+        add_action(
+            "refresh_binance_crypto_research_context",
+            label="Binance 후보 리서치 갱신",
+            detail=(
+                "Binance 활동 공백은 현재 후보가 research_only, pattern prior, "
+                "confidence/live-authority 근거에서 막혔을 수 있습니다. "
+                "기본 crypto universe 리서치를 다시 실행한 뒤 상태 payload의 후보별 "
+                "수리 액션을 확인합니다."
+            ),
+            severity="warn",
+            endpoint="/api/crypto/research/run-once",
+            method="POST",
+            matched_signals=[
+                signal
+                for signal in binance_recovery_signals
+                if signal == "binance_activity_pressure_open"
+            ]
+            or binance_recovery_signals,
+        )
+        add_action(
+            "restart_binance_recovery_runners",
+            label="Binance 복구 러너 재시작",
+            detail=(
+                "Binance runner와 watchdog만 새 코드로 재기동해 활동 압력 복구 루프를 "
+                "적용합니다. Live crypto execution이 켜진 경우 명시 확인이 필요합니다."
+            ),
+            severity="warn",
+            endpoint="/api/ops/restart",
+            method="POST",
+            matched_signals=binance_recovery_signals,
+            request_payload={"keys": ["binance_block_trader", "watchdog"]},
+            requires_confirmation=True,
+            follow_up_actions=[
+                {
+                    "id": "check_binance_status_after_restart",
+                    "label": "Binance 상태 재확인",
+                    "endpoint": "/api/binance/blocks/status",
+                    "method": "GET",
+                },
+                {
+                    "id": "run_binance_manager_after_restart",
+                    "label": "Binance 매니저 즉시 실행",
+                    "endpoint": "/api/binance/blocks/manager/run-once",
+                    "method": "POST",
+                    "request_payload": {"confirm_live_manager_run": True},
+                    "requires_confirmation": True,
+                },
+                {
+                    "id": "run_binance_executor_after_manager",
+                    "label": "Binance 실행 틱 확인 실행",
+                    "endpoint": "/api/binance/blocks/executor/tick",
+                    "method": "POST",
+                    "request_payload": {"confirm_live_executor_tick": True},
+                    "requires_confirmation": True,
+                },
+            ],
         )
 
     jue_wiki_action_reference_signals = [

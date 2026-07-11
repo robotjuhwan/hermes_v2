@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable
+from typing import Any, Awaitable, Callable
 
 from tradecraft.config import AppSettings
 from tradecraft.services.codex_native import codex_native_service_config_kwargs
+from tradecraft.services.llm_model_policy import resolve_llm_model_policy
 from tradecraft.services.naver_reports import (
     NaverReportCrawlerConfig,
     NaverReportRepository,
@@ -22,8 +23,21 @@ class ReportIntelligenceStack:
     rag_store: RAGStore | None
 
 
+ProgressFn = Callable[[str, dict[str, Any]], None]
+
+
+def _progress(
+    callback: ProgressFn | None,
+    stage: str,
+    **detail: Any,
+) -> None:
+    if callback is not None:
+        callback(stage, detail)
+
+
 def build_report_crawler(settings: AppSettings) -> NaverSecuritiesCrawler:
     repository = NaverReportRepository(settings.naver_reports_db_path)
+    llm_policy = resolve_llm_model_policy(settings, component="research_reports")
     config = NaverReportCrawlerConfig(
         db_path=settings.naver_reports_db_path,
         pdf_archive_dir=settings.naver_reports_pdf_archive_dir,
@@ -36,8 +50,8 @@ def build_report_crawler(settings: AppSettings) -> NaverSecuritiesCrawler:
         codex_runtime_mode=settings.codex_runtime_mode,
         codex_runtime_sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
         codex_runtime_timeout_ms=settings.codex_runtime_timeout_ms,
-        llm_model=settings.llm_model,
-        llm_reasoning_effort=settings.llm_reasoning_effort,
+        llm_model=llm_policy.model,
+        llm_reasoning_effort=llm_policy.reasoning_effort,
         llm_usage_enabled=settings.llm_usage_enabled,
         llm_usage_db_path=settings.llm_usage_db_path,
         llm_usage_component="research_reports",
@@ -64,6 +78,7 @@ def build_report_rag_store(settings: AppSettings) -> RAGStore | None:
 
 def build_report_intelligence_stack(settings: AppSettings) -> ReportIntelligenceStack:
     repository = NaverReportRepository(settings.naver_reports_db_path)
+    llm_policy = resolve_llm_model_policy(settings, component="research_reports")
     crawler = NaverSecuritiesCrawler(
         config=NaverReportCrawlerConfig(
             db_path=settings.naver_reports_db_path,
@@ -77,8 +92,8 @@ def build_report_intelligence_stack(settings: AppSettings) -> ReportIntelligence
             codex_runtime_mode=settings.codex_runtime_mode,
             codex_runtime_sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
             codex_runtime_timeout_ms=settings.codex_runtime_timeout_ms,
-            llm_model=settings.llm_model,
-            llm_reasoning_effort=settings.llm_reasoning_effort,
+            llm_model=llm_policy.model,
+            llm_reasoning_effort=llm_policy.reasoning_effort,
             llm_usage_enabled=settings.llm_usage_enabled,
             llm_usage_db_path=settings.llm_usage_db_path,
             llm_usage_component="research_reports",
@@ -95,12 +110,13 @@ def build_report_intelligence_stack(settings: AppSettings) -> ReportIntelligence
 
 
 def build_report_intelligence_status(settings: AppSettings) -> dict[str, Any]:
+    llm_policy = resolve_llm_model_policy(settings, component="research_reports")
     return {
         "codex_runtime": {
             "mode": settings.codex_runtime_mode,
             "ready": settings.codex_runtime_ready,
-            "model": settings.llm_model,
-            "reasoning_effort": settings.llm_reasoning_effort,
+            "model": llm_policy.model,
+            "reasoning_effort": llm_policy.reasoning_effort,
         },
         "llm_facts": {
             "enabled": bool(settings.naver_reports_llm_facts_enabled),
@@ -217,14 +233,22 @@ async def run_report_collection_cycle(
     refresh_symbol_directory: bool = True,
     symbol_refresh_min_age_sec: int = 60 * 60 * 12,
     sync_rag: bool = True,
+    progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
     cycle_started_at = datetime.now(timezone.utc).isoformat()
+    _progress(progress, "crawl_started")
     snapshot = await crawler.crawl_once()
+    _progress(
+        progress,
+        "crawl_completed",
+        inserted=int(snapshot.get("inserted") or 0),
+    )
     symbol_refresh: dict[str, Any] | None = None
     rag_sync: dict[str, Any] | None = None
     rag_metadata_sync: dict[str, Any] | None = None
 
     if refresh_symbol_directory:
+        _progress(progress, "symbol_refresh_started")
         try:
             status = repository.status()
             symbol_last_updated_at = str(status.get("symbol_last_updated_at") or "")
@@ -239,10 +263,22 @@ async def run_report_collection_cycle(
                 "reason": "symbol_directory_refresh_failed",
                 "detail": str(exc)[:300],
             }
+        _progress(
+            progress,
+            "symbol_refresh_completed",
+            result=symbol_refresh or {"status": "fresh"},
+        )
 
+    _progress(progress, "metadata_repair_started")
     metadata_repair = repository.repair_metadata_quality()
+    _progress(
+        progress,
+        "metadata_repair_completed",
+        updated_reports=int(metadata_repair.get("updated_reports") or 0),
+    )
 
     if sync_rag:
+        _progress(progress, "rag_document_sync_started")
         rag_sync = sync_report_rag(
             repository=repository,
             rag_store=rag_store,
@@ -250,7 +286,9 @@ async def run_report_collection_cycle(
             limit=rag_sync_chunk_limit,
             updated_since=cycle_started_at,
         )
+        _progress(progress, "rag_document_sync_completed", result=rag_sync)
         if metadata_repair.get("updated_reports"):
+            _progress(progress, "rag_metadata_sync_started")
             rag_metadata_sync = sync_report_rag(
                 repository=repository,
                 rag_store=rag_store,
@@ -258,7 +296,13 @@ async def run_report_collection_cycle(
                 limit=rag_sync_chunk_limit,
                 metadata_only=True,
             )
+            _progress(
+                progress,
+                "rag_metadata_sync_completed",
+                result=rag_metadata_sync,
+            )
 
+    _progress(progress, "cycle_completed")
     return {
         "snapshot": snapshot,
         "symbol_refresh": symbol_refresh,

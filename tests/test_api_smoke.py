@@ -2,6 +2,8 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,7 +23,13 @@ from tradecraft.main import (
     upbit,
 )
 from tradecraft.runtime.state_store import RuntimeStateStore
+from tradecraft.services.binance_block_trader import (
+    BinanceBlockTrader,
+    BinanceBlockTraderConfig,
+)
 from tradecraft.services.jue_lifecycle import JueLifecycleRepository
+from tradecraft.services.jue_wiki_shadow import WikiShadowRecordingRecorder
+from tradecraft.services.kis_block_trader import KISBlockTrader, KISBlockTraderConfig
 from tradecraft.services.live_edge import LiveEdgeRepository
 from tradecraft.services.llm_usage import LLMUsageRepository
 from tradecraft.services.trading_validation import TradingValidationRepository
@@ -31,6 +39,302 @@ def _admin_headers(monkeypatch) -> dict[str, str]:
     monkeypatch.setattr(settings, "admin_token", "test-admin")
     monkeypatch.setattr(settings, "admin_tokens", "")
     return {"Authorization": "Bearer test-admin"}
+
+
+def test_main_trader_construction_uses_validated_wiki_read_mode() -> None:
+    assert tradecraft_main.kis_block_trader.config.jue_wiki_read_mode == (
+        settings.jue_wiki_read_mode
+    )
+    assert tradecraft_main.binance_block_trader.config.jue_wiki_read_mode == (
+        settings.jue_wiki_read_mode
+    )
+    for trader in (
+        tradecraft_main.kis_block_trader,
+        tradecraft_main.binance_block_trader,
+    ):
+        recorder = trader.wiki_shadow_recording_recorder
+        assert isinstance(recorder, WikiShadowRecordingRecorder)
+        assert recorder.db_path == Path(settings.jue_wiki_shadow_db_path)
+
+
+def test_main_required_disabled_wiki_provider_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "jue_wiki_read_mode", "required")
+    monkeypatch.setattr(settings, "jue_wiki_enabled", False)
+
+    payload = tradecraft_main._jue_wiki_context_provider(target_scope="kis")
+
+    assert payload["status"] == "disabled"
+    assert payload["jue_wiki_decision_gate"] == {
+        "allow_new_risk": False,
+        "allow_exit_actions": True,
+        "reason": "wiki_required_disabled",
+        "read_mode": "required",
+        "snapshot_id": "",
+        "version": "wiki_decision_gate_v1",
+    }
+
+
+def test_admin_run_once_surfaces_required_gate_suppression_for_both_venues(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    gate = {
+        "allow_new_risk": False,
+        "allow_exit_actions": True,
+        "reason": "wiki_required_coverage_missing",
+        "read_mode": "required",
+        "snapshot_id": "snapshot:api:required",
+        "version": "wiki_decision_gate_v1",
+    }
+
+    class FakeKIS:
+        async def fetch_balance_assets(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "asset": "KRW",
+                    "kind": "cash",
+                    "qty": 10_000_000,
+                    "available": 10_000_000,
+                    "value_krw": 10_000_000,
+                }
+            ]
+
+        async def fetch_domestic_quote(self, symbol: str) -> dict[str, object]:
+            price = 100_000 if symbol == "277810" else 76_000
+            return {
+                "symbol": symbol,
+                "price": price,
+                "raw": {"stck_prpr": str(price), "hts_kor_isnm": symbol},
+            }
+
+    class FakeKISStrategy:
+        def build_candidates(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "status": "ok",
+                "candidates": [
+                    {
+                        "symbol": "277810",
+                        "name": "test",
+                        "score": 76,
+                        "confidence": 0.72,
+                        "risk_score": 28,
+                        "sources": ["test"],
+                    }
+                ],
+            }
+
+    class FakeKISLLM:
+        ready = True
+        resolved_model = "test-model"
+        resolved_reasoning_effort = "xhigh"
+
+        async def complete(self, _payload: object, **_kwargs: object) -> dict[str, object]:
+            content = {
+                "create_blocks": [
+                    {
+                        "symbol": "277810",
+                        "qty": 1,
+                        "target_price": 110_000,
+                        "stop_price": 94_000,
+                        "entry_style": "wait_for_price",
+                        "entry_trigger_price": 98_000,
+                        "entry_trigger_operator": "lte",
+                        "horizon": "short",
+                        "thesis": "API required gate test",
+                        "confidence": 0.7,
+                    }
+                ],
+                "close_blocks": [{"block_id": kis_exit_id, "reason": "exit"}],
+                "hold_decision": {"summary": "required gate"},
+            }
+            return {"ok": True, "content": json.dumps(content)}
+
+    class FakeBinance:
+        async def fetch_account_snapshot(self) -> dict[str, object]:
+            return {"status": "ok", "cash_usdt": 10_000, "positions": []}
+
+        async def fetch_quote(
+            self,
+            symbol: str,
+            *,
+            market: str = "spot",
+        ) -> dict[str, object]:
+            return {
+                "symbol": symbol,
+                "market": market,
+                "price": 50_000 if symbol == "BTCUSDT" else 3_000,
+                "source": "test",
+            }
+
+    class FakeBinanceLLM:
+        ready = True
+        resolved_model = "test-model"
+
+        async def complete_json(
+            self,
+            _payload: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            return {
+                "create_blocks": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "market": "spot",
+                        "side": "long",
+                        "entry_price": 50_000,
+                        "target_price": 51_000,
+                        "stop_price": 49_000,
+                        "qty": 0.001,
+                        "thesis": "API required gate test",
+                    }
+                ],
+                "close_blocks": [{"block_id": binance_exit_id, "reason": "exit"}],
+                "hold_decision": {"summary": "required gate"},
+                "lane_review": {
+                    "dominant_lane": "spot:long",
+                    "selected_lanes": [],
+                    "lanes_reviewed": [
+                        "spot:long",
+                        "futures:long",
+                        "futures:short",
+                        "upbit_spot:long",
+                        "volatile_attack",
+                    ],
+                    "non_selected_lane_reasons": {},
+                    "concentration_note": "test reviewed all lanes",
+                    "exploration_watch": [],
+                },
+            }
+
+    for name in (
+        "kis_primary_app_key",
+        "kis_primary_app_secret",
+        "kis_primary_account_no",
+        "kis_primary_product_code",
+    ):
+        monkeypatch.setattr(settings, name, "configured")
+    monkeypatch.setattr(settings, "jue_wiki_read_mode", "required")
+    config_kwargs = tradecraft_main._jue_wiki_trader_config_kwargs()
+    assert config_kwargs == {"jue_wiki_read_mode": "required"}
+
+    kis_trader = KISBlockTrader(
+        config=KISBlockTraderConfig(
+            db_path=str(tmp_path / "api_kis.db"),
+            use_naver_fallback=False,
+            **config_kwargs,
+        ),
+        kis=FakeKIS(),  # type: ignore[arg-type]
+        codex_runtime=FakeKISLLM(),  # type: ignore[arg-type]
+        strategy_engine=FakeKISStrategy(),  # type: ignore[arg-type]
+        wiki_context_provider=lambda **_: {
+            "status": "ok",
+            "prompt_mode": "assist",
+            "jue_wiki_decision_gate": gate,
+            "pages": [],
+        },
+    )
+    kis_existing = kis_trader.repository.create_block(
+        {
+            "symbol": "005930",
+            "qty": 1,
+            "target_price": 80_000,
+            "stop_price": 70_000,
+            "status": "proposed",
+        }
+    )
+    kis_exit_id = kis_existing["block_id"]
+    kis_trader.clock = lambda: {"session": "regular", "is_market_open": True}  # type: ignore[method-assign]
+
+    async def capture_kis(actions: dict[str, Any], **_: Any) -> dict[str, object]:
+        return {
+            "adopted": [],
+            "created": [],
+            "updated": [],
+            "closed_requested": actions["close_blocks"],
+            "paused": [],
+            "rejected": [],
+        }
+
+    kis_trader._apply_manager_actions = capture_kis  # type: ignore[method-assign]
+
+    binance_trader = BinanceBlockTrader(
+        config=BinanceBlockTraderConfig(
+            db_path=str(tmp_path / "api_binance.db"),
+            live_performance_db_path=str(tmp_path / "api_live.db"),
+            spot_universe="BTCUSDT,ETHUSDT",
+            futures_universe="",
+            upbit_universe="",
+            **config_kwargs,
+        ),
+        adapter=FakeBinance(),
+        codex_runtime=FakeBinanceLLM(),
+        memory_provider=lambda **_: {"status": "ok"},
+        wiki_context_provider=lambda **_: {
+            "status": "ok",
+            "prompt_mode": "assist",
+            "jue_wiki_decision_gate": gate,
+            "pages": [],
+        },
+    )
+    binance_existing = binance_trader.create_block(
+        {
+            "symbol": "ETHUSDT",
+            "market": "spot",
+            "side": "long",
+            "qty": 0.1,
+            "entry_price": 3_000,
+            "target_price": 3_200,
+            "stop_price": 2_900,
+            "status": "proposed",
+        }
+    )
+    binance_exit_id = binance_existing["block_id"]
+
+    async def capture_binance(actions: dict[str, Any], **_: Any) -> dict[str, object]:
+        return {
+            "adopted": [],
+            "created": [],
+            "updated": [],
+            "closed": actions["close_blocks"],
+            "paused": [],
+        }
+
+    binance_trader._apply_manager_actions = capture_binance  # type: ignore[method-assign]
+
+    monkeypatch.setattr(
+        tradecraft_main.kis_block_trader,
+        "run_manager_once",
+        kis_trader.run_manager_once,
+    )
+    monkeypatch.setattr(
+        tradecraft_main.binance_block_trader,
+        "run_manager_once",
+        binance_trader.run_manager_once,
+    )
+    client = TestClient(app)
+    headers = _admin_headers(monkeypatch)
+
+    kis_response = client.post("/api/kis/blocks/manager/run-once", headers=headers)
+    binance_response = client.post(
+        "/api/binance/blocks/manager/run-once",
+        headers=headers,
+        json={"confirm_live_manager_run": True},
+    )
+
+    assert kis_response.status_code == 200
+    assert binance_response.status_code == 200
+    for payload, exit_key in (
+        (kis_response.json(), kis_exit_id),
+        (binance_response.json(), binance_exit_id),
+    ):
+        assert payload["status"] == "ok"
+        assert payload["actions"]["create_blocks"] == []
+        assert [row["block_id"] for row in payload["actions"]["close_blocks"]] == [
+            exit_key
+        ]
+        assert payload["jue_wiki_suppression_audit"]["suppressed_new_risk_count"] == 1
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +356,29 @@ def _mock_fx_snapshot(monkeypatch):
 
 
 def test_health_and_dashboard(monkeypatch) -> None:
+    monkeypatch.setattr(
+        tradecraft_main.runtime_reader,
+        "read_snapshot",
+        lambda: (
+            {
+                "sessions": [
+                    {
+                        "session_id": "test-short",
+                        "venue_id": "binance",
+                        "mode": "short_term",
+                    },
+                    {
+                        "session_id": "test-mid-long",
+                        "venue_id": "kr_stock",
+                        "mode": "mid_long_term",
+                    },
+                ],
+                "runtime": {"mode": "test"},
+                "updated_at": "2026-07-10T00:00:00+00:00",
+            },
+            "ok",
+        ),
+    )
     monkeypatch.setattr(settings, "upbit_access_key", "")
     monkeypatch.setattr(settings, "upbit_secret_key", "")
     monkeypatch.setattr(settings, "bithumb_access_key", "")
@@ -2164,6 +2491,7 @@ def test_daily_discovery_status_includes_due_today_and_coverage(monkeypatch) -> 
     monkeypatch.setattr(settings, "daily_discovery_enabled", True)
     monkeypatch.setattr(settings, "daily_discovery_kospi_count", 7)
     monkeypatch.setattr(settings, "daily_discovery_kosdaq_count", 8)
+    monkeypatch.setattr(settings, "daily_discovery_etf_count", 3)
     monkeypatch.setattr(settings, "daily_discovery_candidate_limit_per_market", 450)
     monkeypatch.setattr(
         tradecraft_main,
@@ -2183,6 +2511,7 @@ def test_daily_discovery_status_includes_due_today_and_coverage(monkeypatch) -> 
     assert payload["coverage"] == {
         "kospi_count": 7,
         "kosdaq_count": 8,
+        "etf_count": 3,
         "candidate_limit_per_market": 450,
     }
     assert calls["trading_day"].isoformat()
@@ -2325,6 +2654,57 @@ def test_ops_readiness_cached_reuses_recent_payload(monkeypatch) -> None:
     assert second == first
     assert refreshed == {"status": "ok", "call": 2}
     assert calls["count"] == 2
+
+
+def test_compact_ops_readiness_cache_does_not_build_full_payload(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    def compact_readiness() -> dict[str, object]:
+        calls.append("compact")
+        return {"compact": True, "status": "green", "warnings": []}
+
+    monkeypatch.setattr(
+        tradecraft_main,
+        "_build_ops_readiness",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("compact readiness must not build full payload")
+        ),
+    )
+    monkeypatch.setattr(
+        tradecraft_main,
+        "_build_ops_readiness_compact",
+        compact_readiness,
+    )
+    monkeypatch.setattr(tradecraft_main, "_ops_readiness_cache_payload", None)
+    monkeypatch.setattr(tradecraft_main, "_ops_readiness_cache_expires_at", 0.0)
+    monkeypatch.setattr(tradecraft_main, "_ops_readiness_cache_key", None)
+    monkeypatch.setattr(
+        tradecraft_main,
+        "_ops_compact_readiness_cache_payload",
+        None,
+    )
+    monkeypatch.setattr(
+        tradecraft_main,
+        "_ops_compact_readiness_cache_expires_at",
+        0.0,
+    )
+    monkeypatch.setattr(
+        tradecraft_main,
+        "_ops_compact_readiness_cache_key",
+        None,
+    )
+
+    first = tradecraft_main._build_ops_readiness_compact_cached(ttl_sec=30)
+    second = tradecraft_main._build_ops_readiness_compact_cached(ttl_sec=30)
+
+    assert first == second == {
+        "compact": True,
+        "status": "green",
+        "warnings": [],
+    }
+    assert calls == ["compact"]
 
 
 def test_ops_readiness_cached_default_covers_status_polling_window(monkeypatch) -> None:

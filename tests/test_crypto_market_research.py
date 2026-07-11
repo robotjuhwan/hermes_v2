@@ -1638,7 +1638,7 @@ def test_crypto_research_prompt_contains_jue_workflow(tmp_path: Path) -> None:
     assert workflow["workflow_id"] == "crypto_research"
     assert (
         workflow["model_policy"]["expected_runtime_model"]
-        == "gpt-5.5"
+        == "gpt-5.6-terra"
     )
     assert {"crypto_market_sweep", "evidence_audit"}.issubset(skill_ids)
     assert prompt["language_policy"]["internal_reasoning_language"] == "en-US"
@@ -1710,8 +1710,8 @@ def test_run_spark_research_persists_notes_and_candidates(tmp_path: Path) -> Non
     assert context["candidates"][0]["symbol"] == "BTCUSDT"
     assert context["symbol_notes"]["BTCUSDT"]["stance"] == "long_watch"
     assert spark.calls[0]["kwargs"] == {
-        "model": "gpt-5.5",
-        "reasoning_effort": "xhigh",
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "high",
     }
 
 

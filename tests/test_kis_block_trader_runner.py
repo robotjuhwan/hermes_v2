@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import ast
+import inspect
 import json
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,12 +12,32 @@ from types import SimpleNamespace
 import pytest
 
 from tradecraft.runtime.kis_block_trader_runner import (
+    _build_block_trader,
     _cycle_log_level,
     _latest_manager_run_at,
     run_kis_block_trader_loop,
 )
 from tradecraft.services.jue_wiki import JueWikiConfig, JueWikiService
 from tradecraft.services.kis_block_trader import run_due_manager
+
+
+def test_kis_daemon_builder_injects_wiki_runtime_envelope_recorder() -> None:
+    source = textwrap.dedent(inspect.getsource(_build_block_trader))
+    tree = ast.parse(source)
+    trader_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "KISBlockTrader"
+    ]
+
+    assert len(trader_calls) == 1
+    assert any(
+        keyword.arg == "wiki_shadow_recording_recorder"
+        for keyword in trader_calls[0].keywords
+    )
+    assert "settings.jue_wiki_shadow_db_path" in source
 
 
 class _Settings:
@@ -53,6 +76,9 @@ class _Trader:
         self.executor_ticks += 1
         return {"status": "skipped", "actions": []}
 
+    async def run_manager_once(self) -> dict:
+        return {"status": "ok", "actions": {}}
+
     def prune_operational_history(self, **kwargs) -> dict:
         self.retention_runs += 1
         return {"status": "ok", "kwargs": kwargs}
@@ -70,6 +96,7 @@ class _FundamentalsCollector:
 class _BlockRepository:
     def __init__(self, account: dict | None = None) -> None:
         self.account = account
+        self.saved_quotes: list[dict] = []
 
     def list_blocks(self, *, include_closed: bool = True) -> list[dict]:
         assert include_closed is False
@@ -81,6 +108,9 @@ class _BlockRepository:
 
     def latest_reconciliation_account(self) -> dict | None:
         return self.account
+
+    def save_quotes(self, quotes: list[dict]) -> None:
+        self.saved_quotes.extend(quotes)
 
 
 class _ManagerRunRepository:
@@ -109,6 +139,34 @@ class _LatestManagerRepository:
 class _ManagerRunTrader(_Trader):
     def __init__(self, run_at: str) -> None:
         self.repository = _ManagerRunRepository(run_at)
+
+
+class _PreOpenKIS:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def fetch_domestic_quote(self, symbol: str) -> dict:
+        self.calls.append(symbol)
+        price = {
+            "123456": 12_300,
+            "064350": 87_500,
+            "005930": 82_100,
+            "035420": 191_000,
+        }.get(symbol, 10_000)
+        return {
+            "symbol": symbol,
+            "name": f"name-{symbol}",
+            "price": price,
+            "raw": {
+                "stck_prpr": str(price),
+                "prdy_vrss": "-300",
+                "prdy_ctrt": "-0.36",
+                "askp1": str(price + 50),
+                "bidp1": str(price - 50),
+                "total_askp_rsqn": "1200",
+                "total_bidp_rsqn": "900",
+            },
+        }
 
 
 def test_latest_manager_run_at_reads_repository_timestamp() -> None:
@@ -183,6 +241,112 @@ def test_kis_block_trader_runner_collects_small_fundamentals_batch_after_tick(
     state_text = state_path.read_text(encoding="utf-8")
     assert "fundamentals_collect_result" in state_text
     assert "035420" in state_text
+
+
+def test_kis_block_trader_runner_collects_pre_open_quotes(
+    tmp_path: Path,
+) -> None:
+    class PreOpenSettings(_Settings):
+        def __init__(self, state_path: Path) -> None:
+            super().__init__(state_path)
+            self.etf_research_auto_collect = False
+            self.valuation_auto_collect = False
+            self.kis_pre_open_monitor_enabled = True
+            self.kis_pre_open_monitor_symbols = "123456"
+            self.kis_pre_open_monitor_max_symbols = 4
+            self.kis_pre_open_monitor_interval_sec = 300
+
+    class PreOpenTrader(_Trader):
+        def __init__(self, kis: _PreOpenKIS, repository: _BlockRepository) -> None:
+            super().__init__()
+            self.kis = kis
+            self.repository = repository
+
+        def clock(self) -> dict:
+            return {
+                "session": "pre_open",
+                "is_market_open": False,
+                "date": "2026-07-09",
+            }
+
+    state_path = tmp_path / "kis_block_trader.json"
+    kis = _PreOpenKIS()
+    repository = _BlockRepository(
+        account={
+            "positions": [
+                {"symbol": "064350", "name": "현대로템", "qty": 1},
+            ]
+        }
+    )
+
+    async def no_sleep(seconds: float) -> None:
+        _ = seconds
+
+    asyncio.run(
+        run_kis_block_trader_loop(
+            settings=PreOpenSettings(state_path),  # type: ignore[arg-type]
+            trader=PreOpenTrader(kis, repository),  # type: ignore[arg-type]
+            sleep=no_sleep,
+        )
+    )
+
+    assert kis.calls == ["123456", "064350", "005930", "035420"]
+    assert [row["symbol"] for row in repository.saved_quotes] == kis.calls
+    assert all(row["source"] == "kis_pre_open" for row in repository.saved_quotes)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["pre_open_monitor_result"]["status"] == "ok"
+    assert state["pre_open_monitor_result"]["quote_count"] == 4
+    assert state["pre_open_monitor_result"]["symbols"] == kis.calls
+
+
+def test_kis_block_trader_runner_skips_pre_open_monitor_outside_pre_open(
+    tmp_path: Path,
+) -> None:
+    class MonitorSettings(_Settings):
+        def __init__(self, state_path: Path) -> None:
+            super().__init__(state_path)
+            self.etf_research_auto_collect = False
+            self.valuation_auto_collect = False
+            self.kis_pre_open_monitor_enabled = True
+            self.kis_pre_open_monitor_symbols = "123456"
+            self.kis_pre_open_monitor_max_symbols = 4
+            self.kis_pre_open_monitor_interval_sec = 300
+
+    class ClosedTrader(_Trader):
+        def __init__(self, kis: _PreOpenKIS, repository: _BlockRepository) -> None:
+            super().__init__()
+            self.kis = kis
+            self.repository = repository
+
+        def clock(self) -> dict:
+            return {
+                "session": "closed",
+                "is_market_open": False,
+                "date": "2026-07-09",
+            }
+
+    state_path = tmp_path / "kis_block_trader.json"
+    kis = _PreOpenKIS()
+    repository = _BlockRepository()
+
+    async def no_sleep(seconds: float) -> None:
+        _ = seconds
+
+    asyncio.run(
+        run_kis_block_trader_loop(
+            settings=MonitorSettings(state_path),  # type: ignore[arg-type]
+            trader=ClosedTrader(kis, repository),  # type: ignore[arg-type]
+            sleep=no_sleep,
+        )
+    )
+
+    assert kis.calls == []
+    assert repository.saved_quotes == []
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["pre_open_monitor_result"] == {
+        "status": "skipped",
+        "reason": "not_pre_open",
+    }
 
 
 def test_kis_block_trader_runner_prioritizes_account_positions_for_fundamentals(

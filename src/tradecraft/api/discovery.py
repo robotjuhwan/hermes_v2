@@ -22,7 +22,8 @@ def build_discovery_router(deps: DiscoveryRouteDeps) -> APIRouter:
     def latest_limit(config: dict[str, Any]) -> int:
         kospi_count = _safe_int(config.get("kospi_count"))
         kosdaq_count = _safe_int(config.get("kosdaq_count"))
-        return min(max(kospi_count + kosdaq_count, 10), 120)
+        etf_count = _safe_int(config.get("etf_count"))
+        return min(max(kospi_count + kosdaq_count + etf_count, 10), 120)
 
     @router.get("/api/discovery/status")
     async def daily_discovery_status(
@@ -41,6 +42,7 @@ def build_discovery_router(deps: DiscoveryRouteDeps) -> APIRouter:
             "coverage": {
                 "kospi_count": int(config.get("kospi_count", 0)),
                 "kosdaq_count": int(config.get("kosdaq_count", 0)),
+                "etf_count": int(config.get("etf_count", 0)),
                 "candidate_limit_per_market": int(
                     config.get("candidate_limit_per_market", 0)
                 ),

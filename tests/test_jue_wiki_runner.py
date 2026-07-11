@@ -3,12 +3,226 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from tradecraft.config import AppSettings
 from tradecraft.runtime import jue_wiki_runner
 from tradecraft.runtime.jue_wiki_runner import build_service, run_once
 from tradecraft.services.jue_wiki import JueWikiConfig, JueWikiService
+
+
+def test_jue_wiki_runner_publishes_queue_health_after_repair_finalization(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repair_calls = 0
+    compaction_calls = 0
+    vacuum_calls = 0
+    cold_archive_verification_calls: list[tuple[Path, Path]] = []
+    application_shadow_paths: list[Path] = []
+
+    class SelectionAuditStore:
+        def compact_rejected(self, *, cutoff, apply) -> SimpleNamespace:
+            nonlocal compaction_calls
+            assert cutoff.tzinfo is not None
+            assert apply is True
+            compaction_calls += 1
+            return SimpleNamespace(
+                exported_keys=(("run-1", "page-1"),),
+                deleted_keys=(("run-1", "page-1"),),
+                entry_ids=("entry-1",),
+                verified=True,
+                dry_run=False,
+            )
+
+        def vacuum_hot_database(self) -> dict[str, object]:
+            nonlocal vacuum_calls
+            vacuum_calls += 1
+            return {
+                "status": "ok",
+                "backup_verified": True,
+                "reclaimed_bytes": 1024,
+            }
+
+    class Service:
+        config = SimpleNamespace(
+            investment_memory_db_path=None,
+            db_path=tmp_path / "jue_wiki" / "wiki.db",
+            cold_archive_root=tmp_path / "cold",
+        )
+
+        def rebuild(self, **_kwargs) -> dict[str, object]:
+            return {"status": "ok"}
+
+        def lint(self, **_kwargs) -> dict[str, object]:
+            return {"status": "ok"}
+
+        def repair_once(self, **_kwargs) -> dict[str, object]:
+            nonlocal repair_calls
+            repair_calls += 1
+            return {"status": "ok"}
+
+        def selection_audit_store(self) -> SelectionAuditStore:
+            return SelectionAuditStore()
+
+        def project_status_snapshot(self) -> dict[str, object]:
+            return {
+                "status": "ok",
+                "repair_health": {"repair_calls": repair_calls},
+            }
+
+    class Projector:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def compile_all(self) -> dict[str, object]:
+            return {"status": "ok"}
+
+        def project_all(self) -> dict[str, object]:
+            return {"status": "ok"}
+
+    class Application:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self._shadow_eligibility_reader = None
+
+        @property
+        def shadow_eligibility_reader(self):
+            return self._shadow_eligibility_reader
+
+        @shadow_eligibility_reader.setter
+        def shadow_eligibility_reader(self, value) -> None:
+            self._shadow_eligibility_reader = value
+            application_shadow_paths.append(Path(value.db_path))
+
+        def project_decision_links(self, **_kwargs) -> dict[str, object]:
+            return {"status": "ok"}
+
+        def backfill_decision_link_selected_wiki_pages(self) -> dict[str, object]:
+            return {"status": "ok"}
+
+        def project_selection_outcomes(self, **_kwargs) -> dict[str, object]:
+            return {"status": "ok"}
+
+        def project_page_effectiveness(self, **_kwargs) -> dict[str, object]:
+            return {"status": "ok"}
+
+        def archive_selection_outcomes(self, **_kwargs) -> dict[str, object]:
+            return {"status": "ok"}
+
+        def project_mode_recommendations(self, **_kwargs) -> dict[str, object]:
+            return {"status": "ok"}
+
+        def project_status_snapshot(self) -> dict[str, object]:
+            return {"status": "ok"}
+
+        def status(self) -> dict[str, object]:
+            return {"status": "ok"}
+
+    monkeypatch.setattr(jue_wiki_runner, "JueWikiPlaybookCompiler", Projector)
+    monkeypatch.setattr(jue_wiki_runner, "JueWikiPerformanceProjector", Projector)
+    monkeypatch.setattr(jue_wiki_runner, "JueWikiApplicationService", Application)
+    monkeypatch.setattr(
+        jue_wiki_runner,
+        "persist_runtime_cold_archive_status",
+        lambda *, root, jue_wiki_db_path: (
+            cold_archive_verification_calls.append(
+                (Path(root), Path(jue_wiki_db_path))
+            )
+            or {
+                "status": "ok",
+                "entry_count": 2,
+                "corrupt_entry_ids": [],
+                "verification_snapshot": {"status": "current"},
+            }
+        ),
+        raising=False,
+    )
+
+    result = run_once(
+        service=Service(),  # type: ignore[arg-type]
+        state_path=tmp_path / "state.json",
+        eligibility_db_path=tmp_path / "shadow" / "jue_wiki_shadow.db",
+        repair_enabled=True,
+        application_enabled=True,
+    )
+
+    assert result["repair_finalization"]["status"] == "ok"
+    assert application_shadow_paths == [
+        tmp_path / "shadow" / "jue_wiki_shadow.db"
+    ]
+    assert compaction_calls == 1
+    assert vacuum_calls == 1
+    assert {
+        key: result["selection_audit_compaction"][key]
+        for key in (
+            "status",
+            "verified",
+            "exported_count",
+            "deleted_count",
+            "entry_ids",
+            "database_compaction",
+            "cold_archive_verification",
+        )
+    } == {
+        "status": "ok",
+        "verified": True,
+        "exported_count": 1,
+        "deleted_count": 1,
+        "entry_ids": ["entry-1"],
+        "database_compaction": {
+            "status": "ok",
+            "backup_verified": True,
+            "reclaimed_bytes": 1024,
+        },
+        "cold_archive_verification": {
+            "status": "ok",
+            "entry_count": 2,
+            "corrupt_entry_ids": [],
+            "verification_snapshot": {"status": "current"},
+        },
+    }
+    assert cold_archive_verification_calls == [
+        (tmp_path / "cold", tmp_path / "jue_wiki" / "wiki.db")
+    ]
+    assert result["ops_snapshot"]["repair_health"]["repair_calls"] == 2
+
+
+def test_runner_mode_eligibility_normalization_fails_closed_and_preserves_identity() -> None:
+    normalized = jue_wiki_runner._stored_mode_eligibility(
+        {
+            "wiki_mode_recommendations": {
+                "recommendations": [
+                    {
+                        "version": "",
+                        "venue": "kis",
+                        "required_eligible": True,
+                        "sample_count": True,
+                        "blockers": [],
+                        "evaluated_at": "2026-07-12T00:00:00+00:00",
+                        "evaluated_through": "2026-07-12T00:00:00+00:00",
+                    },
+                    {
+                        "version": "wiki_shadow_eligibility_v1",
+                        "venue": "binance",
+                        "required_eligible": False,
+                        "sample_count": 420,
+                        "blockers": ["insufficient_complete_comparisons"],
+                        "evaluated_at": "2026-07-12T00:00:00+00:00",
+                        "evaluated_through": "2026-07-11T23:59:00+00:00",
+                    },
+                ]
+            }
+        }
+    )
+
+    assert normalized is not None
+    assert normalized["kis"]["required_eligible"] is False
+    assert "eligibility_invalid" in normalized["kis"]["blockers"]
+    assert normalized["binance"]["version"] == "wiki_shadow_eligibility_v1"
+    assert normalized["binance"]["evaluated_through"] == (
+        "2026-07-11T23:59:00+00:00"
+    )
 
 
 def test_jue_wiki_runner_run_once_rebuilds_and_writes_state(
@@ -225,6 +439,57 @@ def test_jue_wiki_runner_cycle_reports_phase3_application(tmp_path: Path) -> Non
     assert "application" in result
     assert "effectiveness" in result["application"]
     assert result["application"]["status"] in {"ok", "disabled", "error"}
+
+
+def test_runner_wires_read_only_shadow_eligibility_without_replacing_prompt_modes(
+    tmp_path: Path,
+) -> None:
+    service = JueWikiService(
+        JueWikiConfig(
+            root_path=tmp_path / "jue_wiki",
+            db_path=tmp_path / "jue_wiki" / "wiki.db",
+        )
+    )
+
+    result = run_once(
+        service=service,
+        state_path=tmp_path / "state.json",
+        market_judgment_db_path=tmp_path / "missing_market_judgment.db",
+        eligibility_db_path=tmp_path / "shadow" / "jue_wiki_shadow.db",
+        settings=SimpleNamespace(
+            jue_wiki_read_mode="required",
+            jue_wiki_provenance_key_path=(
+                tmp_path / "keys" / "jue_wiki_provenance.key"
+            ),
+        ),
+    )
+
+    application = result["application"]
+    assert "mode_recommendations" in application
+    assert "wiki_mode_recommendations" in application
+    assert application["wiki_mode_recommendations"]["read_only"] is True
+    assert {
+        row["venue"] for row in application["wiki_mode_recommendations"]["recommendations"]
+    } == {"kis", "binance"}
+    assert all(
+        row["required_eligible"] is False
+        for row in application["wiki_mode_recommendations"]["recommendations"]
+    )
+    stored_v3 = result["ops_snapshot"]["v3"]
+    assert stored_v3["active_read_mode"] == "required"
+    assert set(stored_v3["mode_eligibility"]) == {"kis", "binance"}
+    assert all(
+        row["required_eligible"] is False
+        for row in stored_v3["mode_eligibility"].values()
+    )
+    with sqlite3.connect(service.config.db_path) as conn:
+        shadow_tables = conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name LIKE 'wiki_shadow_%'
+            """
+        ).fetchall()
+    assert shadow_tables == []
 
 
 def test_jue_wiki_runner_surfaces_application_warning_status(

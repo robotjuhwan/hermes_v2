@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import stat
+from pathlib import Path
 from typing import Any
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_MARKET_INTELLIGENCE_SOURCES_JSON = json.dumps(
@@ -182,6 +184,18 @@ class AppSettings(BaseSettings):
     runtime_sessions_path: str = Field(
         default="", alias="TRADECRAFT_RUNTIME_SESSIONS_PATH"
     )
+    ops_readiness_snapshot_path: str = Field(
+        default=".runtime/ops_readiness_snapshot.json",
+        alias="TRADECRAFT_OPS_READINESS_SNAPSHOT_PATH",
+    )
+    ops_readiness_refresh_interval_sec: float = Field(
+        default=15.0,
+        alias="TRADECRAFT_OPS_READINESS_REFRESH_INTERVAL_SEC",
+    )
+    ops_readiness_snapshot_max_age_sec: float = Field(
+        default=60.0,
+        alias="TRADECRAFT_OPS_READINESS_SNAPSHOT_MAX_AGE_SEC",
+    )
     backtest_cycles: int = Field(default=720, alias="TRADECRAFT_BACKTEST_CYCLES")
     backtest_step_sec: int = Field(default=60, alias="TRADECRAFT_BACKTEST_STEP_SEC")
     backtest_speed: float = Field(default=120.0, alias="TRADECRAFT_BACKTEST_SPEED")
@@ -229,6 +243,26 @@ class AppSettings(BaseSettings):
     runtime_max_age_sec: int = Field(default=90, alias="TRADECRAFT_RUNTIME_MAX_AGE_SEC")
     runtime_write_interval_sec: int = Field(
         default=5, alias="TRADECRAFT_RUNTIME_WRITE_INTERVAL_SEC"
+    )
+    runtime_cold_archive_root: str = Field(
+        default=".runtime-cold-archive",
+        alias="TRADECRAFT_RUNTIME_COLD_ARCHIVE_ROOT",
+    )
+    runtime_storage_archive_dryrun: bool = Field(
+        default=True,
+        alias="TRADECRAFT_RUNTIME_STORAGE_ARCHIVE_DRYRUN",
+    )
+    runtime_storage_dryrun_hot_hours: int = Field(
+        default=24,
+        alias="TRADECRAFT_RUNTIME_STORAGE_DRYRUN_HOT_HOURS",
+    )
+    runtime_storage_dryrun_hot_per_scenario: int = Field(
+        default=3,
+        alias="TRADECRAFT_RUNTIME_STORAGE_DRYRUN_HOT_PER_SCENARIO",
+    )
+    runtime_storage_archive_rag_rebuild_backups: bool = Field(
+        default=True,
+        alias="TRADECRAFT_RUNTIME_STORAGE_ARCHIVE_RAG_REBUILD_BACKUPS",
     )
     runtime_storage_large_file_threshold_mb: int = Field(
         default=10,
@@ -446,12 +480,36 @@ class AppSettings(BaseSettings):
         alias="TRADECRAFT_JUE_CODEX_LAB_MARKET_HOURS_HOT_DEPLOY",
     )
     llm_model: str = Field(
-        default="gpt-5.5",
+        default="gpt-5.6-sol",
         alias="TRADECRAFT_LLM_MODEL",
     )
     llm_reasoning_effort: str = Field(
         default="xhigh",
         alias="TRADECRAFT_LLM_REASONING_EFFORT",
+    )
+    llm_reasoning_model: str = Field(
+        default="gpt-5.6-terra",
+        alias="TRADECRAFT_LLM_REASONING_MODEL",
+    )
+    llm_reasoning_model_effort: str = Field(
+        default="high",
+        alias="TRADECRAFT_LLM_REASONING_MODEL_EFFORT",
+    )
+    llm_utility_model: str = Field(
+        default="gpt-5.6-luna",
+        alias="TRADECRAFT_LLM_UTILITY_MODEL",
+    )
+    llm_utility_model_effort: str = Field(
+        default="medium",
+        alias="TRADECRAFT_LLM_UTILITY_MODEL_EFFORT",
+    )
+    llm_offline_model: str = Field(
+        default="gpt-5.6-sol",
+        alias="TRADECRAFT_LLM_OFFLINE_MODEL",
+    )
+    llm_offline_model_effort: str = Field(
+        default="max",
+        alias="TRADECRAFT_LLM_OFFLINE_MODEL_EFFORT",
     )
     jue_strategy_revision_id: str = Field(
         default="jue_edge_repair_v1",
@@ -486,6 +544,20 @@ class AppSettings(BaseSettings):
             "jue_wiki_db_path",
         ),
     )
+    jue_wiki_shadow_db_path: str = Field(
+        default=str(Path.home() / ".tradecraft" / "jue_wiki_shadow.db"),
+        validation_alias=AliasChoices(
+            "TRADECRAFT_JUE_WIKI_SHADOW_DB_PATH",
+            "jue_wiki_shadow_db_path",
+        ),
+    )
+    jue_wiki_provenance_key_path: str = Field(
+        default=str(Path.home() / ".tradecraft" / "jue_wiki_provenance.key"),
+        validation_alias=AliasChoices(
+            "TRADECRAFT_JUE_WIKI_PROVENANCE_KEY_PATH",
+            "jue_wiki_provenance_key_path",
+        ),
+    )
     jue_wiki_context_max_chars: int = Field(
         default=24000,
         validation_alias=AliasChoices(
@@ -499,6 +571,22 @@ class AppSettings(BaseSettings):
             "TRADECRAFT_JUE_WIKI_RUNNER_INTERVAL_SEC",
             "jue_wiki_runner_interval_sec",
         ),
+    )
+    jue_wiki_repair_overdue_sec: int = Field(
+        default=86_400,
+        alias="TRADECRAFT_JUE_WIKI_REPAIR_OVERDUE_SEC",
+    )
+    jue_wiki_repair_stall_sec: int = Field(
+        default=21_600,
+        alias="TRADECRAFT_JUE_WIKI_REPAIR_STALL_SEC",
+    )
+    jue_wiki_repair_growth_window_sec: int = Field(
+        default=86_400,
+        alias="TRADECRAFT_JUE_WIKI_REPAIR_GROWTH_WINDOW_SEC",
+    )
+    jue_wiki_repair_growth_warn_count: int = Field(
+        default=25,
+        alias="TRADECRAFT_JUE_WIKI_REPAIR_GROWTH_WARN_COUNT",
     )
     jue_wiki_page_max_chars: int = Field(
         default=12000,
@@ -519,6 +607,20 @@ class AppSettings(BaseSettings):
         validation_alias=AliasChoices(
             "TRADECRAFT_JUE_WIKI_PROMPT_MODE",
             "jue_wiki_prompt_mode",
+        ),
+    )
+    jue_wiki_read_mode: str = Field(
+        default="shadow",
+        validation_alias=AliasChoices(
+            "TRADECRAFT_JUE_WIKI_READ_MODE",
+            "jue_wiki_read_mode",
+        ),
+    )
+    jue_wiki_promotion_thresholds_json: str = Field(
+        default="{}",
+        validation_alias=AliasChoices(
+            "TRADECRAFT_JUE_WIKI_PROMOTION_THRESHOLDS_JSON",
+            "jue_wiki_promotion_thresholds_json",
         ),
     )
     jue_wiki_selector_max_pages: int = Field(
@@ -702,6 +804,22 @@ class AppSettings(BaseSettings):
         default=300,
         alias="TRADECRAFT_KIS_BLOCK_TRADER_MANAGER_ERROR_RETRY_SEC",
     )
+    kis_pre_open_monitor_enabled: bool = Field(
+        default=True,
+        alias="TRADECRAFT_KIS_PRE_OPEN_MONITOR_ENABLED",
+    )
+    kis_pre_open_monitor_symbols: str = Field(
+        default="",
+        alias="TRADECRAFT_KIS_PRE_OPEN_MONITOR_SYMBOLS",
+    )
+    kis_pre_open_monitor_max_symbols: int = Field(
+        default=30,
+        alias="TRADECRAFT_KIS_PRE_OPEN_MONITOR_MAX_SYMBOLS",
+    )
+    kis_pre_open_monitor_interval_sec: int = Field(
+        default=300,
+        alias="TRADECRAFT_KIS_PRE_OPEN_MONITOR_INTERVAL_SEC",
+    )
     kis_block_trader_retention_interval_sec: int = Field(
         default=3600,
         alias="TRADECRAFT_KIS_BLOCK_TRADER_RETENTION_INTERVAL_SEC",
@@ -808,6 +926,14 @@ class AppSettings(BaseSettings):
         default=1800,
         alias="TRADECRAFT_BINANCE_BLOCK_TRADER_MANAGER_INTERVAL_SEC",
     )
+    binance_block_trader_waiting_entry_max_age_sec: int = Field(
+        default=172800,
+        alias="TRADECRAFT_BINANCE_BLOCK_TRADER_WAITING_ENTRY_MAX_AGE_SEC",
+    )
+    binance_block_trader_entry_pending_max_age_sec: int = Field(
+        default=600,
+        alias="TRADECRAFT_BINANCE_BLOCK_TRADER_ENTRY_PENDING_MAX_AGE_SEC",
+    )
     binance_block_trader_manager_error_retry_sec: int = Field(
         default=300,
         alias="TRADECRAFT_BINANCE_BLOCK_TRADER_MANAGER_ERROR_RETRY_SEC",
@@ -825,7 +951,7 @@ class AppSettings(BaseSettings):
         alias="TRADECRAFT_BINANCE_BLOCK_TRADER_TELEGRAM_REPORT_SLOTS",
     )
     binance_block_trader_llm_model: str = Field(
-        default="gpt-5.5",
+        default="gpt-5.6-sol",
         alias="TRADECRAFT_BINANCE_BLOCK_TRADER_LLM_MODEL",
     )
     binance_block_trader_llm_reasoning_effort: str = Field(
@@ -1116,7 +1242,7 @@ class AppSettings(BaseSettings):
         alias="TRADECRAFT_CRYPTO_MARKET_RESEARCH_MIN_QUOTE_VOLUME_USDT",
     )
     crypto_market_research_kline_intervals: str = Field(
-        default="1m:120,5m:96,15m:96,1h:168,4h:180",
+        default="1m:120,5m:96,15m:96,1h:168,4h:180,1d:90",
         alias="TRADECRAFT_CRYPTO_MARKET_RESEARCH_KLINE_INTERVALS",
     )
     crypto_market_research_kline_hot_window_rows: int = Field(
@@ -1156,11 +1282,11 @@ class AppSettings(BaseSettings):
         alias="TRADECRAFT_CRYPTO_MARKET_RESEARCH_LLM_INTERVAL_SEC",
     )
     crypto_market_research_llm_model: str = Field(
-        default="gpt-5.5",
+        default="gpt-5.6-terra",
         alias="TRADECRAFT_CRYPTO_MARKET_RESEARCH_LLM_MODEL",
     )
     crypto_market_research_llm_reasoning_effort: str = Field(
-        default="xhigh",
+        default="high",
         alias="TRADECRAFT_CRYPTO_MARKET_RESEARCH_LLM_REASONING_EFFORT",
     )
     crypto_market_research_external_enabled: bool = Field(
@@ -1355,11 +1481,11 @@ class AppSettings(BaseSettings):
         alias="TRADECRAFT_CRYPTO_ALPHA_CONTEXT_LIMIT",
     )
     crypto_alpha_llm_model: str = Field(
-        default="gpt-5.5",
+        default="gpt-5.6-luna",
         alias="TRADECRAFT_CRYPTO_ALPHA_LLM_MODEL",
     )
     crypto_alpha_llm_reasoning_effort: str = Field(
-        default="xhigh",
+        default="medium",
         alias="TRADECRAFT_CRYPTO_ALPHA_LLM_REASONING_EFFORT",
     )
     etf_research_db_path: str = Field(
@@ -1616,6 +1742,10 @@ class AppSettings(BaseSettings):
         default=30,
         alias="TRADECRAFT_DAILY_DISCOVERY_KOSDAQ_COUNT",
     )
+    daily_discovery_etf_count: int = Field(
+        default=5,
+        alias="TRADECRAFT_DAILY_DISCOVERY_ETF_COUNT",
+    )
     daily_discovery_exclude_recent_days: int = Field(
         default=10,
         alias="TRADECRAFT_DAILY_DISCOVERY_EXCLUDE_RECENT_DAYS",
@@ -1654,6 +1784,18 @@ class AppSettings(BaseSettings):
     naver_reports_cycle_timeout_sec: int = Field(
         default=3600,
         alias="TRADECRAFT_NAVER_REPORTS_CYCLE_TIMEOUT_SEC",
+    )
+    naver_reports_state_path: str = Field(
+        default=".runtime/naver_reports_runner.json",
+        alias="TRADECRAFT_NAVER_REPORTS_STATE_PATH",
+    )
+    naver_reports_heartbeat_interval_sec: float = Field(
+        default=5.0,
+        alias="TRADECRAFT_NAVER_REPORTS_HEARTBEAT_INTERVAL_SEC",
+    )
+    naver_reports_worker_terminate_grace_sec: float = Field(
+        default=5.0,
+        alias="TRADECRAFT_NAVER_REPORTS_WORKER_TERMINATE_GRACE_SEC",
     )
     naver_reports_max_pages: int = Field(
         default=5,
@@ -1856,6 +1998,18 @@ class AppSettings(BaseSettings):
         default=60,
         alias="TRADECRAFT_MARKET_JUDGE_LLM_MAX_SYMBOLS",
     )
+    market_judge_prompt_target_chars: int = Field(
+        default=120_000,
+        alias="TRADECRAFT_MARKET_JUDGE_PROMPT_TARGET_CHARS",
+    )
+    market_judge_prompt_warn_chars: int = Field(
+        default=150_000,
+        alias="TRADECRAFT_MARKET_JUDGE_PROMPT_WARN_CHARS",
+    )
+    market_judge_prompt_max_chars: int = Field(
+        default=190_000,
+        alias="TRADECRAFT_MARKET_JUDGE_PROMPT_MAX_CHARS",
+    )
     market_judge_use_naver_fallback: bool = Field(
         default=False,
         alias="TRADECRAFT_MARKET_JUDGE_USE_NAVER_FALLBACK",
@@ -1969,6 +2123,90 @@ class AppSettings(BaseSettings):
         default=".runtime/reports_worker_state.json",
         alias="TRADECRAFT_REPORTS_WORKER_STATE_PATH",
     )
+
+    @field_validator("jue_wiki_read_mode")
+    @classmethod
+    def validate_jue_wiki_read_mode(cls, value: str) -> str:
+        if value not in {"shadow", "prefer", "required"}:
+            raise ValueError(
+                "jue_wiki_read_mode must be one of: shadow, prefer, required"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_jue_wiki_integrity_paths(self) -> AppSettings:
+        shadow = Path(self.jue_wiki_shadow_db_path).expanduser()
+        key = Path(self.jue_wiki_provenance_key_path).expanduser()
+        if not shadow.is_absolute() or not key.is_absolute():
+            raise ValueError("jue_wiki_integrity_path_must_be_absolute")
+        for candidate in (shadow, key):
+            try:
+                candidate_stat = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(candidate_stat.st_mode)
+                or candidate_stat.st_nlink != 1
+            ):
+                raise ValueError("jue_wiki_integrity_path_inode_unsafe")
+        shadow = shadow.resolve(strict=False)
+        key = key.resolve(strict=False)
+        raw = Path(self.jue_wiki_db_path).expanduser()
+        raw = (raw if raw.is_absolute() else Path.cwd() / raw).resolve(strict=False)
+        if shadow == raw or key == shadow or key == raw:
+            raise ValueError("jue_wiki_integrity_path_collision")
+        if ".runtime" in shadow.parts or ".runtime" in key.parts:
+            raise ValueError("jue_wiki_integrity_path_runtime_forbidden")
+        self.jue_wiki_shadow_db_path = str(shadow)
+        self.jue_wiki_provenance_key_path = str(key)
+        return self
+
+    @property
+    def jue_wiki_promotion_thresholds(self) -> dict[str, dict[str, int]]:
+        parsed, warnings = self._parse_jue_wiki_promotion_thresholds()
+        return {} if warnings else parsed
+
+    @property
+    def jue_wiki_promotion_threshold_warnings(self) -> list[str]:
+        _, warnings = self._parse_jue_wiki_promotion_thresholds()
+        return warnings
+
+    def _parse_jue_wiki_promotion_thresholds(
+        self,
+    ) -> tuple[dict[str, dict[str, int]], list[str]]:
+        raw = str(self.jue_wiki_promotion_thresholds_json or "").strip()
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}, ["promotion_thresholds_json_malformed"]
+        if not isinstance(payload, dict):
+            return {}, ["promotion_thresholds_must_be_object"]
+        parsed: dict[str, dict[str, int]] = {}
+        warnings: list[str] = []
+        for raw_venue in sorted(payload, key=str):
+            venue = str(raw_venue).strip().lower()
+            playbooks = payload[raw_venue]
+            if not venue or not isinstance(playbooks, dict):
+                warnings.append(f"promotion_threshold_venue_invalid:{venue or '<empty>'}")
+                continue
+            venue_thresholds: dict[str, int] = {}
+            for raw_playbook in sorted(playbooks, key=str):
+                playbook = str(raw_playbook).strip().lower()
+                threshold = playbooks[raw_playbook]
+                prefix = f"promotion_threshold_invalid:{venue}:{playbook or '<empty>'}"
+                if not playbook:
+                    warnings.append(f"{prefix}:playbook")
+                elif isinstance(threshold, bool):
+                    warnings.append(f"{prefix}:boolean")
+                elif not isinstance(threshold, int):
+                    warnings.append(f"{prefix}:not_integer")
+                elif threshold <= 0:
+                    warnings.append(f"{prefix}:not_positive")
+                else:
+                    venue_thresholds[playbook] = threshold
+            if venue_thresholds:
+                parsed[venue] = venue_thresholds
+        return parsed, sorted(warnings)
 
     @property
     def cors_origins(self) -> list[str]:

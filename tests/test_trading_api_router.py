@@ -143,6 +143,8 @@ def test_trading_validation_status_passes_venue() -> None:
         "venue": "binance",
         "readiness": "normal",
         "discipline_count": 0,
+        "failed_discipline_ids": [],
+        "warned_discipline_ids": [],
     }
     assert full_response.json() == {
         "status": "ok",
@@ -222,6 +224,8 @@ def test_trading_validation_short_status_alias_accepts_compact_query() -> None:
         "venue": "kis",
         "readiness": "normal",
         "discipline_count": 0,
+        "failed_discipline_ids": [],
+        "warned_discipline_ids": [],
     }
     assert full_response.json() == {"status": "ok", "venue": "kis", "readiness": "normal"}
     assert calls == [

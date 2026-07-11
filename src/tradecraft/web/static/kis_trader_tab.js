@@ -391,6 +391,27 @@
     const ruleMode = isWaitingEntry
       ? "매수 조건 감시"
       : row.rule_exit_mode || (horizon === "short" ? "목표/손절 룰 감시" : "30분 매니저 검토");
+    const fillProvenance = String(
+      metadata.fill_provenance
+      || metadata.fill_source
+      || row.fill_provenance
+      || row.fill_source
+      || row.execution_source
+      || ""
+    ).toLowerCase();
+    const provenanceChips = [
+      row.created_by === "existing_position"
+        ? '<span class="strategy-data-chip warn">기존 보유 채택 · 쥬 진입 성과 제외</span>'
+        : "",
+      fillProvenance.includes("exchange") || fillProvenance === "live_fill"
+        ? '<span class="strategy-data-chip good">거래소 체결</span>'
+        : fillProvenance.includes("paper")
+          ? '<span class="strategy-data-chip neutral">Paper 체결</span>'
+          : "",
+      ["failed", "failed_entry", "rejected", "error"].includes(String(row.status || "").toLowerCase())
+        ? '<span class="strategy-data-chip bad">진입 실패 · 체결 없음</span>'
+        : "",
+    ].join("");
     return `
     <article class="block-card ${escape(tone)} horizon-${escape(horizonClass)}" data-kis-block-id="${escape(row.block_id || "")}">
       <div class="block-card-head">
@@ -430,12 +451,12 @@
         ${decisionClass ? `<span class="block-chip decision">${escape(decisionClass)}</span>` : ""}
         ${stopPolicy ? `<span class="block-chip stop-policy">${escape(stopPolicy)}</span>` : ""}
         ${maxLoss > 0 ? `<span class="block-chip risk">최대손실 ${escape(formatKRW(maxLoss))}</span>` : ""}
+        ${provenanceChips}
         ${renderBlockValidationChips(metadata)}
         ${renderValidationPassportChips(metadata)}
         ${renderBlockCostFeasibilityChips(metadata)}
         ${renderBlockPolicyEffectChips(metadata)}
         <span class="strategy-data-chip ${reflection.status === "reflected" ? "good" : "neutral"}">${escape(reflection.status === "reflected" ? "반성 완료" : reflection.status === "pending" ? "반성 대기" : "반성 미대상")}</span>
-        ${row.created_by === "existing_position" ? '<span class="strategy-data-chip">기존 보유</span>' : ""}
         ${policyImpacts.slice(0, 2).map((item) => `<span class="strategy-data-chip warn">${escape(item.rule_id || item.policy_id || "policy")}</span>`).join("")}
         ${preferredHorizon ? `<span class="strategy-data-chip good">사용자 ${escape(blockHorizonLabel(preferredHorizon))}</span>` : ""}
         ${

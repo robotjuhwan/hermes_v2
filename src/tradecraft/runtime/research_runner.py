@@ -15,6 +15,7 @@ from tradecraft.config import AppSettings
 from tradecraft.runtime.process_status import write_current_runner_pid
 from tradecraft.runtime.state_store import RuntimeStateStore, utc_now_iso
 from tradecraft.services.codex_native import codex_native_service_config_kwargs
+from tradecraft.services.llm_model_policy import resolve_llm_model_policy
 from tradecraft.services.intelligence import (
     build_report_intelligence_stack,
     run_report_collection_cycle,
@@ -82,6 +83,7 @@ def _write_research_disabled_snapshot(
 
 
 def _build_pipeline(settings: AppSettings) -> ResearchPipeline:
+    llm_policy = resolve_llm_model_policy(settings, component="research_pipeline")
     config = ResearchPipelineConfig(
         state_path=settings.research_state_path,
         strategy_md_path=settings.research_strategy_md_path,
@@ -102,8 +104,8 @@ def _build_pipeline(settings: AppSettings) -> ResearchPipeline:
         codex_runtime_mode=settings.codex_runtime_mode,
         codex_runtime_sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
         codex_runtime_timeout_ms=settings.codex_runtime_timeout_ms,
-        llm_model=settings.llm_model,
-        llm_reasoning_effort=settings.llm_reasoning_effort,
+        llm_model=llm_policy.model,
+        llm_reasoning_effort=llm_policy.reasoning_effort,
         llm_usage_enabled=settings.llm_usage_enabled,
         llm_usage_db_path=settings.llm_usage_db_path,
         llm_usage_component="research_pipeline",
@@ -591,6 +593,10 @@ def run(service_name: str = "tradecraft-research") -> None:
     rag_store = report_stack.rag_store
     portfolio_coach: PortfolioCoachService | None = None
     if settings.portfolio_coach_enabled and kis is not None:
+        portfolio_llm_policy = resolve_llm_model_policy(
+            settings,
+            component="portfolio_coach",
+        )
         portfolio_coach = PortfolioCoachService(
             PortfolioCoachConfig(
                 state_db_path=settings.portfolio_coach_db_path,
@@ -613,8 +619,8 @@ def run(service_name: str = "tradecraft-research") -> None:
                 codex_runtime_mode=settings.codex_runtime_mode,
                 codex_runtime_sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
                 codex_runtime_timeout_ms=settings.codex_runtime_timeout_ms,
-                llm_model=settings.llm_model,
-                llm_reasoning_effort=settings.llm_reasoning_effort,
+                llm_model=portfolio_llm_policy.model,
+                llm_reasoning_effort=portfolio_llm_policy.reasoning_effort,
                 llm_usage_enabled=settings.llm_usage_enabled,
                 llm_usage_db_path=settings.llm_usage_db_path,
                 llm_usage_component="portfolio_coach",

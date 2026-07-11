@@ -5,9 +5,11 @@ import inspect
 import json
 import logging
 import math
+import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Iterable
 
 from tradecraft.config import AppSettings
 from tradecraft.runtime.live_evaluator_runner import build_live_authority_payload
@@ -29,6 +31,17 @@ from tradecraft.services.investment_memory import (
     InvestmentMemoryService,
 )
 from tradecraft.services.jue_wiki import JueWikiConfig, JueWikiService
+from tradecraft.services.jue_wiki_context import (
+    JueWikiContextService,
+    evaluate_wiki_decision_gate,
+)
+from tradecraft.services.jue_wiki_contract import WikiContextRequestV1
+from tradecraft.services.jue_wiki_repository import JueWikiRepository
+from tradecraft.services.jue_wiki_shadow import (
+    JueWikiShadowStore,
+    WikiCompletionSigner,
+    build_runtime_recording_recorder,
+)
 from tradecraft.services.jue_wiki_selector import (
     JueWikiSelectionRequest,
     JueWikiSelector,
@@ -39,6 +52,7 @@ from tradecraft.services.codex_native import (
     CodexNativeRuntime,
     codex_native_thread_config_kwargs,
 )
+from tradecraft.services.llm_model_policy import llm_model_config_kwargs
 
 try:
     from tradecraft.services.crypto_market_research import (
@@ -114,6 +128,11 @@ def _jue_wiki_prompt_mode(settings: AppSettings) -> str:
     return mode if mode in {"observe", "assist", "primary"} else "assist"
 
 
+def _jue_wiki_read_mode(settings: AppSettings) -> str:
+    mode = str(_setting(settings, "jue_wiki_read_mode", "shadow") or "shadow")
+    return mode if mode in {"shadow", "prefer", "required"} else "shadow"
+
+
 def _selector_context_provider(
     service: JueWikiService,
     settings: AppSettings,
@@ -126,41 +145,157 @@ def _selector_context_provider(
                 _setting(settings, "jue_wiki_context_max_chars", 24000),
             )
         )
-        result = JueWikiSelector(service).select(
-            JueWikiSelectionRequest(
-                target_scope=str(kwargs.get("target_scope") or ""),
-                symbols=_jue_wiki_arg_list(kwargs, "symbols"),
-                page_types=_jue_wiki_arg_list(kwargs, "page_types"),
-                lanes=_jue_wiki_arg_list(kwargs, "lanes"),
-                regimes=_jue_wiki_arg_list(kwargs, "regimes"),
-                block_ids=_jue_wiki_arg_list(kwargs, "block_ids"),
-                horizons=_jue_wiki_arg_list(kwargs, "horizons"),
-                max_chars=int(
-                    kwargs["max_chars"]
-                    if kwargs.get("max_chars") is not None
-                    else default_max_chars
+        target_scope = str(kwargs.get("target_scope") or "")
+        symbols = _jue_wiki_arg_list(kwargs, "symbols")
+        page_types = _jue_wiki_arg_list(kwargs, "page_types")
+        lanes = _jue_wiki_arg_list(kwargs, "lanes")
+        regimes = _jue_wiki_arg_list(kwargs, "regimes")
+        block_ids = _jue_wiki_arg_list(kwargs, "block_ids")
+        horizons = _jue_wiki_arg_list(kwargs, "horizons")
+        max_chars = int(
+            kwargs["max_chars"]
+            if kwargs.get("max_chars") is not None
+            else default_max_chars
+        )
+        read_mode = _jue_wiki_read_mode(settings)
+        try:
+            context_service = JueWikiContextService(
+                JueWikiRepository(
+                    Path(str(_setting(settings, "jue_wiki_db_path", "")))
                 ),
-                max_pages=int(_setting(settings, "jue_wiki_selector_max_pages", 24)),
-                min_confidence=float(
-                    _setting(settings, "jue_wiki_selector_min_confidence", 0.15)
-                ),
-                exclude_lint_warnings=bool(
-                    _setting(settings, "jue_wiki_exclude_lint_warnings", False)
-                ),
-                effectiveness_weight=float(
-                    _setting(settings, "jue_wiki_effectiveness_weight", 0.12)
-                ),
-                effectiveness_max_adjustment=float(
-                    _setting(settings, "jue_wiki_effectiveness_max_adjustment", 8.0)
+                health_reader=service.status,
+                eligibility_reader=JueWikiShadowStore(
+                    Path(str(_setting(
+                        settings, "jue_wiki_shadow_db_path",
+                        str(Path.home() / ".tradecraft" / "jue_wiki_shadow.db"),
+                    ))),
+                    completion_verifier=WikiCompletionSigner(
+                        Path(str(_setting(
+                            settings, "jue_wiki_provenance_key_path",
+                            os.environ.get(
+                                "TRADECRAFT_JUE_WIKI_PROVENANCE_KEY_PATH",
+                                str(Path.home() / ".tradecraft" / "jue_wiki_provenance.key"),
+                            ),
+                        )))
+                    ),
                 ),
             )
-        )
+            packet = context_service.context_packet(
+                WikiContextRequestV1(
+                    target_scope=target_scope,
+                    symbols=tuple(symbols),
+                    page_types=tuple(page_types),
+                    lanes=tuple(lanes),
+                    regimes=tuple(regimes),
+                    block_ids=tuple(block_ids),
+                    horizons=tuple(horizons),
+                    max_chars=max_chars,
+                ),
+                read_mode=read_mode,
+            )
+            gate_payload = evaluate_wiki_decision_gate(packet).to_dict()
+            packet_payload = packet.to_dict()
+        except Exception as exc:
+            packet_payload = {
+                "status": "error",
+                "read_mode": read_mode,
+                "snapshot_id": "",
+                "error_message": str(exc),
+            }
+            gate_payload = {
+                "allow_new_risk": read_mode != "required",
+                "allow_exit_actions": True,
+                "reason": (
+                    "wiki_required_context_unavailable"
+                    if read_mode == "required"
+                    else "wiki_context_advisory"
+                ),
+                "read_mode": read_mode,
+                "snapshot_id": "",
+                "version": "wiki_decision_gate_v1",
+            }
+        base_payload = {
+            "read_mode": read_mode,
+            "jue_wiki_context_packet": packet_payload,
+            "jue_wiki_decision_gate": gate_payload,
+        }
+        wiki_enabled = bool(_setting(settings, "jue_wiki_enabled", True))
+        if read_mode == "required" and not wiki_enabled:
+            return {
+                **base_payload,
+                "status": "disabled",
+                "target_scope": target_scope,
+                "prompt_mode": _jue_wiki_prompt_mode(settings),
+                "jue_wiki_decision_gate": {
+                    "allow_new_risk": False,
+                    "allow_exit_actions": True,
+                    "reason": "wiki_required_disabled",
+                    "read_mode": "required",
+                    "snapshot_id": "",
+                    "version": "wiki_decision_gate_v1",
+                },
+            }
+        try:
+            result = JueWikiSelector(service).select(
+                JueWikiSelectionRequest(
+                    target_scope=target_scope,
+                    symbols=symbols,
+                    page_types=page_types,
+                    lanes=lanes,
+                    regimes=regimes,
+                    block_ids=block_ids,
+                    horizons=horizons,
+                    max_chars=max_chars,
+                    max_pages=int(
+                        _setting(settings, "jue_wiki_selector_max_pages", 24)
+                    ),
+                    min_confidence=float(
+                        _setting(settings, "jue_wiki_selector_min_confidence", 0.15)
+                    ),
+                    exclude_lint_warnings=bool(
+                        _setting(settings, "jue_wiki_exclude_lint_warnings", False)
+                    ),
+                    effectiveness_weight=float(
+                        _setting(settings, "jue_wiki_effectiveness_weight", 0.12)
+                    ),
+                    effectiveness_max_adjustment=float(
+                        _setting(settings, "jue_wiki_effectiveness_max_adjustment", 8.0)
+                    ),
+                )
+            )
+        except Exception as exc:
+            if read_mode == "required":
+                base_payload["jue_wiki_decision_gate"] = {
+                    "allow_new_risk": False,
+                    "allow_exit_actions": True,
+                    "reason": "wiki_required_selector_unavailable",
+                    "read_mode": "required",
+                    "snapshot_id": str(gate_payload.get("snapshot_id") or ""),
+                    "version": "wiki_decision_gate_v1",
+                }
+            return {
+                **base_payload,
+                "status": "error",
+                "target_scope": target_scope,
+                "prompt_mode": _jue_wiki_prompt_mode(settings),
+                "error_message": str(exc),
+            }
+        if read_mode == "required" and result.status != "ok":
+            base_payload["jue_wiki_decision_gate"] = {
+                "allow_new_risk": False,
+                "allow_exit_actions": True,
+                "reason": "wiki_required_selector_ineligible",
+                "read_mode": "required",
+                "snapshot_id": str(gate_payload.get("snapshot_id") or ""),
+                "version": "wiki_decision_gate_v1",
+            }
         configured_prompt_mode = _jue_wiki_prompt_mode(settings)
         prompt_mode_resolution = resolve_jue_wiki_prompt_mode(
             configured_prompt_mode,
             result.mode_recommendation,
         )
         return {
+            **base_payload,
             "status": result.status,
             "selection_run_id": result.selection_run_id,
             "target_scope": result.target_scope,
@@ -207,7 +342,10 @@ def _selector_context_provider(
 def _build_jue_wiki_context_provider(
     settings: AppSettings,
 ) -> Callable[..., dict[str, Any]] | None:
-    if not bool(_setting(settings, "jue_wiki_enabled", True)):
+    if (
+        not bool(_setting(settings, "jue_wiki_enabled", True))
+        and _jue_wiki_read_mode(settings) != "required"
+    ):
         return None
     service = JueWikiService(
         config=JueWikiConfig(
@@ -277,6 +415,65 @@ def _build_jue_wiki_context_provider(
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _default_runner_source_paths() -> list[Path]:
+    paths = [Path(__file__).resolve()]
+    service_dir: Path | None = None
+    for obj in (AppSettings, BinanceBlockTrader):
+        try:
+            source = inspect.getsourcefile(obj)
+        except TypeError:
+            source = None
+        if not source:
+            continue
+        path = Path(source).resolve()
+        if path not in paths:
+            paths.append(path)
+        if obj is BinanceBlockTrader:
+            service_dir = path.parent
+    for filename in ("binance_manager_prompt.py", "binance_manager_contract.py"):
+        if service_dir is None:
+            continue
+        path = (service_dir / filename).resolve()
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _runner_source_freshness(
+    *,
+    started_at: datetime,
+    source_paths: Iterable[Path] | None = None,
+) -> dict[str, Any]:
+    started = started_at
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    started_ts = started.timestamp()
+    changed_paths: list[str] = []
+    latest_mtime: datetime | None = None
+    checked_paths = 0
+    for source_path in source_paths or _default_runner_source_paths():
+        path = Path(source_path)
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        checked_paths += 1
+        mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        if latest_mtime is None or mtime > latest_mtime:
+            latest_mtime = mtime
+        if stat.st_mtime > started_ts + 1.0:
+            changed_paths.append(str(path))
+    stale = bool(changed_paths)
+    return {
+        "status": "stale_source" if stale else "fresh",
+        "restart_recommended": stale,
+        "started_at": started.isoformat(),
+        "checked_path_count": checked_paths,
+        "changed_paths": changed_paths[:8],
+        "latest_source_mtime": latest_mtime.isoformat() if latest_mtime else "",
+    }
 
 
 def _to_float(value: Any) -> float:
@@ -686,16 +883,7 @@ def _build_crypto_research_service(
             mode=str(_setting(settings, "codex_runtime_mode", "auto")),
             sdk_codex_bin=str(_setting(settings, "codex_runtime_sdk_codex_bin", "")),
             timeout_ms=int(_setting(settings, "codex_runtime_timeout_ms", 60000)),
-            model=str(
-                _setting(
-                    settings,
-                    "crypto_market_research_llm_model",
-                    "gpt-5.5",
-                )
-            ),
-            reasoning_effort=str(
-                _setting(settings, "crypto_market_research_llm_reasoning_effort", "xhigh")
-            ),
+            **llm_model_config_kwargs(settings, component="crypto_market_research"),
             usage_enabled=bool(_setting(settings, "llm_usage_enabled", True)),
             usage_db_path=str(_setting(settings, "llm_usage_db_path", ".runtime/llm_usage.db")),
             usage_component="crypto_market_research",
@@ -715,7 +903,7 @@ def _build_crypto_research_service(
             _setting(
                 settings,
                 "crypto_market_research_llm_model",
-                "gpt-5.5",
+                "gpt-5.6-terra",
             )
         ),
         llm_reasoning_effort=str(
@@ -795,7 +983,7 @@ def _build_crypto_alpha_service(
             rate_limit_sec=float(_setting(settings, "crypto_alpha_rate_limit_sec", 2.0)),
             context_limit=int(_setting(settings, "crypto_alpha_context_limit", 12)),
             llm_model=str(
-                _setting(settings, "crypto_alpha_llm_model", "gpt-5.5")
+                _setting(settings, "crypto_alpha_llm_model", "gpt-5.6-luna")
             ),
             llm_reasoning_effort=str(
                 _setting(settings, "crypto_alpha_llm_reasoning_effort", "xhigh")
@@ -902,19 +1090,24 @@ def _build_trader(settings: AppSettings) -> BinanceBlockTrader:
                     _setting(settings, "codex_runtime_timeout_ms", 60000),
                 )
             ),
-            model=str(
-                _setting(
-                    settings,
-                    "binance_block_trader_llm_model",
-                    "gpt-5.5",
-                )
-            ),
-            reasoning_effort=str(
-                _setting(settings, "binance_block_trader_llm_reasoning_effort", "xhigh")
-            ),
+            **llm_model_config_kwargs(settings, component="binance_block_manager"),
             usage_enabled=bool(_setting(settings, "llm_usage_enabled", True)),
             usage_db_path=str(_setting(settings, "llm_usage_db_path", ".runtime/llm_usage.db")),
             usage_component="binance_block_manager",
+            **codex_native_thread_config_kwargs(settings),
+        )
+    )
+    memory_bridge = CodexNativeRuntime(
+        CodexNativeConfig(
+            mode=str(_setting(settings, "codex_runtime_mode", "auto")),
+            sdk_codex_bin=str(_setting(settings, "codex_runtime_sdk_codex_bin", "")),
+            timeout_ms=int(_setting(settings, "codex_runtime_timeout_ms", 60000)),
+            **llm_model_config_kwargs(settings, component="investment_memory"),
+            usage_enabled=bool(_setting(settings, "llm_usage_enabled", True)),
+            usage_db_path=str(
+                _setting(settings, "llm_usage_db_path", ".runtime/llm_usage.db")
+            ),
+            usage_component="investment_memory",
             **codex_native_thread_config_kwargs(settings),
         )
     )
@@ -932,7 +1125,7 @@ def _build_trader(settings: AppSettings) -> BinanceBlockTrader:
                 getattr(settings, "investment_memory_ops_summary_cache_ttl_sec", 10)
             ),
         ),
-        codex_runtime=bridge,
+        codex_runtime=memory_bridge,
         wiki_context_provider=wiki_context_provider,
     )
     binance = _build_binance_adapter(settings)
@@ -989,6 +1182,23 @@ def _build_trader(settings: AppSettings) -> BinanceBlockTrader:
             quote_interval_sec=settings.binance_block_trader_quote_interval_sec,
             rule_interval_sec=settings.binance_block_trader_rule_interval_sec,
             manager_interval_sec=settings.binance_block_trader_manager_interval_sec,
+            jue_wiki_read_mode=str(
+                _setting(settings, "jue_wiki_read_mode", "shadow") or "shadow"
+            ),
+            waiting_entry_max_age_sec=int(
+                _setting(
+                    settings,
+                    "binance_block_trader_waiting_entry_max_age_sec",
+                    48 * 60 * 60,
+                )
+            ),
+            entry_pending_max_age_sec=int(
+                _setting(
+                    settings,
+                    "binance_block_trader_entry_pending_max_age_sec",
+                    10 * 60,
+                )
+            ),
             aggressive_limit_bps=settings.binance_block_trader_aggressive_limit_bps,
             failed_exit_retry_cooldown_sec=(
                 int(
@@ -1248,6 +1458,23 @@ def _build_trader(settings: AppSettings) -> BinanceBlockTrader:
         codex_runtime=bridge,
         memory_context_provider=memory.context_pack,
         wiki_context_provider=wiki_context_provider,
+        wiki_shadow_recording_recorder=build_runtime_recording_recorder(
+            str(
+                _setting(
+                    settings,
+                    "jue_wiki_shadow_db_path",
+                    str(Path.home() / ".tradecraft" / "jue_wiki_shadow.db"),
+                )
+            ),
+            provenance_key_path=str(_setting(
+                settings,
+                "jue_wiki_provenance_key_path",
+                os.environ.get(
+                    "TRADECRAFT_JUE_WIKI_PROVENANCE_KEY_PATH",
+                    str(Path.home() / ".tradecraft" / "jue_wiki_provenance.key"),
+                ),
+            )),
+        ),
         crypto_research_provider=crypto_research,
         crypto_alpha_provider=crypto_alpha,
         quant_provider=quant_provider,
@@ -1310,6 +1537,32 @@ def _recover_last_manager_result(trader: BinanceBlockTrader) -> dict[str, Any] |
         if value not in (None, ""):
             result[key] = value
     return result
+
+
+def _runner_cycle_status(
+    *,
+    tick_result: dict[str, Any],
+    manager_result: dict[str, Any] | None,
+    last_manager_result: dict[str, Any] | None,
+) -> str:
+    tick_status = str(tick_result.get("status") or "ok").strip() or "ok"
+    if tick_status.lower() not in {"ok", "success"}:
+        return tick_status
+    current_manager_status = (
+        str(manager_result.get("status") or "").strip().lower()
+        if isinstance(manager_result, dict)
+        else ""
+    )
+    last_manager_status = (
+        str(last_manager_result.get("status") or "").strip().lower()
+        if isinstance(last_manager_result, dict)
+        else ""
+    )
+    if current_manager_status == "error" or (
+        current_manager_status in {"", "running"} and last_manager_status == "error"
+    ):
+        return "manager_error"
+    return tick_status
 
 
 def _compact_manager_text_list(value: Any, *, limit: int = 5) -> list[str]:
@@ -1783,6 +2036,9 @@ async def run_binance_block_trader_loop(
         ),
         60,
     )
+    runner_started_at = now_provider()
+    if runner_started_at.tzinfo is None:
+        runner_started_at = runner_started_at.replace(tzinfo=timezone.utc)
     cycle = 0
     last_manager_at = _latest_manager_timestamp(resolved_trader)
     last_retention_at: float | None = None
@@ -2075,7 +2331,11 @@ async def run_binance_block_trader_loop(
                     resolved_trader
                 )
                 last_status_snapshot = status_snapshot
-            status = str(tick_result.get("status") or "ok")
+            status = _runner_cycle_status(
+                tick_result=tick_result,
+                manager_result=manager_result,
+                last_manager_result=last_manager_result,
+            )
         except Exception as exc:
             logger.exception("binance block trader cycle failed")
             status = "error"
@@ -2109,6 +2369,9 @@ async def run_binance_block_trader_loop(
                     "binance_block_trader_telegram_report_slots",
                     DEFAULT_TELEGRAM_REPORT_SLOTS,
                 )
+            ),
+            "runner_source_freshness": _runner_source_freshness(
+                started_at=runner_started_at,
             ),
             "tick_result": tick_result,
             "status_snapshot": status_snapshot,

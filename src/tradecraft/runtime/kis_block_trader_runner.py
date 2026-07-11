@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
@@ -42,6 +44,17 @@ from tradecraft.services.investment_memory import (
     InvestmentMemoryService,
 )
 from tradecraft.services.jue_wiki import JueWikiConfig, JueWikiService
+from tradecraft.services.jue_wiki_context import (
+    JueWikiContextService,
+    evaluate_wiki_decision_gate,
+)
+from tradecraft.services.jue_wiki_contract import WikiContextRequestV1
+from tradecraft.services.jue_wiki_repository import JueWikiRepository
+from tradecraft.services.jue_wiki_shadow import (
+    JueWikiShadowStore,
+    WikiCompletionSigner,
+    build_runtime_recording_recorder,
+)
 from tradecraft.services.jue_wiki_selector import (
     JueWikiSelectionRequest,
     JueWikiSelector,
@@ -52,6 +65,7 @@ from tradecraft.services.codex_native import (
     CodexNativeRuntime,
     codex_native_thread_config_kwargs,
 )
+from tradecraft.services.llm_model_policy import llm_model_config_kwargs
 from tradecraft.services.market_judgment import (
     MarketJudgmentConfig,
     MarketJudgmentEngine,
@@ -112,6 +126,11 @@ def _jue_wiki_prompt_mode(settings: AppSettings) -> str:
     return mode if mode in {"observe", "assist", "primary"} else "assist"
 
 
+def _jue_wiki_read_mode(settings: AppSettings) -> str:
+    mode = str(getattr(settings, "jue_wiki_read_mode", "shadow") or "shadow")
+    return mode if mode in {"shadow", "prefer", "required"} else "shadow"
+
+
 def _selector_context_provider(
     service: JueWikiService,
     settings: AppSettings,
@@ -124,41 +143,151 @@ def _selector_context_provider(
                 getattr(settings, "jue_wiki_context_max_chars", 24000),
             )
         )
-        result = JueWikiSelector(service).select(
-            JueWikiSelectionRequest(
-                target_scope=str(kwargs.get("target_scope") or ""),
-                symbols=_jue_wiki_arg_list(kwargs, "symbols"),
-                page_types=_jue_wiki_arg_list(kwargs, "page_types"),
-                lanes=_jue_wiki_arg_list(kwargs, "lanes"),
-                regimes=_jue_wiki_arg_list(kwargs, "regimes"),
-                block_ids=_jue_wiki_arg_list(kwargs, "block_ids"),
-                horizons=_jue_wiki_arg_list(kwargs, "horizons"),
-                max_chars=int(
-                    kwargs["max_chars"]
-                    if kwargs.get("max_chars") is not None
-                    else default_max_chars
-                ),
-                max_pages=int(getattr(settings, "jue_wiki_selector_max_pages", 24)),
-                min_confidence=float(
-                    getattr(settings, "jue_wiki_selector_min_confidence", 0.15)
-                ),
-                exclude_lint_warnings=bool(
-                    getattr(settings, "jue_wiki_exclude_lint_warnings", False)
-                ),
-                effectiveness_weight=float(
-                    getattr(settings, "jue_wiki_effectiveness_weight", 0.12)
-                ),
-                effectiveness_max_adjustment=float(
-                    getattr(settings, "jue_wiki_effectiveness_max_adjustment", 8.0)
+        target_scope = str(kwargs.get("target_scope") or "")
+        symbols = _jue_wiki_arg_list(kwargs, "symbols")
+        page_types = _jue_wiki_arg_list(kwargs, "page_types")
+        lanes = _jue_wiki_arg_list(kwargs, "lanes")
+        regimes = _jue_wiki_arg_list(kwargs, "regimes")
+        block_ids = _jue_wiki_arg_list(kwargs, "block_ids")
+        horizons = _jue_wiki_arg_list(kwargs, "horizons")
+        max_chars = int(
+            kwargs["max_chars"]
+            if kwargs.get("max_chars") is not None
+            else default_max_chars
+        )
+        read_mode = _jue_wiki_read_mode(settings)
+        try:
+            context_service = JueWikiContextService(
+                JueWikiRepository(Path(str(settings.jue_wiki_db_path))),
+                health_reader=service.status,
+                eligibility_reader=JueWikiShadowStore(
+                    Path(str(settings.jue_wiki_shadow_db_path)),
+                    completion_verifier=WikiCompletionSigner(
+                        Path(str(getattr(
+                            settings,
+                            "jue_wiki_provenance_key_path",
+                            os.environ.get(
+                                "TRADECRAFT_JUE_WIKI_PROVENANCE_KEY_PATH",
+                                str(Path.home() / ".tradecraft" / "jue_wiki_provenance.key"),
+                            ),
+                        )))
+                    ),
                 ),
             )
-        )
+            packet = context_service.context_packet(
+                WikiContextRequestV1(
+                    target_scope=target_scope,
+                    symbols=tuple(symbols),
+                    page_types=tuple(page_types),
+                    lanes=tuple(lanes),
+                    regimes=tuple(regimes),
+                    block_ids=tuple(block_ids),
+                    horizons=tuple(horizons),
+                    max_chars=max_chars,
+                ),
+                read_mode=read_mode,
+            )
+            gate_payload = evaluate_wiki_decision_gate(packet).to_dict()
+            packet_payload = packet.to_dict()
+        except Exception as exc:
+            packet_payload = {
+                "status": "error",
+                "read_mode": read_mode,
+                "snapshot_id": "",
+                "error_message": str(exc),
+            }
+            gate_payload = {
+                "allow_new_risk": read_mode != "required",
+                "allow_exit_actions": True,
+                "reason": (
+                    "wiki_required_context_unavailable"
+                    if read_mode == "required"
+                    else "wiki_context_advisory"
+                ),
+                "read_mode": read_mode,
+                "snapshot_id": "",
+                "version": "wiki_decision_gate_v1",
+            }
+        base_payload = {
+            "read_mode": read_mode,
+            "jue_wiki_context_packet": packet_payload,
+            "jue_wiki_decision_gate": gate_payload,
+        }
+        wiki_enabled = bool(getattr(settings, "jue_wiki_enabled", True))
+        if read_mode == "required" and not wiki_enabled:
+            return {
+                **base_payload,
+                "status": "disabled",
+                "target_scope": target_scope,
+                "prompt_mode": _jue_wiki_prompt_mode(settings),
+                "jue_wiki_decision_gate": {
+                    "allow_new_risk": False,
+                    "allow_exit_actions": True,
+                    "reason": "wiki_required_disabled",
+                    "read_mode": "required",
+                    "snapshot_id": "",
+                    "version": "wiki_decision_gate_v1",
+                },
+            }
+        try:
+            result = JueWikiSelector(service).select(
+                JueWikiSelectionRequest(
+                    target_scope=target_scope,
+                    symbols=symbols,
+                    page_types=page_types,
+                    lanes=lanes,
+                    regimes=regimes,
+                    block_ids=block_ids,
+                    horizons=horizons,
+                    max_chars=max_chars,
+                    max_pages=int(getattr(settings, "jue_wiki_selector_max_pages", 24)),
+                    min_confidence=float(
+                        getattr(settings, "jue_wiki_selector_min_confidence", 0.15)
+                    ),
+                    exclude_lint_warnings=bool(
+                        getattr(settings, "jue_wiki_exclude_lint_warnings", False)
+                    ),
+                    effectiveness_weight=float(
+                        getattr(settings, "jue_wiki_effectiveness_weight", 0.12)
+                    ),
+                    effectiveness_max_adjustment=float(
+                        getattr(settings, "jue_wiki_effectiveness_max_adjustment", 8.0)
+                    ),
+                )
+            )
+        except Exception as exc:
+            if read_mode == "required":
+                base_payload["jue_wiki_decision_gate"] = {
+                    "allow_new_risk": False,
+                    "allow_exit_actions": True,
+                    "reason": "wiki_required_selector_unavailable",
+                    "read_mode": "required",
+                    "snapshot_id": str(gate_payload.get("snapshot_id") or ""),
+                    "version": "wiki_decision_gate_v1",
+                }
+            return {
+                **base_payload,
+                "status": "error",
+                "target_scope": target_scope,
+                "prompt_mode": _jue_wiki_prompt_mode(settings),
+                "error_message": str(exc),
+            }
+        if read_mode == "required" and result.status != "ok":
+            base_payload["jue_wiki_decision_gate"] = {
+                "allow_new_risk": False,
+                "allow_exit_actions": True,
+                "reason": "wiki_required_selector_ineligible",
+                "read_mode": "required",
+                "snapshot_id": str(gate_payload.get("snapshot_id") or ""),
+                "version": "wiki_decision_gate_v1",
+            }
         configured_prompt_mode = _jue_wiki_prompt_mode(settings)
         prompt_mode_resolution = resolve_jue_wiki_prompt_mode(
             configured_prompt_mode,
             result.mode_recommendation,
         )
         return {
+            **base_payload,
             "status": result.status,
             "selection_run_id": result.selection_run_id,
             "target_scope": result.target_scope,
@@ -205,7 +334,10 @@ def _selector_context_provider(
 def _build_jue_wiki_context_provider(
     settings: AppSettings,
 ) -> Callable[..., dict[str, Any]] | None:
-    if not bool(getattr(settings, "jue_wiki_enabled", True)):
+    if (
+        not bool(getattr(settings, "jue_wiki_enabled", True))
+        and _jue_wiki_read_mode(settings) != "required"
+    ):
         return None
     service = JueWikiService(
         config=JueWikiConfig(
@@ -259,6 +391,32 @@ def _runtime_etf_universe(settings: AppSettings) -> list[Any]:
     return _merge_etf_items(configured, discovered, limit=200)
 
 
+def _symbols_from_etf_items(items: list[Any]) -> list[str]:
+    symbols: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            symbol = item.strip()
+        elif isinstance(item, dict):
+            symbol = str(
+                item.get("symbol")
+                or item.get("code")
+                or item.get("ticker")
+                or ""
+            ).strip()
+        else:
+            symbol = ""
+        if len(symbol) == 6 and symbol.isdigit() and symbol not in symbols:
+            symbols.append(symbol)
+    return symbols
+
+
+def _configured_etf_symbols(settings: AppSettings) -> list[str]:
+    configured = expand_default_etf_universe(
+        parse_etf_universe_config(str(getattr(settings, "etf_research_universe", "")))
+    )
+    return _symbols_from_etf_items(configured)
+
+
 def _build_block_trader(settings: AppSettings) -> KISBlockTrader:
     stack = build_report_intelligence_stack(settings)
     bridge = CodexNativeRuntime(
@@ -266,8 +424,7 @@ def _build_block_trader(settings: AppSettings) -> KISBlockTrader:
             mode=settings.codex_runtime_mode,
             sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
             timeout_ms=settings.codex_runtime_timeout_ms,
-            model=settings.llm_model,
-            reasoning_effort=settings.llm_reasoning_effort,
+            **llm_model_config_kwargs(settings, component="kis_block_manager"),
             usage_enabled=settings.llm_usage_enabled,
             usage_db_path=settings.llm_usage_db_path,
             usage_component="kis_block_manager",
@@ -279,11 +436,22 @@ def _build_block_trader(settings: AppSettings) -> KISBlockTrader:
             mode=settings.codex_runtime_mode,
             sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
             timeout_ms=settings.codex_runtime_timeout_ms,
-            model=settings.llm_model,
-            reasoning_effort=settings.llm_reasoning_effort,
+            **llm_model_config_kwargs(settings, component="daily_discovery"),
             usage_enabled=settings.llm_usage_enabled,
             usage_db_path=settings.llm_usage_db_path,
             usage_component="daily_discovery",
+            **codex_native_thread_config_kwargs(settings),
+        )
+    )
+    memory_bridge = CodexNativeRuntime(
+        CodexNativeConfig(
+            mode=settings.codex_runtime_mode,
+            sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
+            timeout_ms=settings.codex_runtime_timeout_ms,
+            **llm_model_config_kwargs(settings, component="investment_memory"),
+            usage_enabled=settings.llm_usage_enabled,
+            usage_db_path=settings.llm_usage_db_path,
+            usage_component="investment_memory",
             **codex_native_thread_config_kwargs(settings),
         )
     )
@@ -316,7 +484,7 @@ def _build_block_trader(settings: AppSettings) -> KISBlockTrader:
     strategy_engine = StrategyIntelligenceEngine(
         repository=stack.repository,
         rag_store=stack.rag_store,
-        codex_runtime=bridge,
+        codex_runtime=discovery_bridge,
         fundamentals_repository=fundamentals,
         etf_research_repository=etf_research_provider,
         config=StrategyIntelligenceConfig(
@@ -384,7 +552,7 @@ def _build_block_trader(settings: AppSettings) -> KISBlockTrader:
                 getattr(settings, "investment_memory_ops_summary_cache_ttl_sec", 10)
             ),
         ),
-        codex_runtime=bridge,
+        codex_runtime=memory_bridge,
         wiki_context_provider=wiki_context_provider,
     )
 
@@ -412,6 +580,9 @@ def _build_block_trader(settings: AppSettings) -> KISBlockTrader:
             prompt_target_chars=settings.kis_block_trader_prompt_target_chars,
             prompt_warn_chars=settings.kis_block_trader_prompt_warn_chars,
             prompt_max_chars=settings.kis_block_trader_prompt_max_chars,
+            jue_wiki_read_mode=str(
+                getattr(settings, "jue_wiki_read_mode", "shadow") or "shadow"
+            ),
             strategy_revision_id=settings.jue_strategy_revision_id,
             use_naver_fallback=settings.market_judge_use_naver_fallback,
             manager_query=settings.kis_block_trader_manager_query,
@@ -427,6 +598,17 @@ def _build_block_trader(settings: AppSettings) -> KISBlockTrader:
         research_feed_provider=read_research,
         memory_context_provider=investment_memory.context_pack,
         wiki_context_provider=wiki_context_provider,
+        wiki_shadow_recording_recorder=build_runtime_recording_recorder(
+            settings.jue_wiki_shadow_db_path,
+            provenance_key_path=getattr(
+                settings,
+                "jue_wiki_provenance_key_path",
+                os.environ.get(
+                    "TRADECRAFT_JUE_WIKI_PROVENANCE_KEY_PATH",
+                    str(Path.home() / ".tradecraft" / "jue_wiki_provenance.key"),
+                ),
+            ),
+        ),
         market_pulse_provider=market_pulse.context_for_blocks,
         live_authority_provider=lambda: build_live_authority_payload(settings)[
             "venues"
@@ -438,7 +620,7 @@ def _build_block_trader(settings: AppSettings) -> KISBlockTrader:
         telegram=telegram,
     )
     symbol_analysis = SymbolAnalysisService(
-        codex_runtime=bridge,
+        codex_runtime=discovery_bridge,
         memory_service=investment_memory,
         fundamentals=fundamentals,
         quote_provider=market_judgment.quote_service,
@@ -464,6 +646,7 @@ def _build_block_trader(settings: AppSettings) -> KISBlockTrader:
             enabled=settings.daily_discovery_enabled,
             kospi_count=settings.daily_discovery_kospi_count,
             kosdaq_count=settings.daily_discovery_kosdaq_count,
+            etf_count=settings.daily_discovery_etf_count,
             exclude_recent_days=settings.daily_discovery_exclude_recent_days,
             candidate_limit_per_market=(
                 settings.daily_discovery_candidate_limit_per_market
@@ -476,7 +659,8 @@ def _build_block_trader(settings: AppSettings) -> KISBlockTrader:
     discovery_context_limit = min(
         max(
             int(settings.daily_discovery_kospi_count)
-            + int(settings.daily_discovery_kosdaq_count),
+            + int(settings.daily_discovery_kosdaq_count)
+            + int(settings.daily_discovery_etf_count),
             30,
         ),
         120,
@@ -875,6 +1059,105 @@ def _fundamentals_collect_symbols(
     ][: max(int(max_symbols), 1)]
 
 
+def _runner_pre_open_monitor_skipped(reason: str) -> dict[str, Any]:
+    return {"status": "skipped", "reason": reason}
+
+
+def _pre_open_monitor_symbols(
+    *,
+    settings: AppSettings,
+    trader: KISBlockTrader,
+    max_symbols: int,
+) -> list[str]:
+    symbols = [
+        *_symbols_from_csv(getattr(settings, "kis_pre_open_monitor_symbols", "")),
+        *_account_position_symbols(trader),
+        *_active_block_symbols(trader),
+        *_symbols_from_csv(getattr(settings, "valuation_watchlist", "")),
+        *_configured_etf_symbols(settings),
+    ]
+    return [
+        symbol
+        for symbol in dict.fromkeys(symbols)
+        if len(symbol) == 6 and symbol.isdigit()
+    ][: max(int(max_symbols), 1)]
+
+
+async def _collect_pre_open_monitor_if_due(
+    *,
+    settings: AppSettings,
+    trader: KISBlockTrader,
+    clock: dict[str, Any],
+    last_attempt_at: datetime | None,
+    now: datetime,
+) -> tuple[datetime | None, dict[str, Any]]:
+    if not bool(getattr(settings, "kis_pre_open_monitor_enabled", True)):
+        return last_attempt_at, _runner_pre_open_monitor_skipped("disabled")
+    if str(clock.get("session") or "").strip().lower() != "pre_open":
+        return last_attempt_at, _runner_pre_open_monitor_skipped("not_pre_open")
+    interval_sec = max(int(getattr(settings, "kis_pre_open_monitor_interval_sec", 300)), 0)
+    if (
+        last_attempt_at is not None
+        and (now - last_attempt_at).total_seconds() < interval_sec
+    ):
+        return last_attempt_at, _runner_pre_open_monitor_skipped("throttled")
+    kis = getattr(trader, "kis", None)
+    fetch_quote = getattr(kis, "fetch_domestic_quote", None)
+    if not callable(fetch_quote):
+        return last_attempt_at, _runner_pre_open_monitor_skipped("kis_unavailable")
+    repository = getattr(trader, "repository", None)
+    save_quotes = getattr(repository, "save_quotes", None)
+    if not callable(save_quotes):
+        return last_attempt_at, _runner_pre_open_monitor_skipped("repository_unavailable")
+
+    max_symbols = max(int(getattr(settings, "kis_pre_open_monitor_max_symbols", 30)), 0)
+    if max_symbols <= 0:
+        return last_attempt_at, _runner_pre_open_monitor_skipped("max_symbols_zero")
+    symbols = _pre_open_monitor_symbols(
+        settings=settings,
+        trader=trader,
+        max_symbols=max_symbols,
+    )
+    if not symbols:
+        return now, _runner_pre_open_monitor_skipped("empty_universe")
+
+    fetched_at = now.isoformat()
+    rows: list[dict[str, Any]] = []
+    for symbol in symbols:
+        try:
+            quote = await fetch_quote(symbol)
+            quote_row = dict(quote) if isinstance(quote, dict) else {}
+            quote_row["symbol"] = str(quote_row.get("symbol") or symbol)
+            quote_row["source"] = "kis_pre_open"
+            quote_row["fetched_at"] = fetched_at
+            quote_row["status"] = str(quote_row.get("status") or "ok")
+            rows.append(quote_row)
+        except Exception as exc:
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": symbol,
+                    "price": None,
+                    "source": "kis_pre_open",
+                    "fetched_at": fetched_at,
+                    "status": "error",
+                    "error_message": str(exc),
+                    "raw": {},
+                }
+            )
+    save_quotes(rows)
+    ok_count = sum(1 for row in rows if str(row.get("status") or "") != "error")
+    return now, {
+        "status": "ok" if ok_count else "error",
+        "session": "pre_open",
+        "quote_count": ok_count,
+        "error_count": len(rows) - ok_count,
+        "symbols": symbols,
+        "fetched_at": fetched_at,
+        "source": "kis_pre_open",
+    }
+
+
 async def _collect_fundamentals_if_due(
     *,
     settings: AppSettings,
@@ -955,6 +1238,7 @@ async def run_kis_block_trader_loop(
     cycle = 0
     last_manager_at: datetime | None = _latest_manager_run_at(resolved_trader)
     last_retention_at: datetime | None = None
+    last_pre_open_monitor_attempt_at: datetime | None = None
     last_etf_research_collect_attempt_at: datetime | None = None
     last_fundamentals_collect_attempt_at: datetime | None = None
     manager_task: asyncio.Task[dict[str, Any]] | None = None
@@ -991,6 +1275,7 @@ async def run_kis_block_trader_loop(
         manager_used = False
         manager_result: dict[str, Any] | None = None
         manager_due_reason: str | None = None
+        pre_open_monitor_result: dict[str, Any] | None = None
         etf_research_collect_result: dict[str, Any] | None = None
         fundamentals_collect_result: dict[str, Any] | None = None
         daily_discovery_result: dict[str, Any] | None = None
@@ -1158,6 +1443,23 @@ async def run_kis_block_trader_loop(
                 fundamentals_collect_started_at = None
             clock = resolved_trader.clock()
             tick_result = await resolved_trader.executor_tick()
+            try:
+                (
+                    last_pre_open_monitor_attempt_at,
+                    pre_open_monitor_result,
+                ) = await _collect_pre_open_monitor_if_due(
+                    settings=resolved_settings,
+                    trader=resolved_trader,
+                    clock=clock,
+                    last_attempt_at=last_pre_open_monitor_attempt_at,
+                    now=now_dt,
+                )
+            except Exception as exc:
+                logger.exception("kis pre-open monitor failed")
+                pre_open_monitor_result = {
+                    "status": "error",
+                    "error_message": str(exc),
+                }
             if resolved_settings.kis_block_trader_once:
                 try:
                     daily_discovery_result = await _run_daily_discovery_if_due(
@@ -1385,6 +1687,7 @@ async def run_kis_block_trader_loop(
             "last_manager_result": _compact_manager_result_for_state(
                 last_manager_result
             ),
+            "pre_open_monitor_result": pre_open_monitor_result,
             "etf_research_collect_result": etf_research_collect_result,
             "fundamentals_collect_result": fundamentals_collect_result,
             "daily_discovery_result": daily_discovery_result,

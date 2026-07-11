@@ -52,6 +52,55 @@ def _normalize_list(value: Any) -> list[Any]:
     return []
 
 
+def _compact_kis_research_packet(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact = {
+        key: value.get(key)
+        for key in (
+            "symbol",
+            "asset_class",
+            "status",
+            "entry_support",
+            "addition_allowed",
+            "revisions",
+            "conflict_status",
+            "confirmed_facts",
+            "interpretation",
+            "missing_data",
+            "version",
+        )
+        if value.get(key) not in (None, "", [], {})
+    }
+    evidence: list[dict[str, Any]] = []
+    for raw in _normalize_list(value.get("evidence"))[:6]:
+        if not isinstance(raw, dict):
+            continue
+        row = {
+            key: raw.get(key)
+            for key in (
+                "report_id",
+                "symbol",
+                "published_at",
+                "broker",
+                "rating",
+                "target_price",
+                "catalysts",
+                "risks",
+                "evidence_quotes",
+                "source_ref",
+                "link_confidence",
+                "freshness",
+            )
+            if raw.get(key) not in (None, "", [], {})
+        }
+        if row:
+            evidence.append(row)
+    if evidence:
+        compact["evidence"] = evidence
+    return compact
+
+
 def _compact_strings(value: Any, *, limit: int = 4, chars: int = 180) -> list[str]:
     out: list[str] = []
     for item in _normalize_list(value):
@@ -841,6 +890,7 @@ def build_research_spine(
     account: dict[str, Any],
     blocks: list[dict[str, Any]],
     quotes: list[dict[str, Any]],
+    kis_research_packets: dict[str, dict[str, Any]] | None = None,
     max_packets: int = 12,
 ) -> dict[str, Any]:
     account_payload = account if isinstance(account, dict) else {}
@@ -917,6 +967,11 @@ def build_research_spine(
             packets_by_symbol[symbol]["buckets"].append("owned_symbols")
 
     for symbol, packet in packets_by_symbol.items():
+        kis_research = _compact_kis_research_packet(
+            (kis_research_packets or {}).get(symbol)
+        )
+        if kis_research:
+            packet["kis_research"] = kis_research
         _attach_live_context(
             packet,
             owned=symbol in owned_symbols,
@@ -964,6 +1019,17 @@ def build_research_spine(
         if isinstance(market_judgment, dict)
         else "missing"
     ) or "missing"
+    kis_research_eligible_count = sum(
+        1
+        for row in packets
+        if str((row.get("kis_research") or {}).get("status") or "") == "eligible"
+    )
+    kis_research_conflict_count = sum(
+        1
+        for row in packets
+        if str((row.get("kis_research") or {}).get("conflict_status") or "")
+        == "material"
+    )
     return {
         "status": "ok",
         "version": "research_spine_v1",
@@ -974,6 +1040,8 @@ def build_research_spine(
             "valuation_missing_count": valuation_missing_count,
             "low_evidence_count": low_evidence_count,
             "pre_surge_count": pre_surge_count,
+            "kis_research_eligible_count": kis_research_eligible_count,
+            "kis_research_conflict_count": kis_research_conflict_count,
             "market_judgment_status": market_status,
             "etf_research_status": str((etf_research or {}).get("status") or "missing")
             if isinstance(etf_research, dict)

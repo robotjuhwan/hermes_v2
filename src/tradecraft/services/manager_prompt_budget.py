@@ -165,7 +165,7 @@ def prompt_budget_error(prompt: dict[str, Any]) -> str:
     total = int(budget.get("total_chars") or 0)
     max_allowed = int(budget.get("max_chars") or 0)
     return (
-        "prompt_budget_exceeded: "
+        "prompt_budget_contract_violation: prompt_budget_exceeded: "
         f"total_chars={total} max_chars={max_allowed}"
     )
 

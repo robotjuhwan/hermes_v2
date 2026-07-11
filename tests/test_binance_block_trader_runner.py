@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from tradecraft.runtime.binance_block_trader_runner import (
     _build_trader,
     _cycle_log_level,
     _parse_telegram_report_slots,
+    _runner_source_freshness,
     _telegram_report_due_slot,
     run_binance_block_trader_loop,
 )
@@ -114,6 +116,24 @@ class Settings:
     binance_block_trader_once = True
 
 
+def test_runner_source_freshness_flags_source_changed_after_start(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "binance_block_trader.py"
+    source.write_text("old", encoding="utf-8")
+    started_at = datetime(2026, 6, 20, 2, 0, tzinfo=timezone.utc)
+    os.utime(source, (started_at.timestamp() + 120, started_at.timestamp() + 120))
+
+    payload = _runner_source_freshness(
+        started_at=started_at,
+        source_paths=[source],
+    )
+
+    assert payload["status"] == "stale_source"
+    assert payload["restart_recommended"] is True
+    assert payload["changed_paths"] == [str(source)]
+
+
 def test_runner_writes_state_once(tmp_path: Path) -> None:
     settings = Settings()
     settings.binance_block_trader_state_path = str(tmp_path / "state.json")
@@ -166,6 +186,8 @@ def test_runner_writes_state_once(tmp_path: Path) -> None:
     }
     assert payload["performance_result"]["status"] == "ok"
     assert payload["telegram_report_result"] is None
+    assert payload["runner_source_freshness"]["status"] in {"fresh", "stale_source"}
+    assert payload["runner_source_freshness"]["started_at"]
 
 
 def test_runner_reuses_status_snapshot_during_idle_ticks(tmp_path: Path) -> None:
@@ -780,6 +802,39 @@ def test_runner_records_cancelled_manager_task_without_stopping_ticks(
     }
 
 
+def test_runner_marks_cycle_manager_error_when_manager_result_fails(
+    tmp_path: Path,
+) -> None:
+    class BrokenManagerTrader(FakeTrader):
+        async def run_manager_once(self) -> dict[str, Any]:
+            self.manager_runs += 1
+            return {
+                "status": "error",
+                "manager_run_id": 88,
+                "error_message": "validation_repair_resolution_missing_from_model",
+            }
+
+    settings = Settings()
+    settings.binance_block_trader_state_path = str(tmp_path / "state.json")
+    trader = BrokenManagerTrader()
+
+    asyncio.run(
+        run_binance_block_trader_loop(
+            settings=settings,
+            trader=trader,
+            sleep=lambda _: asyncio.sleep(0),
+        )
+    )
+
+    payload = json.loads(Path(settings.binance_block_trader_state_path).read_text())
+    assert trader.executor_ticks == 1
+    assert trader.manager_runs == 1
+    assert payload["tick_result"]["status"] == "ok"
+    assert payload["manager_result"]["status"] == "error"
+    assert payload["last_manager_result"]["status"] == "error"
+    assert payload["status"] == "manager_error"
+
+
 def test_binance_telegram_report_slots_skip_dawn_and_dedupe() -> None:
     slots = _parse_telegram_report_slots("morning:06:00,noon:12:00,night:20:00")
     sent: dict[str, Any] = {}
@@ -958,6 +1013,8 @@ def test_build_trader_wires_crypto_research_provider(monkeypatch) -> None:
         investment_memory_policy_mode = "soft_auto"
         investment_memory_persona_tone = "friendly_partner"
         investment_memory_context_max_chars = 8000
+        jue_wiki_db_path = ".runtime/test-jue-wiki.db"
+        jue_wiki_shadow_db_path = ".tradecraft/test-jue-wiki-shadow.db"
         binance_spot_api_key = ""
         binance_spot_api_secret = ""
         binance_spot_base_url = "https://api.binance.com"
@@ -973,6 +1030,7 @@ def test_build_trader_wires_crypto_research_provider(monkeypatch) -> None:
         binance_block_trader_quote_interval_sec = 15
         binance_block_trader_rule_interval_sec = 15
         binance_block_trader_manager_interval_sec = 600
+        binance_block_trader_entry_pending_max_age_sec = 123
         binance_block_trader_aggressive_limit_bps = 20.0
         binance_block_trader_max_manager_symbols = 12
         binance_block_trader_jue_wiki_context_max_chars = 36_000
@@ -1083,7 +1141,12 @@ def test_build_trader_wires_crypto_research_provider(monkeypatch) -> None:
     assert constructed["config"].quant_context_limit == 16
     assert constructed["config"].llm_timeout_ms == 234000
     assert constructed["config"].jue_wiki_context_max_chars == 36_000
+    assert constructed["config"].waiting_entry_max_age_sec == 172800
+    assert constructed["config"].entry_pending_max_age_sec == 123
     assert constructed["codex_runtime"].config.timeout_ms == 234000
+    assert constructed["wiki_shadow_recording_recorder"].db_path == Path(
+        Settings.jue_wiki_shadow_db_path
+    )
     assert crypto.config.kwargs["llm_model"] == "gpt-5.5"
     assert crypto.config.kwargs["llm_reasoning_effort"] == "xhigh"
     assert crypto.config.kwargs["kline_intervals"] == {"1m": 10, "15m": 20}

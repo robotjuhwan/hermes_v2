@@ -4,6 +4,8 @@ from pathlib import Path
 import pytest
 
 from tradecraft.config import AppSettings
+from tradecraft.services.binance_block_trader import BinanceBlockTraderConfig
+from tradecraft.services.kis_block_trader import KISBlockTraderConfig
 
 
 JUE_CODEX_LAB_ENV_KEYS = (
@@ -262,6 +264,11 @@ def test_runtime_storage_pdf_cleanup_defaults(monkeypatch) -> None:
     assert settings.runtime_storage_zero_byte_marker_retention_days == 7
     assert settings.runtime_storage_database_compact_min_free_mb == 4
     assert settings.runtime_storage_database_compact_min_free_ratio_pct == 10.0
+    assert settings.runtime_cold_archive_root == ".runtime-cold-archive"
+    assert settings.runtime_storage_archive_dryrun is True
+    assert settings.runtime_storage_dryrun_hot_hours == 24
+    assert settings.runtime_storage_dryrun_hot_per_scenario == 3
+    assert settings.runtime_storage_archive_rag_rebuild_backups is True
 
 
 def test_crypto_archive_retention_defaults(monkeypatch) -> None:
@@ -411,7 +418,14 @@ def test_llm_usage_defaults(monkeypatch) -> None:
 
     assert settings.llm_usage_enabled is True
     assert settings.llm_usage_db_path == ".runtime/llm_usage.db"
+    assert settings.llm_model == "gpt-5.6-sol"
     assert settings.llm_reasoning_effort == "xhigh"
+    assert settings.llm_reasoning_model == "gpt-5.6-terra"
+    assert settings.llm_reasoning_model_effort == "high"
+    assert settings.llm_utility_model == "gpt-5.6-luna"
+    assert settings.llm_utility_model_effort == "medium"
+    assert settings.llm_offline_model == "gpt-5.6-sol"
+    assert settings.llm_offline_model_effort == "max"
 
 
 def test_live_authority_defaults(monkeypatch) -> None:
@@ -468,23 +482,125 @@ def test_jue_wiki_settings_have_safe_defaults(monkeypatch) -> None:
     monkeypatch.delenv("TRADECRAFT_JUE_WIKI_ENABLED", raising=False)
     monkeypatch.delenv("TRADECRAFT_JUE_WIKI_ROOT_PATH", raising=False)
     monkeypatch.delenv("TRADECRAFT_JUE_WIKI_DB_PATH", raising=False)
+    monkeypatch.delenv("TRADECRAFT_JUE_WIKI_SHADOW_DB_PATH", raising=False)
     monkeypatch.delenv("TRADECRAFT_JUE_WIKI_CONTEXT_MAX_CHARS", raising=False)
     monkeypatch.delenv("TRADECRAFT_JUE_WIKI_RUNNER_INTERVAL_SEC", raising=False)
     monkeypatch.delenv("TRADECRAFT_JUE_WIKI_PAGE_MAX_CHARS", raising=False)
     monkeypatch.delenv("TRADECRAFT_JUE_WIKI_CONTEXT_PAGE_LIMIT", raising=False)
+    monkeypatch.delenv("TRADECRAFT_JUE_WIKI_REPAIR_OVERDUE_SEC", raising=False)
+    monkeypatch.delenv("TRADECRAFT_JUE_WIKI_REPAIR_STALL_SEC", raising=False)
+    monkeypatch.delenv(
+        "TRADECRAFT_JUE_WIKI_REPAIR_GROWTH_WINDOW_SEC",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TRADECRAFT_JUE_WIKI_REPAIR_GROWTH_WARN_COUNT",
+        raising=False,
+    )
 
     settings = AppSettings(_env_file=None)
 
     assert settings.jue_wiki_enabled is True
     assert settings.jue_wiki_root_path == ".runtime/jue_wiki"
     assert settings.jue_wiki_db_path == ".runtime/jue_wiki/wiki.db"
+    assert settings.jue_wiki_shadow_db_path == str(
+        Path.home() / ".tradecraft" / "jue_wiki_shadow.db"
+    )
+    assert settings.jue_wiki_provenance_key_path == str(
+        Path.home() / ".tradecraft" / "jue_wiki_provenance.key"
+    )
     assert settings.jue_wiki_context_max_chars == 24000
     assert settings.jue_wiki_runner_interval_sec == 1800
     assert settings.jue_wiki_page_max_chars == 12000
     assert settings.jue_wiki_context_page_limit == 8
+    assert settings.jue_wiki_repair_overdue_sec == 86_400
+    assert settings.jue_wiki_repair_stall_sec == 21_600
+    assert settings.jue_wiki_repair_growth_window_sec == 86_400
+    assert settings.jue_wiki_repair_growth_warn_count == 25
+
+
+def test_jue_wiki_shadow_db_path_env_alias(monkeypatch) -> None:
+    configured = str(Path.home() / ".tradecraft" / "custom-shadow.db")
+    monkeypatch.setenv(
+        "TRADECRAFT_JUE_WIKI_SHADOW_DB_PATH",
+        configured,
+    )
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.jue_wiki_shadow_db_path == configured
+
+
+def test_jue_wiki_integrity_paths_default_outside_runtime(monkeypatch) -> None:
+    monkeypatch.delenv("TRADECRAFT_JUE_WIKI_SHADOW_DB_PATH", raising=False)
+    monkeypatch.delenv("TRADECRAFT_JUE_WIKI_PROVENANCE_KEY_PATH", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert Path(settings.jue_wiki_shadow_db_path) == (
+        Path.home() / ".tradecraft" / "jue_wiki_shadow.db"
+    )
+    assert Path(settings.jue_wiki_provenance_key_path) == (
+        Path.home() / ".tradecraft" / "jue_wiki_provenance.key"
+    )
+    assert Path(settings.jue_wiki_shadow_db_path).is_absolute()
+    assert Path(settings.jue_wiki_provenance_key_path).is_absolute()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"jue_wiki_shadow_db_path": ".tradecraft/relative.db"},
+        {"jue_wiki_provenance_key_path": ".tradecraft/relative.key"},
+        {
+            "jue_wiki_db_path": "/tmp/wiki-same.db",
+            "jue_wiki_shadow_db_path": "/tmp/wiki-same.db",
+        },
+        {"jue_wiki_shadow_db_path": "/tmp/project/.runtime/shadow.db"},
+        {"jue_wiki_provenance_key_path": "/tmp/project/.runtime/provenance.key"},
+        {
+            "jue_wiki_shadow_db_path": "/tmp/wiki-key-shadow.db",
+            "jue_wiki_provenance_key_path": "/tmp/wiki-key-shadow.db",
+        },
+        {
+            "jue_wiki_db_path": "/tmp/wiki-key-raw.db",
+            "jue_wiki_provenance_key_path": "/tmp/wiki-key-raw.db",
+        },
+    ],
+)
+def test_jue_wiki_integrity_paths_reject_unsafe_values(
+    monkeypatch,
+    overrides: dict[str, str],
+) -> None:
+    monkeypatch.delenv("TRADECRAFT_JUE_WIKI_SHADOW_DB_PATH", raising=False)
+    monkeypatch.delenv("TRADECRAFT_JUE_WIKI_PROVENANCE_KEY_PATH", raising=False)
+
+    with pytest.raises(ValueError, match="jue_wiki_integrity_path"):
+        AppSettings(_env_file=None, **overrides)
+
+
+def test_jue_wiki_integrity_paths_reject_symlink_and_hardlink_keys(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.key"
+    source.write_bytes(b"x" * 32)
+    symlink = tmp_path / "symlink.key"
+    symlink.symlink_to(source)
+    hardlink = tmp_path / "hardlink.key"
+    hardlink.hardlink_to(source)
+
+    for key_path in (symlink, hardlink):
+        with pytest.raises(ValueError, match="jue_wiki_integrity_path"):
+            AppSettings(
+                _env_file=None,
+                jue_wiki_shadow_db_path=str(tmp_path / "shadow.db"),
+                jue_wiki_provenance_key_path=str(key_path),
+            )
 
 
 def test_jue_wiki_phase2_settings_have_safe_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("TRADECRAFT_JUE_WIKI_READ_MODE", raising=False)
+    monkeypatch.delenv("TRADECRAFT_JUE_WIKI_PROMOTION_THRESHOLDS_JSON", raising=False)
     monkeypatch.delenv("TRADECRAFT_JUE_WIKI_PROMPT_MODE", raising=False)
     monkeypatch.delenv("TRADECRAFT_JUE_WIKI_SELECTOR_MAX_PAGES", raising=False)
     monkeypatch.delenv("TRADECRAFT_JUE_WIKI_SELECTOR_MIN_CONFIDENCE", raising=False)
@@ -495,11 +611,71 @@ def test_jue_wiki_phase2_settings_have_safe_defaults(monkeypatch) -> None:
     settings = AppSettings(_env_file=None)
 
     assert settings.jue_wiki_prompt_mode == "assist"
+    assert settings.jue_wiki_read_mode == "shadow"
+    assert settings.jue_wiki_promotion_thresholds_json == "{}"
+    assert settings.jue_wiki_promotion_thresholds == {}
+    assert settings.jue_wiki_promotion_threshold_warnings == []
     assert settings.jue_wiki_selector_max_pages == 24
     assert settings.jue_wiki_selector_min_confidence == 0.15
     assert settings.jue_wiki_exclude_lint_warnings is True
     assert settings.jue_wiki_repair_enabled is True
     assert settings.jue_wiki_full_prompt_max_chars == 190_000
+    assert KISBlockTraderConfig().jue_wiki_read_mode == "shadow"
+    assert BinanceBlockTraderConfig().jue_wiki_read_mode == "shadow"
+
+
+@pytest.mark.parametrize("mode", ["shadow", "prefer", "required"])
+def test_jue_wiki_read_mode_accepts_only_supported_values(
+    monkeypatch,
+    mode: str,
+) -> None:
+    monkeypatch.setenv("TRADECRAFT_JUE_WIKI_READ_MODE", mode)
+
+    assert AppSettings(_env_file=None).jue_wiki_read_mode == mode
+
+
+def test_jue_wiki_read_mode_rejects_unknown_value(monkeypatch) -> None:
+    monkeypatch.setenv("TRADECRAFT_JUE_WIKI_READ_MODE", "primary")
+
+    with pytest.raises(ValueError, match="jue_wiki_read_mode"):
+        AppSettings(_env_file=None)
+
+
+def test_jue_wiki_promotion_thresholds_parse_positive_integer_map(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "TRADECRAFT_JUE_WIKI_PROMOTION_THRESHOLDS_JSON",
+        '{"kis":{"swing":30},"binance":{"intraday":50}}',
+    )
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.jue_wiki_promotion_thresholds == {
+        "binance": {"intraday": 50},
+        "kis": {"swing": 30},
+    }
+    assert settings.jue_wiki_promotion_threshold_warnings == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "warning"),
+    [
+        ("not-json", "promotion_thresholds_json_malformed"),
+        ('{"kis":{"swing":true}}', "promotion_threshold_invalid:kis:swing:boolean"),
+        ('{"kis":{"swing":0}}', "promotion_threshold_invalid:kis:swing:not_positive"),
+        ('{"kis":{"swing":-2}}', "promotion_threshold_invalid:kis:swing:not_positive"),
+    ],
+)
+def test_invalid_jue_wiki_promotion_thresholds_disable_promotion_with_warning(
+    monkeypatch,
+    raw: str,
+    warning: str,
+) -> None:
+    monkeypatch.setenv("TRADECRAFT_JUE_WIKI_PROMOTION_THRESHOLDS_JSON", raw)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.jue_wiki_promotion_thresholds == {}
+    assert warning in settings.jue_wiki_promotion_threshold_warnings
 
 
 def test_jue_wiki_phase3_settings_have_safe_defaults(monkeypatch) -> None:
@@ -835,12 +1011,14 @@ def test_binance_block_trader_defaults() -> None:
     assert settings.binance_block_trader_quote_interval_sec == 15
     assert settings.binance_block_trader_rule_interval_sec == 15
     assert settings.binance_block_trader_manager_interval_sec == 1800
+    assert settings.binance_block_trader_waiting_entry_max_age_sec == 172800
+    assert settings.binance_block_trader_entry_pending_max_age_sec == 600
     assert settings.binance_block_trader_manager_error_retry_sec == 300
     assert settings.binance_block_trader_telegram_reports_enabled is True
     assert settings.binance_block_trader_telegram_report_slots == (
         "morning:06:00,noon:12:00,night:20:00"
     )
-    assert settings.binance_block_trader_llm_model == "gpt-5.5"
+    assert settings.binance_block_trader_llm_model == "gpt-5.6-sol"
     assert settings.binance_block_trader_llm_reasoning_effort == "xhigh"
     assert settings.binance_block_trader_llm_timeout_ms == 420_000
     assert settings.binance_block_trader_max_manager_symbols == 60
@@ -875,6 +1053,10 @@ def test_binance_block_trader_defaults() -> None:
 
     from tradecraft.services.settings_catalog import META
 
+    assert META["binance_block_trader_waiting_entry_max_age_sec"].category == "trading"
+    assert META["binance_block_trader_waiting_entry_max_age_sec"].min_value == 0
+    assert META["binance_block_trader_entry_pending_max_age_sec"].category == "trading"
+    assert META["binance_block_trader_entry_pending_max_age_sec"].min_value == 0
     assert META["binance_block_trader_manager_error_retry_sec"].category == "ops"
     assert META["binance_block_trader_manager_error_retry_sec"].min_value == 60
     assert settings.binance_block_trader_retention_interval_sec == 3600
@@ -899,7 +1081,7 @@ def test_binance_jue_edge_defaults(monkeypatch) -> None:
     settings = AppSettings(_env_file=None)
 
     assert settings.crypto_market_research_kline_intervals == (
-        "1m:120,5m:96,15m:96,1h:168,4h:180"
+        "1m:120,5m:96,15m:96,1h:168,4h:180,1d:90"
     )
     assert settings.crypto_market_research_kline_hot_window_rows == 720
     assert settings.crypto_market_research_market_hot_window_rows == 720
@@ -943,8 +1125,8 @@ def test_crypto_market_research_settings_defaults(monkeypatch) -> None:
     assert settings.crypto_market_research_collect_concurrency == 4
     assert settings.crypto_market_research_feature_interval_sec == 300
     assert settings.crypto_market_research_llm_interval_sec == 3600
-    assert settings.crypto_market_research_llm_model == "gpt-5.5"
-    assert settings.crypto_market_research_llm_reasoning_effort == "xhigh"
+    assert settings.crypto_market_research_llm_model == "gpt-5.6-terra"
+    assert settings.crypto_market_research_llm_reasoning_effort == "high"
     assert settings.crypto_market_research_external_enabled is True
     assert settings.crypto_market_research_external_sources == "coingecko,defillama,fear_greed"
 
@@ -1046,8 +1228,8 @@ def test_crypto_alpha_settings_defaults(monkeypatch) -> None:
     assert settings.crypto_alpha_outcome_interval_sec == 900
     assert settings.crypto_alpha_rate_limit_sec == 2.0
     assert settings.crypto_alpha_context_limit == 12
-    assert settings.crypto_alpha_llm_model == "gpt-5.5"
-    assert settings.crypto_alpha_llm_reasoning_effort == "xhigh"
+    assert settings.crypto_alpha_llm_model == "gpt-5.6-luna"
+    assert settings.crypto_alpha_llm_reasoning_effort == "medium"
 
 
 def test_investment_memory_defaults_are_safe(monkeypatch) -> None:
@@ -1082,3 +1264,81 @@ def test_investment_memory_defaults_are_safe(monkeypatch) -> None:
         META["investment_memory_symbol_analysis_recent_rows_per_symbol"].category
         == "memory"
     )
+
+
+def test_ops_readiness_snapshot_settings_defaults_and_aliases(monkeypatch) -> None:
+    for key in (
+        "TRADECRAFT_OPS_READINESS_SNAPSHOT_PATH",
+        "TRADECRAFT_OPS_READINESS_REFRESH_INTERVAL_SEC",
+        "TRADECRAFT_OPS_READINESS_SNAPSHOT_MAX_AGE_SEC",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    defaults = AppSettings(_env_file=None)
+
+    assert defaults.ops_readiness_snapshot_path == ".runtime/ops_readiness_snapshot.json"
+    assert defaults.ops_readiness_refresh_interval_sec == 15.0
+    assert defaults.ops_readiness_snapshot_max_age_sec == 60.0
+
+    monkeypatch.setenv(
+        "TRADECRAFT_OPS_READINESS_SNAPSHOT_PATH",
+        "/tmp/hermes-ops-readiness.json",
+    )
+    monkeypatch.setenv("TRADECRAFT_OPS_READINESS_REFRESH_INTERVAL_SEC", "5")
+    monkeypatch.setenv("TRADECRAFT_OPS_READINESS_SNAPSHOT_MAX_AGE_SEC", "30")
+    overridden = AppSettings(_env_file=None)
+
+    assert overridden.ops_readiness_snapshot_path == "/tmp/hermes-ops-readiness.json"
+    assert overridden.ops_readiness_refresh_interval_sec == 5.0
+    assert overridden.ops_readiness_snapshot_max_age_sec == 30.0
+
+
+def test_naver_reports_supervisor_settings_defaults_and_aliases(monkeypatch) -> None:
+    for key in (
+        "TRADECRAFT_NAVER_REPORTS_STATE_PATH",
+        "TRADECRAFT_NAVER_REPORTS_HEARTBEAT_INTERVAL_SEC",
+        "TRADECRAFT_NAVER_REPORTS_WORKER_TERMINATE_GRACE_SEC",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    defaults = AppSettings(_env_file=None)
+
+    assert defaults.naver_reports_state_path == ".runtime/naver_reports_runner.json"
+    assert defaults.naver_reports_heartbeat_interval_sec == 5.0
+    assert defaults.naver_reports_worker_terminate_grace_sec == 5.0
+
+    monkeypatch.setenv(
+        "TRADECRAFT_NAVER_REPORTS_STATE_PATH",
+        "/tmp/naver-reports-state.json",
+    )
+    monkeypatch.setenv("TRADECRAFT_NAVER_REPORTS_HEARTBEAT_INTERVAL_SEC", "2.5")
+    monkeypatch.setenv(
+        "TRADECRAFT_NAVER_REPORTS_WORKER_TERMINATE_GRACE_SEC",
+        "1.5",
+    )
+    overridden = AppSettings(_env_file=None)
+
+    assert overridden.naver_reports_state_path == "/tmp/naver-reports-state.json"
+    assert overridden.naver_reports_heartbeat_interval_sec == 2.5
+    assert overridden.naver_reports_worker_terminate_grace_sec == 1.5
+
+
+def test_market_judge_prompt_budget_settings_defaults_and_aliases(monkeypatch) -> None:
+    for key in (
+        "TRADECRAFT_MARKET_JUDGE_PROMPT_TARGET_CHARS",
+        "TRADECRAFT_MARKET_JUDGE_PROMPT_WARN_CHARS",
+        "TRADECRAFT_MARKET_JUDGE_PROMPT_MAX_CHARS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    defaults = AppSettings(_env_file=None)
+
+    assert defaults.market_judge_prompt_target_chars == 120_000
+    assert defaults.market_judge_prompt_warn_chars == 150_000
+    assert defaults.market_judge_prompt_max_chars == 190_000
+
+    monkeypatch.setenv("TRADECRAFT_MARKET_JUDGE_PROMPT_TARGET_CHARS", "60000")
+    monkeypatch.setenv("TRADECRAFT_MARKET_JUDGE_PROMPT_WARN_CHARS", "80000")
+    monkeypatch.setenv("TRADECRAFT_MARKET_JUDGE_PROMPT_MAX_CHARS", "100000")
+    overridden = AppSettings(_env_file=None)
+
+    assert overridden.market_judge_prompt_target_chars == 60_000
+    assert overridden.market_judge_prompt_warn_chars == 80_000
+    assert overridden.market_judge_prompt_max_chars == 100_000

@@ -211,3 +211,40 @@ Ritual output is intentionally trading-native. When a memory note implies action
 - Preserve symbol identity repair: generic names, OCR/date-like symbols, ETF prefix-only names, and code-only names must be resolved before they influence active block decisions.
 - Keep ETF/core memory semantics distinct from scalp-only blocks; ETF/core notes should emphasize exposure, allocation, rebalance, and stale research checks.
 - Keep policy/reflection growth loop observable so 쥬's behavior changes can be traced back to closed blocks, period reviews, and scorecards.
+
+## Wiki-First V3 Ownership And Migration
+
+Jue Wiki V3 is the canonical decision-knowledge layer. RAG remains useful, but
+it is not the live decision authority. The ownership boundary has four layers:
+
+1. Source evidence owns immutable source identity, content hashes, observation
+   time, and source location. `evidence_id` identifies this layer.
+2. Candidate artifacts own extractor/compiler inputs and provenance before
+   publication. `artifact_id` and its source evidence refs identify this layer.
+3. Canonical Wiki V3 owns reviewed claims, relationships, pages, and immutable
+   publications. `claim_id`, `page_id`, and `snapshot_id` identify this layer.
+4. Decision application owns selected-page traces, manager/action references,
+   shadow comparisons, outcomes, and readiness audits. It may measure or block
+   use, but it does not rewrite evidence or a published snapshot on a read.
+
+Prompt mode (`observe`, `assist`, `primary`) controls how selected knowledge is
+presented to the model. Read mode (`shadow`, `prefer`, `required`) controls the
+safety authority of Wiki context. These are independent contracts: changing a
+prompt mode never promotes a read mode, and a recommendation never changes a
+live setting automatically.
+
+Read authority advances only through `shadow -> prefer -> required`. Promotion
+requires a fresh venue-matched V3 snapshot, all ingest/compile/lint/publish and
+index gates healthy, zero stale/conflicted/orphan/backlog degradation, at least
+500 signed complete shadow comparisons, full snapshot attribution, no safety
+gate loss, no required-path raw RAG injection, and successful outage recovery.
+Eligibility is advisory until a separate operator-approved configuration change.
+Rollback sets read mode back to `shadow`; it does not delete snapshots or change
+prompt mode. A rollback or failed current build cannot use an older valid
+snapshot to expand risk until the stored health and signed eligibility gates are
+fresh and valid again.
+
+RAG is retained for bounded repair discovery, evidence audit, historical
+backfill, and index rebuild. Its output first becomes evidence/candidate data and
+must pass the V3 compiler and lint/publish contracts. Direct raw-RAG injection is
+not allowed on the `required` decision path.

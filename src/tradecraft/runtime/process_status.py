@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from tradecraft.runtime.runner_manifest import (
     RUNNER_SPECS,
     RunnerSpec,
 )
+from tradecraft.runtime.runner_recovery import normalize_recovery_order
 
 RUNNER_PID_DIR = Path(".runtime/pids")
 
@@ -302,14 +304,15 @@ def _existing_runner_pids(keys: list[str]) -> dict[str, list[int]]:
     for key in keys:
         pattern = RUNNER_PATTERNS.get(key, "")
         pids: list[int] = []
-        for row in list_matching_processes(pattern, include_current=key == "control"):
+        include_current = key in {"control", "watchdog"}
+        for row in list_matching_processes(pattern, include_current=include_current):
             try:
                 pid = int(row.get("pid") or 0)
             except (TypeError, ValueError):
                 continue
             if pid <= 0:
                 continue
-            if key != "control" and pid == current_pid:
+            if key not in {"control", "watchdog"} and pid == current_pid:
                 continue
             if pid not in pids:
                 pids.append(pid)
@@ -405,5 +408,47 @@ def restart_runner_processes(
         "terminated_existing_pids": {
             key: pids for key, pids in existing_pids_by_key.items() if pids
         },
+        "supervisor_pid": int(proc.pid),
+    }
+
+
+def schedule_runner_recovery(
+    keys: list[str] | tuple[str, ...] | None = None,
+    *,
+    delay_sec: float = 0.5,
+    state_path: str = ".runtime/runner_recovery.json",
+    verify_timeout_sec: float = 60.0,
+    poll_interval_sec: float = 0.5,
+) -> dict[str, Any]:
+    normalized = _normalize_restart_keys(keys)
+    ordered = normalize_recovery_order(normalized)
+    command = [
+        sys.executable,
+        "-m",
+        "tradecraft.runtime.runner_recovery",
+        "--keys",
+        ",".join(ordered),
+        "--state-path",
+        str(state_path),
+        "--verify-timeout-sec",
+        str(max(float(verify_timeout_sec), 0.0)),
+        "--poll-interval-sec",
+        str(max(float(poll_interval_sec), 0.01)),
+    ]
+    proc = subprocess.Popen(
+        command,
+        cwd=str(Path.cwd()),
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return {
+        "status": "scheduled",
+        "mode": "verified_rolling",
+        "keys": ordered,
+        "delay_sec": max(float(delay_sec), 0.0),
+        "state_path": str(state_path),
+        "verify_timeout_sec": max(float(verify_timeout_sec), 0.0),
+        "poll_interval_sec": max(float(poll_interval_sec), 0.01),
         "supervisor_pid": int(proc.pid),
     }

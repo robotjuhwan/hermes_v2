@@ -7,6 +7,7 @@ from typing import Any
 
 from tradecraft.config import AppSettings
 from tradecraft.services.codex_native import CodexNativeConfig, CodexNativeRuntime
+from tradecraft.services.llm_model_policy import llm_model_config_kwargs
 from tradecraft.services.jue_codex_lab import JueCodexLabService
 from tradecraft.services.jue_codex_lab_store import JueCodexLabStore
 
@@ -179,8 +180,7 @@ def _build_codex_runtime(settings: AppSettings) -> CodexNativeRuntime:
             mode=settings.codex_runtime_mode,
             sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
             timeout_ms=settings.codex_runtime_timeout_ms,
-            model=settings.llm_model,
-            reasoning_effort=settings.llm_reasoning_effort,
+            **llm_model_config_kwargs(settings, component="jue_codex_lab"),
             usage_enabled=settings.llm_usage_enabled,
             usage_db_path=settings.llm_usage_db_path,
             usage_component="jue_codex_lab",

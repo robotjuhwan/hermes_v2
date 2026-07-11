@@ -1,8 +1,21 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tradecraft import main
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ops_readiness_dependencies(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main.jue_wiki_service,
+        "status",
+        lambda: {"status": "ok", "page_count": 0},
+    )
+    monkeypatch.setattr(main, "_ops_readiness_cache_payload", None)
+    monkeypatch.setattr(main, "_ops_readiness_cache_expires_at", 0.0)
+    monkeypatch.setattr(main, "_ops_readiness_cache_key", None)
 
 
 def _set_admin_token(monkeypatch, token: str = "test-admin") -> None:
@@ -187,12 +200,16 @@ def test_ops_restart_schedules_allowlisted_runners(monkeypatch) -> None:
         }
 
     monkeypatch.setattr(main, "restart_runner_processes", fake_restart)
+    monkeypatch.setattr(main, "_build_ops_readiness", lambda: {})
 
     with TestClient(main.app) as client:
         response = client.post(
             "/api/ops/restart",
             headers=_auth_header(),
-            json={"keys": ["market_judge", "kis_block_trader"]},
+            json={
+                "keys": ["market_judge", "kis_block_trader"],
+                "confirm_active_trading_restart": True,
+            },
         )
 
     assert response.status_code == 200

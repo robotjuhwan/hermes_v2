@@ -120,6 +120,55 @@ def diversify_manager_candidates_by_lane(
     return selected[:limit], selected[:limit] != candidates[:limit]
 
 
+def _waiting_entry_base_gate_available(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    for source in (
+        row,
+        row.get("metadata") if isinstance(row.get("metadata"), dict) else {},
+        row.get("calculated") if isinstance(row.get("calculated"), dict) else {},
+    ):
+        hint = (
+            source.get("waiting_entry_gate_hint")
+            if isinstance(source, dict)
+            and isinstance(source.get("waiting_entry_gate_hint"), dict)
+            else {}
+        )
+        if (
+            str(hint.get("status") or "").strip().lower()
+            == "waiting_entry_base_gate_available"
+        ):
+            return True
+    return False
+
+
+def _preserve_waiting_entry_base_gate_candidate(
+    selected: list[dict[str, Any]],
+    ranked_candidates: list[dict[str, Any]],
+    *,
+    max_items: int,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    waiting_candidates = [
+        row for row in ranked_candidates if _waiting_entry_base_gate_available(row)
+    ]
+    if not waiting_candidates:
+        return selected, False, 0
+    if any(_waiting_entry_base_gate_available(row) for row in selected):
+        return selected, False, len(waiting_candidates)
+
+    limit = max(int(max_items), 1)
+    replacement = waiting_candidates[0]
+    selected_keys = {candidate_identity(row) for row in selected}
+    if candidate_identity(replacement) in selected_keys:
+        return selected, False, len(waiting_candidates)
+    next_selected = list(selected[:limit])
+    if len(next_selected) < limit:
+        next_selected.append(replacement)
+    else:
+        next_selected[-1] = replacement
+    return next_selected[:limit], True, len(waiting_candidates)
+
+
 def candidate_execution_blocker_context(
     row: dict[str, Any],
     *,
@@ -1193,6 +1242,16 @@ def finalize_manager_candidates(
         ranked_candidates,
         max_items=max_items,
     )
+    (
+        selected_candidates,
+        waiting_entry_preserved,
+        waiting_entry_candidate_count,
+    ) = _preserve_waiting_entry_base_gate_candidate(
+        selected_candidates,
+        ranked_candidates,
+        max_items=max_items,
+    )
+    diversified = bool(diversified or waiting_entry_preserved)
     raw_lane_distribution = hooks.lane_distribution(ranked_candidates)
     selected_lane_distribution = hooks.lane_distribution(selected_candidates)
     candidate_packets = hooks.manager_candidate_packets(
@@ -1219,6 +1278,8 @@ def finalize_manager_candidates(
         "candidate_packets": candidate_packets,
         "volatile_attack_candidate_count": volatile_attack_candidate_count,
         "candidate_lane_diversified": diversified,
+        "waiting_entry_base_gate_candidate_count": waiting_entry_candidate_count,
+        "waiting_entry_base_gate_candidate_preserved": waiting_entry_preserved,
         "lane_distribution": selected_lane_distribution,
         "raw_lane_distribution": raw_lane_distribution,
         "spot_shadow_candidate_count": spot_shadow_count,

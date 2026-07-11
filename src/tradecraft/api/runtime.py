@@ -19,6 +19,7 @@ class RuntimeRouteDeps:
     runtime_storage_policy: Callable[[], Any]
     build_runtime_storage_report: Callable[[Any], dict[str, Any]]
     cleanup_runtime_storage: Callable[..., dict[str, Any]]
+    refresh_cold_archive_status: Callable[[], dict[str, Any]] | None = None
     storage_report_cache_ttl_sec: float = 30.0
     storage_report_file_cache_enabled: bool = False
     storage_report_file_cache_ttl_sec: float | None = None
@@ -184,6 +185,14 @@ def build_runtime_router(deps: RuntimeRouteDeps) -> APIRouter:
             dry_run=dry_run,
             compact_databases=compact_databases,
         )
+        if (
+            not dry_run
+            and list(result.get("archived") or [])
+            and deps.refresh_cold_archive_status is not None
+        ):
+            result["cold_archive_verification"] = (
+                deps.refresh_cold_archive_status()
+            )
         result["after"] = fresh_storage_report()
         return result
 

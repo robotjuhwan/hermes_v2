@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,42 @@ def test_compact_binance_blocks_payload_compacts_manager_run_actions() -> None:
     assert "candidate" not in create
     assert "metadata" not in create
     assert len(str(compact)) < 5_000
+
+
+def test_compact_binance_blocks_payload_preserves_order_fill_summary() -> None:
+    payload = {
+        "status": "ok",
+        "orders": [
+            {
+                "id": 4217,
+                "block_id": "bnb_spot_MEGAUSDT",
+                "symbol": "MEGAUSDT",
+                "market": "spot",
+                "side": "buy",
+                "qty": 371.609067261241,
+                "order_type": "LIMIT_IOC",
+                "status": "sent",
+                "execution_status": "filled",
+                "filled_qty": 371.6,
+                "filled_quote": 19.91776,
+                "effective_fill": True,
+                "reason": "entry_order",
+                "response": {"status": "FILLED", "executed_qty": "371.60000000"},
+                "created_at": "2026-07-05T07:25:25+00:00",
+                "updated_at": "2026-07-05T07:25:25+00:00",
+            }
+        ],
+    }
+
+    compact = compact_binance_blocks_payload(payload)
+    order = compact["orders"][0]
+
+    assert order["status"] == "sent"
+    assert order["execution_status"] == "filled"
+    assert order["filled_qty"] == 371.6
+    assert order["filled_quote"] == 19.91776
+    assert order["effective_fill"] is True
+    assert order["response"]["status"] == "FILLED"
 
 
 def test_compact_binance_blocks_payload_exposes_latest_run_and_recent_errors() -> None:
@@ -225,6 +262,251 @@ def test_build_binance_block_readiness_payload_summarizes_status_without_payload
     assert "readiness" not in payload["status"]
 
 
+def test_build_binance_block_readiness_payload_exposes_activity_pressure() -> None:
+    payload = build_binance_block_readiness_payload(
+        status_payload={
+            "status": "ok",
+            "latest_decision_input": {
+                "current_replay_pressure_status": "action_required",
+                "current_replay_pressure_level": "high",
+                "current_replay_pressure_source": "binance_activity_gap",
+                "current_replay_zero_action_streak": 5,
+                "current_replay_binance_zero_action_streak": 5,
+                "current_replay_binance_activity_gap_status": "stale_binance_entries",
+                "current_replay_binance_entry_stale_hours": 73.5,
+                "current_replay_binance_candidate_symbols": ["ESPUSDT", "CHIPUSDT"],
+            },
+        },
+        runner={},
+        enabled=True,
+        spot_live=True,
+        futures_live=True,
+        upbit_live=False,
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0,
+        max_symbol_exposure_pct=25,
+        min_reward_risk=1.3,
+        manager_interval_sec=1800,
+        next_from_latest=lambda latest, interval: "next",
+    )
+
+    assert payload["activity_pressure"] == {
+        "status": "action_required",
+        "level": "high",
+        "source": "binance_activity_gap",
+        "zero_action_streak": 5,
+        "binance_zero_action_streak": 5,
+        "activity_gap_status": "stale_binance_entries",
+        "entry_stale_hours": 73.5,
+        "candidate_symbols": ["ESPUSDT", "CHIPUSDT"],
+    }
+    assert payload["warnings"] == ["binance_activity_pressure_open"]
+
+
+def test_build_binance_block_readiness_payload_exposes_entry_activity() -> None:
+    payload = build_binance_block_readiness_payload(
+        status_payload={
+            "status": "ok",
+            "entry_activity": {
+                "version": "binance_entry_activity_v1",
+                "status": "stale_binance_entries",
+                "latest_binance_entry_at": "2026-07-05T00:00:00+00:00",
+                "latest_binance_entry_market": "futures",
+                "latest_upbit_entry_at": "2026-07-07T23:00:00+00:00",
+                "binance_entry_stale_hours": 73.5,
+                "binance_entry_count": 2,
+                "upbit_entry_count": 4,
+                "raw": "x" * 20_000,
+            },
+        },
+        runner={},
+        enabled=True,
+        spot_live=True,
+        futures_live=True,
+        upbit_live=True,
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0,
+        max_symbol_exposure_pct=25,
+        min_reward_risk=1.3,
+        manager_interval_sec=1800,
+        next_from_latest=lambda latest, interval: "next",
+    )
+
+    assert payload["entry_activity"] == {
+        "version": "binance_entry_activity_v1",
+        "status": "stale_binance_entries",
+        "latest_binance_entry_at": "2026-07-05T00:00:00+00:00",
+        "latest_binance_entry_market": "futures",
+        "latest_upbit_entry_at": "2026-07-07T23:00:00+00:00",
+        "binance_entry_stale_hours": 73.5,
+        "binance_entry_count": 2,
+        "upbit_entry_count": 4,
+    }
+    assert "warnings" not in payload
+
+
+def test_build_binance_block_readiness_payload_exposes_contract_replay_recovery() -> None:
+    payload = build_binance_block_readiness_payload(
+        status_payload={
+            "status": "ok",
+            "latest_decision_input": {
+                "contract_replay_status": "stored_error_resolved_by_current_contract",
+                "stored_error_message": "missing required field action_type",
+                "current_contract_error": "",
+                "action_count": 1,
+                "current_replay_action_count": 3,
+                "current_replay_auto_action_count": 2,
+                "current_replay_action_sections": [
+                    "create_blocks",
+                    "update_blocks",
+                ],
+                "current_replay_hold_summary": "stored failure now replays",
+                "current_replay_watch_symbols": ["BTCUSDT", "ETHUSDT"],
+                "current_replay_next_triggers": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "market": "futures",
+                        "condition": "pattern prior recovers",
+                        "price": 0.0,
+                        "reason": "pattern prior missing",
+                    }
+                ],
+                "current_replay_data_gaps": ["pattern prior missing"],
+                "current_replay_auto_create_preview": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "entry_style": "wait_for_price",
+                        "entry_trigger_price": 2475.0,
+                        "entry_trigger_operator": ">=",
+                        "entry_price": 2475.0,
+                        "target_price": 2300.0,
+                        "stop_price": 2525.0,
+                        "qty": 0.01,
+                        "quote_budget_usdt": 24.75,
+                        "min_executable_notional_usdt": 20.0,
+                        "min_executable_qty": 0.008081,
+                        "notional_estimate_usdt": 24.75,
+                        "auto_materialized_reason": (
+                            "manager_selected_probe_waiting_block_without_create_action"
+                        ),
+                        "raw": "drop me",
+                    }
+                ],
+                "raw_replay_payload": {"heavy": "drop me"},
+            },
+        },
+        runner={},
+        enabled=True,
+        spot_live=True,
+        futures_live=True,
+        upbit_live=False,
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0,
+        max_symbol_exposure_pct=25,
+        min_reward_risk=1.3,
+        manager_interval_sec=1800,
+        next_from_latest=lambda latest, interval: "next",
+    )
+
+    assert payload["manager_contract_replay"] == {
+        "contract_replay_status": "stored_error_resolved_by_current_contract",
+        "stored_error_message": "missing required field action_type",
+        "action_count": 1,
+        "current_replay_action_count": 3,
+        "current_replay_auto_action_count": 2,
+        "current_replay_action_sections": ["create_blocks", "update_blocks"],
+        "current_replay_hold_summary": "stored failure now replays",
+        "current_replay_watch_symbols": ["BTCUSDT", "ETHUSDT"],
+        "current_replay_next_triggers": [
+            {
+                "symbol": "ETHUSDT",
+                "market": "futures",
+                "condition": "pattern prior recovers",
+                "price": 0.0,
+                "reason": "pattern prior missing",
+            }
+        ],
+        "current_replay_data_gaps": ["pattern prior missing"],
+        "current_replay_auto_create_preview": [
+            {
+                "symbol": "ETHUSDT",
+                "market": "futures",
+                "side": "short",
+                "entry_style": "wait_for_price",
+                "entry_trigger_price": 2475.0,
+                "entry_trigger_operator": ">=",
+                "entry_price": 2475.0,
+                "target_price": 2300.0,
+                "stop_price": 2525.0,
+                "qty": 0.01,
+                "quote_budget_usdt": 24.75,
+                "min_executable_notional_usdt": 20.0,
+                "min_executable_qty": 0.008081,
+                "notional_estimate_usdt": 24.75,
+                "auto_materialized_reason": (
+                    "manager_selected_probe_waiting_block_without_create_action"
+                ),
+            }
+        ],
+    }
+    assert payload["warnings"] == ["binance_manager_contract_replay_recovered"]
+
+
+def test_build_binance_block_readiness_payload_exposes_current_contract_replay_error() -> None:
+    payload = build_binance_block_readiness_payload(
+        status_payload={
+            "status": "ok",
+            "latest_decision_input": {
+                "contract_replay_status": "current_contract_error",
+                "stored_error_message": "validation_repair_resolution_missing_from_model",
+                "current_contract_error": (
+                    "binance_activity_gap_resolution_missing_from_model"
+                ),
+                "action_count": 0,
+                "current_replay_action_count": 0,
+                "current_replay_pressure_status": "action_required",
+                "current_replay_pressure_source": "binance_activity_gap",
+                "raw_replay_payload": {"heavy": "drop me"},
+            },
+        },
+        runner={},
+        enabled=True,
+        spot_live=True,
+        futures_live=True,
+        upbit_live=False,
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0,
+        max_symbol_exposure_pct=25,
+        min_reward_risk=1.3,
+        manager_interval_sec=1800,
+        next_from_latest=lambda latest, interval: "next",
+    )
+
+    assert payload["manager_contract_replay"] == {
+        "contract_replay_status": "current_contract_error",
+        "stored_error_message": "validation_repair_resolution_missing_from_model",
+        "current_contract_error": (
+            "binance_activity_gap_resolution_missing_from_model"
+        ),
+        "action_count": 0,
+        "current_replay_action_count": 0,
+    }
+    assert payload["warnings"] == [
+        "binance_activity_pressure_open",
+        "binance_manager_contract_replay_current_error",
+    ]
+
+
 def test_build_binance_block_readiness_payload_separates_recovered_manager_error() -> None:
     payload = build_binance_block_readiness_payload(
         status_payload={
@@ -269,6 +551,105 @@ def test_build_binance_block_readiness_payload_separates_recovered_manager_error
     }
     assert payload["status"]["latest_manager_error_recovered"] is True
     assert "latest_unresolved_manager_error" not in payload["status"]
+
+
+def test_build_binance_block_readiness_payload_suppresses_replay_recovered_error() -> None:
+    payload = build_binance_block_readiness_payload(
+        status_payload={
+            "status": "ok",
+            "latest_manager_run_at": "2026-07-08T00:00:00+00:00",
+            "latest_manager_status": "error",
+            "manager_operational_status": "manager_error_pending_next_run",
+            "latest_manager_mode": "llm",
+            "latest_unresolved_manager_error": {
+                "run_at": "2026-07-08T00:00:00+00:00",
+                "status": "error",
+                "mode": "llm",
+                "error_message": "validation_repair_resolution_missing_from_model",
+            },
+            "latest_manager_error_recovered": False,
+            "latest_decision_input": {
+                "contract_replay_status": "stored_error_resolved_by_current_contract",
+                "stored_error_message": "validation_repair_resolution_missing_from_model",
+                "current_contract_error": "",
+                "action_count": 0,
+                "current_replay_action_count": 0,
+            },
+        },
+        runner={},
+        enabled=True,
+        spot_live=True,
+        futures_live=True,
+        upbit_live=True,
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0,
+        max_symbol_exposure_pct=25,
+        min_reward_risk=1.3,
+        manager_interval_sec=1800,
+        next_from_latest=lambda latest, interval: "next",
+    )
+
+    assert "latest_unresolved_manager_error" not in payload["status"]
+    assert payload["status"]["latest_manager_error_recovered"] is True
+    assert payload["status"]["manager_operational_status"] == (
+        "manager_contract_replay_recovered"
+    )
+    assert payload["manager_contract_replay"]["contract_replay_status"] == (
+        "stored_error_resolved_by_current_contract"
+    )
+
+
+def test_build_binance_block_readiness_payload_marks_manager_error_stale_after_restart() -> None:
+    payload = build_binance_block_readiness_payload(
+        status_payload={
+            "status": "ok",
+            "latest_manager_run_at": "2026-07-08T00:00:00+00:00",
+            "latest_manager_status": "error",
+            "manager_operational_status": "manager_error_pending_next_run",
+            "latest_manager_mode": "llm",
+            "latest_unresolved_manager_error": {
+                "run_at": "2026-07-08T00:00:00+00:00",
+                "status": "error",
+                "mode": "llm",
+                "error_message": "validation_repair_resolution_missing_from_model",
+            },
+            "latest_manager_error_recovered": False,
+        },
+        runner={
+            "started_at_epoch": datetime(
+                2026,
+                7,
+                8,
+                1,
+                0,
+                tzinfo=timezone.utc,
+            ).timestamp()
+        },
+        enabled=True,
+        spot_live=True,
+        futures_live=True,
+        upbit_live=True,
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        account_risk_pct=0.25,
+        max_total_exposure_usdt=0,
+        max_symbol_exposure_pct=25,
+        min_reward_risk=1.3,
+        manager_interval_sec=1800,
+        next_from_latest=lambda latest, interval: f"{latest}|{interval}",
+    )
+
+    assert payload["status"]["latest_manager_error_stale_after_restart"] is True
+    assert payload["status"]["latest_stale_manager_error"] == {
+        "run_at": "2026-07-08T00:00:00+00:00",
+        "status": "error",
+        "mode": "llm",
+        "error_message": "validation_repair_resolution_missing_from_model",
+    }
+    assert "latest_unresolved_manager_error" not in payload["status"]
+    assert "latest_manager_error" not in payload["status"]
 
 
 def test_build_binance_quant_signals_payload_attaches_recent_history() -> None:

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, time, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from tradecraft.config import AppSettings
@@ -23,6 +25,15 @@ from tradecraft.services.investment_memory import (
     InvestmentMemoryService,
 )
 from tradecraft.services.jue_wiki import JueWikiConfig, JueWikiService
+from tradecraft.services.jue_wiki_context import (
+    JueWikiContextService,
+    evaluate_wiki_decision_gate,
+)
+from tradecraft.services.jue_wiki_contract import WikiContextRequestV1
+from tradecraft.services.jue_wiki_shadow import (
+    JueWikiShadowStore,
+    WikiCompletionSigner,
+)
 from tradecraft.services.jue_wiki_selector import (
     JueWikiSelectionRequest,
     JueWikiSelector,
@@ -33,6 +44,7 @@ from tradecraft.services.codex_native import (
     CodexNativeRuntime,
     codex_native_thread_config_kwargs,
 )
+from tradecraft.services.llm_model_policy import llm_model_config_kwargs
 from tradecraft.services.market_judgment import (
     MarketJudgmentConfig,
     MarketJudgmentEngine,
@@ -126,10 +138,91 @@ def _selector_context_provider(
                 getattr(settings, "jue_wiki_context_max_chars", 24000),
             )
         )
+        target_scope = str(kwargs.get("target_scope") or "")
+        symbols = _jue_wiki_arg_list(kwargs, "symbols")
+        read_mode = str(
+            getattr(settings, "jue_wiki_read_mode", "shadow") or "shadow"
+        ).strip().lower()
+        if read_mode not in {"shadow", "prefer", "required"}:
+            read_mode = "shadow"
+        eligibility_reader = None
+        if read_mode == "required":
+            eligibility_reader = JueWikiShadowStore(
+                Path(
+                    str(
+                        getattr(
+                            settings,
+                            "jue_wiki_shadow_db_path",
+                            Path.home() / ".tradecraft" / "jue_wiki_shadow.db",
+                        )
+                    )
+                ),
+                completion_verifier=WikiCompletionSigner(
+                    Path(
+                        str(
+                            getattr(
+                                settings,
+                                "jue_wiki_provenance_key_path",
+                                os.environ.get(
+                                    "TRADECRAFT_JUE_WIKI_PROVENANCE_KEY_PATH",
+                                    str(
+                                        Path.home()
+                                        / ".tradecraft"
+                                        / "jue_wiki_provenance.key"
+                                    ),
+                                ),
+                            )
+                        )
+                    )
+                ),
+            )
+        try:
+            packet = JueWikiContextService(
+                service.repository(),
+                eligibility_reader=eligibility_reader,
+                health_reader=service.status,
+            ).context_packet(
+                WikiContextRequestV1(
+                    target_scope=target_scope,
+                    symbols=tuple(symbols),
+                    page_types=tuple(_jue_wiki_arg_list(kwargs, "page_types")),
+                    lanes=tuple(_jue_wiki_arg_list(kwargs, "lanes")),
+                    regimes=tuple(_jue_wiki_arg_list(kwargs, "regimes")),
+                    block_ids=tuple(_jue_wiki_arg_list(kwargs, "block_ids")),
+                    horizons=tuple(_jue_wiki_arg_list(kwargs, "horizons")),
+                    max_chars=int(
+                        kwargs["max_chars"]
+                        if kwargs.get("max_chars") is not None
+                        else default_max_chars
+                    ),
+                ),
+                read_mode=read_mode,
+            )
+            packet_payload = packet.to_dict()
+            decision_gate = evaluate_wiki_decision_gate(packet).to_dict()
+        except Exception as exc:
+            packet_payload = {
+                "status": "error",
+                "read_mode": read_mode,
+                "snapshot_id": "",
+                "error_message": str(exc),
+            }
+            decision_gate = {
+                "allow_new_risk": read_mode != "required",
+                "allow_exit_actions": True,
+                "reason": (
+                    "wiki_required_context_unavailable"
+                    if read_mode == "required"
+                    else "wiki_context_advisory"
+                ),
+                "read_mode": read_mode,
+                "snapshot_id": "",
+                "version": "wiki_decision_gate_v1",
+            }
         result = JueWikiSelector(service).select(
             JueWikiSelectionRequest(
-                target_scope=str(kwargs.get("target_scope") or ""),
-                symbols=_jue_wiki_arg_list(kwargs, "symbols"),
+                target_scope=target_scope,
+                symbols=symbols,
                 page_types=_jue_wiki_arg_list(kwargs, "page_types"),
                 lanes=_jue_wiki_arg_list(kwargs, "lanes"),
                 regimes=_jue_wiki_arg_list(kwargs, "regimes"),
@@ -162,6 +255,9 @@ def _selector_context_provider(
         )
         return {
             "status": result.status,
+            "read_mode": read_mode,
+            "jue_wiki_context_packet": packet_payload,
+            "jue_wiki_decision_gate": decision_gate,
             "selection_run_id": result.selection_run_id,
             "target_scope": result.target_scope,
             "prompt_mode": prompt_mode_resolution["prompt_mode"],
@@ -235,8 +331,7 @@ def _build_market_judge(settings: AppSettings) -> MarketJudgmentEngine:
             mode=settings.codex_runtime_mode,
             sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
             timeout_ms=settings.codex_runtime_timeout_ms,
-            model=settings.llm_model,
-            reasoning_effort=settings.llm_reasoning_effort,
+            **llm_model_config_kwargs(settings, component="market_judge"),
             usage_enabled=settings.llm_usage_enabled,
             usage_db_path=settings.llm_usage_db_path,
             usage_component="market_judge",
@@ -395,6 +490,9 @@ def _build_market_judge(settings: AppSettings) -> MarketJudgmentEngine:
             llm_max_symbols=settings.market_judge_llm_max_symbols,
             use_naver_fallback=settings.market_judge_use_naver_fallback,
             query=settings.market_judge_query,
+            prompt_target_chars=settings.market_judge_prompt_target_chars,
+            prompt_warn_chars=settings.market_judge_prompt_warn_chars,
+            prompt_max_chars=settings.market_judge_prompt_max_chars,
         ),
         kis=kis,
         codex_runtime=bridge,

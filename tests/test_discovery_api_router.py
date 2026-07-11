@@ -88,6 +88,7 @@ def test_discovery_status_includes_config_latest_and_due_today() -> None:
         "coverage": {
             "kospi_count": 5,
             "kosdaq_count": 5,
+            "etf_count": 0,
             "candidate_limit_per_market": 300,
         },
     }

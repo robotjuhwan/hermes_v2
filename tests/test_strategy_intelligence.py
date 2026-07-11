@@ -2734,11 +2734,14 @@ def test_strategy_research_feed_merges_daily_discovery(monkeypatch) -> None:
         "read_active_research_feed",
         lambda settings: ({"count": 1, "items": [{"picks": ["005930"]}]}, None),
     )
+    monkeypatch.setattr(main.settings, "daily_discovery_kospi_count", 30)
+    monkeypatch.setattr(main.settings, "daily_discovery_kosdaq_count", 30)
+    monkeypatch.setattr(main.settings, "daily_discovery_etf_count", 5)
     monkeypatch.setattr(main, "daily_discovery_service", _FakeDiscoveryService())
 
     feed = main._read_strategy_research_feed()
 
-    assert seen["limit"] == 10
+    assert seen["limit"] == 65
     assert feed is not None
     assert feed["count"] == 1
     assert feed["daily_discovery"]["items"][0]["symbol"] == "375500"

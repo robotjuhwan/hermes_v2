@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 import tradecraft.main as main_module
@@ -14,6 +15,18 @@ from tradecraft.services.live_performance import (
     LivePerformanceRepository,
 )
 from tradecraft.services.trading_validation import TradingValidationRepository
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ops_readiness_dependencies(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main_module.jue_wiki_service,
+        "status",
+        lambda: {"status": "ok", "page_count": 0},
+    )
+    monkeypatch.setattr(main_module, "_ops_readiness_cache_payload", None)
+    monkeypatch.setattr(main_module, "_ops_readiness_cache_expires_at", 0.0)
+    monkeypatch.setattr(main_module, "_ops_readiness_cache_key", None)
 
 
 def _admin_headers(monkeypatch) -> dict[str, str]:
@@ -136,6 +149,7 @@ def test_trading_validation_run_once_api(monkeypatch, tmp_path: Path) -> None:
     assert latest["remediation_plan"]["status"] in {
         "clear",
         "needs_work",
+        "probe_rebuild",
         "blocked",
     }
 
@@ -311,6 +325,8 @@ def test_trading_validation_status_uses_venue_specific_service(monkeypatch) -> N
     )
 
     with TestClient(app) as client:
+        created_for.clear()
+        latest_called_with.clear()
         response = client.get(
             "/api/trading/validation/status?venue=kis",
             headers=_admin_headers(monkeypatch),

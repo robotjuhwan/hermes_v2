@@ -602,8 +602,8 @@ _RESEARCH_RUN_COMPACTION_REASON = "crypto_research_run_payload_retention"
 class CryptoMarketResearchConfig:
     db_path: str = ".runtime/crypto_market_research.db"
     max_symbols: int = 300
-    llm_model: str = "gpt-5.5"
-    llm_reasoning_effort: str = "xhigh"
+    llm_model: str = "gpt-5.6-terra"
+    llm_reasoning_effort: str = "high"
     external_enabled: bool = True
     external_sources: str = "coingecko,defillama,fear_greed"
     auto_universe_enabled: bool = True
@@ -2240,6 +2240,7 @@ class CryptoMarketResearchService:
             "15m": 96,
             "1h": 168,
             "4h": 180,
+            "1d": 90,
         }
 
     async def _safe_futures_payload(

@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from tradecraft.api.ops_payloads import build_stored_jue_wiki_readiness_status
+
 
 RunnerStatusFn = Callable[[str], dict[str, Any]]
 CodeStalenessFn = Callable[..., dict[str, Any]]
@@ -42,6 +44,153 @@ def _safe_int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def build_compact_ops_readiness_source(
+    *,
+    provider_status: dict[str, dict[str, Any]],
+    enabled: dict[str, bool],
+    checked_at: str,
+    configured_jue_wiki_read_mode: str | None = None,
+) -> dict[str, Any]:
+    provider_status = dict(provider_status)
+    provider_status["jue_wiki"] = build_stored_jue_wiki_readiness_status(
+        provider_status.get("jue_wiki", {}),
+        configured_read_mode=configured_jue_wiki_read_mode,
+    )
+    processes = provider_status["processes"]
+    warnings: list[str] = []
+    blockers: list[str] = []
+    for name, payload in provider_status.items():
+        provider_meta = (
+            payload.get("_status_provider")
+            if isinstance(payload.get("_status_provider"), dict)
+            else {}
+        )
+        provider_state = str(provider_meta.get("status") or "").strip().lower()
+        payload_state = str(payload.get("status") or "").strip().lower()
+        if provider_state == "stale_cache":
+            warnings.append(f"{name}_status_stale_cache")
+        elif provider_state == "error" or payload_state == "error":
+            warnings.append(f"{name}_status_error")
+        elif payload_state in {"unavailable", "missing"}:
+            warnings.append(f"{name}_status_{payload_state}")
+    disk_status = str(provider_status["disk_space"].get("status") or "").lower()
+    if disk_status == "critical":
+        blockers.append("disk_space_critical")
+    elif disk_status == "low":
+        warnings.append("disk_space_low")
+    elif disk_status == "error":
+        warnings.append("disk_space_status_error")
+    runtime_storage = (
+        provider_status["disk_space"].get("runtime_storage")
+        if isinstance(
+            provider_status["disk_space"].get("runtime_storage"),
+            dict,
+        )
+        else {}
+    )
+    runtime_storage_status = str(runtime_storage.get("status") or "").lower()
+    if runtime_storage_status == "risk":
+        blockers.append("runtime_storage_risk")
+    elif runtime_storage_status == "warning":
+        warnings.append("runtime_storage_warning")
+    elif runtime_storage_status == "error":
+        warnings.append("runtime_storage_status_error")
+    cold_archive = (
+        runtime_storage.get("cold_archive")
+        if isinstance(runtime_storage.get("cold_archive"), dict)
+        else {}
+    )
+    cold_archive_status = str(cold_archive.get("status") or "").lower()
+    cold_snapshot = (
+        cold_archive.get("verification_snapshot")
+        if isinstance(cold_archive.get("verification_snapshot"), dict)
+        else {}
+    )
+    if cold_archive_status == "corrupt" or list(
+        cold_archive.get("corrupt_entry_ids") or []
+    ):
+        warnings.append("runtime_cold_archive_corrupt")
+    elif cold_archive_status in {"warning", "error"} or str(
+        cold_snapshot.get("status") or ""
+    ).lower() in {"missing", "stale", "invalid"}:
+        warnings.append("runtime_cold_archive_unverified")
+    missing_processes = [
+        str(key)
+        for key, row in processes.items()
+        if isinstance(row, dict) and not bool(row.get("alive"))
+    ]
+    duplicate_processes = [
+        str(key)
+        for key, row in processes.items()
+        if isinstance(row, dict) and _safe_int(row.get("matched_count")) > 1
+    ]
+    if missing_processes:
+        warnings.append("runner_process_missing")
+    if duplicate_processes:
+        warnings.append("runner_process_duplicate")
+    for warning in list(provider_status["jue_wiki"].get("warnings") or []):
+        warnings.append(str(warning))
+    for blocker in list(provider_status["jue_wiki"].get("blockers") or []):
+        blockers.append(str(blocker))
+    status = "red" if blockers else "yellow" if warnings else "green"
+
+    def section(
+        name: str,
+        *,
+        runner_key: str = "",
+        schedule: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "enabled": bool(enabled.get(name)),
+            "status": provider_status[name],
+        }
+        if runner_key:
+            payload["runner"] = processes.get(runner_key, {})
+        if schedule is not None:
+            payload["schedule"] = schedule
+        return payload
+
+    return {
+        "status": status,
+        "checked_at": checked_at,
+        "blockers": list(dict.fromkeys(blockers)),
+        "warnings": list(dict.fromkeys(warnings)),
+        "advisories": [],
+        "operational_remediation_actions": [],
+        "advisory_actions": [],
+        "remediation_actions": [],
+        "stale_processes": [],
+        "missing_processes": missing_processes,
+        "duplicate_processes": duplicate_processes,
+        "processes": processes,
+        "disk_space": provider_status["disk_space"],
+        "memory": section("memory", runner_key="investment_memory"),
+        "market_judge": section(
+            "market_judge",
+            runner_key="market_judge",
+            schedule=provider_status["market_schedule"],
+        ),
+        "market_pulse": section("market_pulse", runner_key="market_pulse"),
+        "kis_block_trader": section(
+            "kis_block_trader",
+            runner_key="kis_block_trader",
+        ),
+        "binance_block_trader": section(
+            "binance_block_trader",
+            runner_key="binance_block_trader",
+        ),
+        "reports": section("reports", runner_key="naver_reports"),
+        "jue_wiki": section("jue_wiki", runner_key="jue_wiki"),
+        "crypto_market_research": section(
+            "crypto_market_research",
+            runner_key="crypto_market_research",
+        ),
+        "crypto_alpha": section("crypto_alpha", runner_key="crypto_alpha"),
+        "llm_usage": section("llm_usage"),
+        "trading_validation": provider_status["trading_validation"],
+    }
 
 
 def build_market_judgment_readiness_status(engine: Any) -> dict[str, Any]:
@@ -392,6 +541,10 @@ def build_ops_readiness_payload(
         "remediation_actions": list(
             readiness_signals.get("remediation_actions") or []
         ),
+        "operational_remediation_actions": list(
+            readiness_signals.get("operational_remediation_actions") or []
+        ),
+        "advisory_actions": list(readiness_signals.get("advisory_actions") or []),
         "processes": _compact_processes(processes),
         "stale_processes": list(readiness_signals.get("stale_processes") or []),
         "missing_processes": list(readiness_signals.get("missing_processes") or []),
@@ -502,6 +655,8 @@ def build_core_runner_processes(
             [
                 base / "runtime" / "binance_block_trader_runner.py",
                 base / "services" / "binance_block_trader.py",
+                base / "services" / "binance_manager_prompt.py",
+                base / "services" / "binance_manager_contract.py",
             ],
         ),
         "crypto_market_research": (

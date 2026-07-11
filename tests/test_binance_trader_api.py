@@ -3,6 +3,9 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from tradecraft import main
+from tradecraft.services.unavailable_services import (
+    UnavailableCryptoMarketResearchService,
+)
 
 
 def _admin_headers(monkeypatch) -> dict[str, str]:
@@ -183,6 +186,7 @@ def test_binance_manager_run_once(monkeypatch) -> None:
         response = client.post(
             "/api/binance/blocks/manager/run-once",
             headers=_admin_headers(monkeypatch),
+            json={"confirm_live_manager_run": True},
         )
 
     assert response.status_code == 200
@@ -292,7 +296,10 @@ def test_crypto_research_routes_use_service(monkeypatch) -> None:
 
 
 def test_unavailable_crypto_research_context_keeps_regime_shape(monkeypatch) -> None:
-    service = main._UnavailableCryptoMarketResearchService(reason="missing import")
+    service = UnavailableCryptoMarketResearchService(
+        reason="missing import",
+        db_path=main.settings.crypto_market_research_db_path,
+    )
     monkeypatch.setattr(main, "crypto_market_research_service", service)
 
     with TestClient(main.app) as client:

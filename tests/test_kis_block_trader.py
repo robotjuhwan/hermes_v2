@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from tradecraft.services import kis_block_trader as kis_block_trader_module
 from tradecraft.services.etf_research import (
     ConfiguredETFResearchProvider,
     ETFResearchRepository,
@@ -40,6 +41,258 @@ from tradecraft.services.kis_price import aggressive_limit_price
 from tradecraft.services.kis_reconciliation import build_reconciliation_plan
 from tradecraft.services.kis_snapshot import compact_kis_manager_run
 from tradecraft.services.live_authority import LiveAuthorityConfig, build_authority_packet
+
+
+def _required_wiki_gate_payload(
+    venue: str,
+    *,
+    read_mode: str = "required",
+) -> dict[str, Any]:
+    snapshot_id = f"snapshot:{venue}:required"
+    return {
+        "status": "ok",
+        "read_mode": read_mode,
+        "prompt_mode": "assist",
+        "jue_wiki_context_packet": {
+            "version": "wiki_context_packet_v1",
+            "status": "ok",
+            "read_mode": read_mode,
+            "snapshot_id": snapshot_id,
+            "selected_pages": [],
+            "rejected_page_ids": [],
+            "coverage_status": "sufficient",
+            "quality_warnings": [],
+            "repair_required": False,
+            "char_count": 2,
+            "required_eligible": False,
+        },
+        "jue_wiki_decision_gate": {
+            "allow_new_risk": read_mode != "required",
+            "allow_exit_actions": True,
+            "reason": "wiki_required_coverage_missing",
+            "read_mode": read_mode,
+            "snapshot_id": snapshot_id,
+            "version": "wiki_decision_gate_v1",
+        },
+        "pages": [],
+        "budget_report": {"selected_count": 0},
+        "raw_rag": {
+            "source_contract": "raw_rag",
+            "marker": "KIS_RAW_RAG_MUST_NOT_REACH_LLM",
+        },
+    }
+
+
+def test_kis_required_wiki_gate_filters_manager_actions_before_executor(
+    tmp_path: Path,
+) -> None:
+    recorded_envelopes: list[Any] = []
+    trader = _trader(
+        tmp_path,
+        jue_wiki_read_mode="required",
+        wiki_context_provider=lambda **_: _required_wiki_gate_payload("kis"),
+        llm_payload={
+            "create_blocks": [
+                {
+                    "symbol": "277810",
+                    "qty": 1,
+                    "target_price": 110_000,
+                    "stop_price": 94_000,
+                    "entry_style": "wait_for_price",
+                    "entry_trigger_price": 98_000,
+                    "entry_trigger_operator": "lte",
+                    "horizon": "short",
+                    "thesis": "required Wiki gap must block this entry",
+                    "confidence": 0.7,
+                }
+            ],
+            "close_blocks": [],
+            "hold_decision": {"summary": "Wiki gate에 따라 신규 위험만 차단"},
+        },
+        wiki_shadow_recording_recorder=recorded_envelopes.append,
+    )
+    existing = trader.repository.create_block(
+        {
+            "symbol": "277810",
+            "qty": 1,
+            "target_price": 110_000,
+            "stop_price": 94_000,
+            "status": "proposed",
+        }
+    )
+    trader.codex_runtime.content["close_blocks"] = [
+        {"block_id": existing["block_id"], "reason": "cancel waiting entry"}
+    ]
+    trader.clock = lambda: {"session": "regular", "is_market_open": True}  # type: ignore[method-assign]
+    executor_actions: list[dict[str, Any]] = []
+
+    async def capture_executor(actions: dict[str, Any], **_: Any) -> dict[str, Any]:
+        executor_actions.append(actions)
+        return {
+            "adopted": [],
+            "created": [],
+            "updated": [],
+            "closed_requested": [{"block_id": existing["block_id"]}],
+            "paused": [],
+            "rejected": [],
+        }
+
+    trader._apply_manager_actions = capture_executor  # type: ignore[method-assign]
+
+    result = asyncio.run(trader.run_manager_once())
+
+    assert result["status"] == "ok"
+    assert len(executor_actions) == 1
+    assert executor_actions[0]["create_blocks"] == []
+    assert executor_actions[0]["close_blocks"] == [
+        {"block_id": existing["block_id"], "reason": "cancel waiting entry"}
+    ]
+    assert result["jue_wiki_suppression_audit"]["suppressed_new_risk_count"] == 1
+    runtime_prompt = json.loads(
+        trader.codex_runtime.calls[0]["messages"][1]["content"]
+    )
+    assert runtime_prompt["jue_wiki_decision_gate"] == (
+        _required_wiki_gate_payload("kis")["jue_wiki_decision_gate"]
+    )
+    assert "jue_wiki_decision_gate" in runtime_prompt["decision_inputs"]
+    assert runtime_prompt["jue_wiki_raw_rag_strip_audit"]["read_mode"] == "required"
+    assert runtime_prompt["jue_wiki_raw_rag_strip_audit"]["removed_path_count"] >= 1
+    assert "KIS_RAW_RAG_MUST_NOT_REACH_LLM" not in json.dumps(runtime_prompt)
+    assert "account" in runtime_prompt
+    assert recorded_envelopes == []
+
+
+def test_kis_required_invalid_wiki_gate_fails_before_llm(tmp_path: Path) -> None:
+    payload = _required_wiki_gate_payload("kis")
+    payload["jue_wiki_decision_gate"] = {
+        "allow_new_risk": True,
+        "allow_exit_actions": True,
+        "reason": "wiki_context_eligible",
+        "read_mode": "required",
+        "snapshot_id": "x" * 100_000,
+        "version": "wiki_decision_gate_v1",
+    }
+    trader = _trader(
+        tmp_path,
+        jue_wiki_read_mode="required",
+        wiki_context_provider=lambda **_: payload,
+    )
+    trader.clock = lambda: {"session": "regular", "is_market_open": True}  # type: ignore[method-assign]
+
+    result = asyncio.run(trader.run_manager_once())
+
+    assert result["status"] == "error"
+    assert trader.codex_runtime.calls == []
+    assert "wiki_required_gate_invalid:snapshot_id" in result["error_message"]
+
+
+def test_kis_wiki_audits_survive_executor_failure(tmp_path: Path) -> None:
+    trader = _trader(
+        tmp_path,
+        jue_wiki_read_mode="required",
+        wiki_context_provider=lambda **_: _required_wiki_gate_payload(
+            "kis", read_mode="required"
+        ),
+        llm_payload={
+            "create_blocks": [
+                {
+                    "symbol": "277810",
+                    "qty": 1,
+                    "target_price": 110_000,
+                    "stop_price": 94_000,
+                    "entry_style": "wait_for_price",
+                    "entry_trigger_price": 98_000,
+                    "entry_trigger_operator": "lte",
+                    "horizon": "short",
+                    "thesis": "executor failure audit",
+                    "confidence": 0.7,
+                }
+            ],
+            "hold_decision": {"summary": "required gate"},
+        },
+    )
+    trader.clock = lambda: {"session": "regular", "is_market_open": True}  # type: ignore[method-assign]
+
+    async def failing_executor(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("executor partial failure")
+
+    trader._apply_manager_actions = failing_executor  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="executor partial failure"):
+        asyncio.run(trader.run_manager_once())
+
+    stored = trader.repository.latest_manager_run(public=False)
+    assert stored["response"]["jue_wiki_suppression_audit"][
+        "suppressed_new_risk_count"
+    ] == 1
+    assert stored["prompt"]["jue_wiki_decision_gate"]["read_mode"] == "required"
+
+
+@pytest.mark.parametrize("read_mode", ["shadow", "prefer"])
+def test_kis_advisory_wiki_modes_preserve_full_manager_action_flow(
+    tmp_path: Path,
+    read_mode: str,
+) -> None:
+    recorded: list[Any] = []
+    trader = _trader(
+        tmp_path,
+        jue_wiki_read_mode=read_mode,
+        wiki_context_provider=lambda **_: _required_wiki_gate_payload("kis"),
+        llm_payload={
+            "create_blocks": [
+                {
+                    "symbol": "277810",
+                    "qty": 1,
+                    "target_price": 110_000,
+                    "stop_price": 94_000,
+                    "entry_style": "wait_for_price",
+                    "entry_trigger_price": 98_000,
+                    "entry_trigger_operator": "lte",
+                    "horizon": "short",
+                    "thesis": "advisory mode preserves action",
+                    "confidence": 0.7,
+                }
+            ],
+            "hold_decision": {"summary": "advisory"},
+        },
+        wiki_shadow_recording_recorder=lambda row: (
+            recorded.append(row) or row.recording_id
+        ),
+    )
+    trader.clock = lambda: {"session": "regular", "is_market_open": True}  # type: ignore[method-assign]
+    executor_actions: list[dict[str, Any]] = []
+
+    async def capture_executor(actions: dict[str, Any], **_: Any) -> dict[str, Any]:
+        executor_actions.append(actions)
+        return {
+            "adopted": [],
+            "created": [],
+            "updated": [],
+            "closed_requested": [],
+            "paused": [],
+            "rejected": [],
+        }
+
+    trader._apply_manager_actions = capture_executor  # type: ignore[method-assign]
+
+    result = asyncio.run(trader.run_manager_once())
+
+    assert len(executor_actions[0]["create_blocks"]) == 1
+    assert result["jue_wiki_suppression_audit"]["suppressed_new_risk_count"] == 0
+    runtime_prompt = json.loads(trader.codex_runtime.calls[0]["messages"][1]["content"])
+    assert runtime_prompt["jue_wiki_decision_gate"]["read_mode"] == read_mode
+    assert "jue_wiki_raw_rag_strip_audit" not in runtime_prompt
+    assert len(recorded) == 1
+    assert recorded[0].manager_run_id == str(result["run_id"])
+    assert json.loads(recorded[0].final_actions_json) == executor_actions[0]
+    assert result["wiki_shadow_recording_id"] == recorded[0].recording_id
+    stored = trader.repository.latest_manager_run(public=False)
+    assert stored["response"]["manager_run_telemetry"][
+        "wiki_shadow_recording_id"
+    ] == recorded[0].recording_id
+    assert stored["actions"]["_manager_run_telemetry"][
+        "wiki_shadow_recording_id"
+    ] == recorded[0].recording_id
 
 
 def _decode_gzip_base64(value: str) -> str:
@@ -1495,12 +1748,15 @@ def _trader(
     live_authority_provider=None,
     kr_pattern_lab_provider=None,
     wiki_context_provider=None,
+    wiki_shadow_recording_recorder=None,
+    jue_wiki_read_mode: str = "shadow",
 ) -> KISBlockTrader:
     return KISBlockTrader(
         config=KISBlockTraderConfig(
             db_path=str(tmp_path / "kis_blocks.db"),
             execute_orders=execute_orders,
             use_naver_fallback=False,
+            jue_wiki_read_mode=jue_wiki_read_mode,
         ),
         kis=_FakeKIS(),  # type: ignore[arg-type]
         codex_runtime=_FakeLLM(llm_payload or {}),  # type: ignore[arg-type]
@@ -1511,6 +1767,7 @@ def _trader(
         live_authority_provider=live_authority_provider,
         kr_pattern_lab_provider=kr_pattern_lab_provider,
         wiki_context_provider=wiki_context_provider,
+        wiki_shadow_recording_recorder=wiki_shadow_recording_recorder,
     )
 
 
@@ -1519,6 +1776,206 @@ def test_kis_status_exposes_naver_fallback_config(tmp_path: Path) -> None:
 
     assert trader.status()["config"]["use_naver_fallback"] is False
     assert trader.status()["reasoning_effort"] == "xhigh"
+
+
+def test_kis_manager_prompt_uses_source_linked_research_packet(tmp_path: Path) -> None:
+    class ReportRepository:
+        def latest_symbol_linked_reports(
+            self,
+            symbol: str,
+            *,
+            limit: int,
+        ) -> list[dict[str, Any]]:
+            assert symbol == "277810"
+            assert limit == 12
+            return [
+                {
+                    "report_id": 42,
+                    "symbol": symbol,
+                    "broker": "테스트증권",
+                    "published_at": "2026-07-10T00:00:00+00:00",
+                    "pdf_sha256": "sha-42",
+                    "pdf_url": "https://example.test/42.pdf",
+                    "link_confidence": 0.99,
+                    "asset_class": "stock",
+                }
+            ]
+
+        def get_report_facts(self, report_id: int) -> dict[str, Any]:
+            assert report_id == 42
+            return {
+                "rating": "BUY",
+                "target_price": {"value": 180_000, "currency": "KRW"},
+                "catalysts": ["수주 증가"],
+                "risks": ["밸류에이션"],
+                "evidence_quotes": ["원문 근거"],
+            }
+
+    trader = _trader(tmp_path)
+    trader.strategy_engine.repository = ReportRepository()  # type: ignore[attr-defined]
+
+    asyncio.run(trader.run_manager_once())
+
+    prompt = json.loads(
+        trader.codex_runtime.calls[0]["messages"][1]["content"]  # type: ignore[attr-defined]
+    )
+    research_packet = next(
+        row["kis_research"]
+        for row in prompt["research_spine"]["packets"]
+        if row["symbol"] == "277810"
+    )
+    assert research_packet["status"] == "eligible"
+    assert research_packet["evidence"][0]["report_id"] == 42
+
+
+def test_kis_manager_prompt_receives_deterministic_multi_horizon_signal(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+
+    async def fetch_daily_prices(
+        symbol: str,
+        *,
+        start_date: str,
+        end_date: str,
+        adjusted: bool = True,
+    ) -> list[dict[str, Any]]:
+        _ = (symbol, start_date, end_date, adjusted)
+        rows: list[dict[str, Any]] = []
+        for index in range(20):
+            day = datetime(2026, 7, 10, tzinfo=timezone.utc) - timedelta(days=index)
+            close = 120_000 - index * 1_000
+            rows.append(
+                {
+                    "open_time": day.date().isoformat(),
+                    "open": close - 500,
+                    "high": close + 500,
+                    "low": close - 1_000,
+                    "close": close,
+                    "volume": 10_000,
+                }
+            )
+        return rows
+
+    trader.kis.fetch_domestic_daily_prices = fetch_daily_prices  # type: ignore[method-assign]
+
+    asyncio.run(trader.run_manager_once())
+
+    prompt = json.loads(
+        trader.codex_runtime.calls[0]["messages"][1]["content"]  # type: ignore[attr-defined]
+    )
+    signal = prompt["multi_horizon_signals"]["277810"]
+    assert signal["version"] == "multi_horizon_signal_v1"
+    assert signal["agreement_count"] == 3
+    assert signal["entry_eligible"] is True
+
+
+def test_kis_manager_rejects_new_block_without_two_horizon_agreement(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(
+        tmp_path,
+        llm_payload={
+            "create_blocks": [
+                {
+                    "symbol": "277810",
+                    "qty": 1,
+                    "target_price": 130_000,
+                    "stop_price": 90_000,
+                    "thesis": "시간축 합의 없는 진입",
+                    "confidence": 0.80,
+                }
+            ]
+        },
+    )
+
+    async def fetch_flat_daily_prices(
+        symbol: str,
+        *,
+        start_date: str,
+        end_date: str,
+        adjusted: bool = True,
+    ) -> list[dict[str, Any]]:
+        _ = (symbol, start_date, end_date, adjusted)
+        return [
+            {
+                "open_time": (
+                    datetime(2026, 7, 10, tzinfo=timezone.utc) - timedelta(days=index)
+                ).date().isoformat(),
+                "open": 100_000,
+                "high": 101_000,
+                "low": 99_000,
+                "close": 100_000,
+                "volume": 10_000,
+            }
+            for index in range(20)
+        ]
+
+    trader.kis.fetch_domestic_daily_prices = fetch_flat_daily_prices  # type: ignore[method-assign]
+    trader.clock = lambda: {"session": "regular", "is_market_open": True}  # type: ignore[method-assign]
+
+    result = asyncio.run(trader.run_manager_once())
+
+    assert result["actions"]["create_blocks"] == []
+    assert result["actions"]["rejected_create_blocks"][0]["reason"] == (
+        "multi_horizon_signal_entry_ineligible"
+    )
+    assert trader.repository.list_blocks() == []
+
+
+def test_kis_manager_rejects_new_stock_when_research_is_stale(tmp_path: Path) -> None:
+    class StaleReportRepository:
+        def latest_symbol_linked_reports(
+            self,
+            symbol: str,
+            *,
+            limit: int,
+        ) -> list[dict[str, Any]]:
+            _ = limit
+            return [
+                {
+                    "report_id": 41,
+                    "symbol": symbol,
+                    "broker": "테스트증권",
+                    "published_at": "2026-04-01T00:00:00+00:00",
+                    "pdf_sha256": "sha-41",
+                    "link_confidence": 0.99,
+                }
+            ]
+
+        def get_report_facts(self, report_id: int) -> dict[str, Any]:
+            _ = report_id
+            return {
+                "rating": "BUY",
+                "target_price": {"value": 180_000, "currency": "KRW"},
+                "evidence_quotes": ["과거 원문 근거"],
+            }
+
+    trader = _trader(
+        tmp_path,
+        llm_payload={
+            "create_blocks": [
+                {
+                    "symbol": "277810",
+                    "qty": 1,
+                    "target_price": 130_000,
+                    "stop_price": 90_000,
+                    "thesis": "오래된 리포트만 근거로 진입",
+                    "confidence": 0.80,
+                }
+            ]
+        },
+    )
+    trader.strategy_engine.repository = StaleReportRepository()  # type: ignore[attr-defined]
+    trader.clock = lambda: {"session": "regular", "is_market_open": True}  # type: ignore[method-assign]
+
+    result = asyncio.run(trader.run_manager_once())
+
+    assert result["actions"]["create_blocks"] == []
+    assert result["actions"]["rejected_create_blocks"][0]["reason"] == (
+        "kis_research_entry_ineligible"
+    )
+    assert trader.repository.list_blocks() == []
 
 
 def test_kis_status_exposes_latest_proactive_decision_pressure(
@@ -3577,6 +4034,42 @@ def test_manager_prompt_over_max_fails_before_llm_call(tmp_path: Path) -> None:
     assert latest["prompt"]["prompt_budget"]["over_max"] is True
 
 
+def test_manager_prompt_contract_violation_fails_before_llm_or_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = _FakeLLM({"hold_decision": {"reason": "should not run"}})
+    trader = KISBlockTrader(
+        config=KISBlockTraderConfig(
+            db_path=str(tmp_path / "kis_blocks.db"),
+            execute_orders=False,
+            use_naver_fallback=False,
+        ),
+        kis=_FakeKIS(),  # type: ignore[arg-type]
+        codex_runtime=llm,  # type: ignore[arg-type]
+        strategy_engine=_FakeStrategy(),  # type: ignore[arg-type]
+    )
+
+    def reject_contract(*args: Any, **kwargs: Any) -> Any:
+        _ = args, kwargs
+        raise kis_block_trader_module.ManagerPromptContractViolation(
+            "prompt_budget_contract_violation: candidates must be a list"
+        )
+
+    monkeypatch.setattr(
+        kis_block_trader_module,
+        "build_manager_prompt_bundle",
+        reject_contract,
+    )
+
+    result = asyncio.run(trader.run_manager_once())
+
+    assert result["status"] == "error"
+    assert "prompt_budget_contract_violation" in result["error_message"]
+    assert llm.calls == []
+    assert trader.repository.list_orders(limit=10) == []
+
+
 def test_manager_prompt_over_max_sends_telegram_alert(tmp_path: Path) -> None:
     marker = "PROMPT_TELEGRAM_LIMIT_MARKER"
     llm = _FakeLLM({"hold_decision": {"reason": "should not run"}})
@@ -3662,6 +4155,11 @@ def test_manager_creates_independent_same_symbol_blocks(tmp_path: Path) -> None:
     assert len(blocks) == 2
     assert {row["qty_initial"] for row in blocks} == {1, 2}
     assert len({row["block_id"] for row in blocks}) == 2
+    latest = trader.repository.latest_manager_run(public=False)
+    telemetry = latest["actions"]["_manager_run_telemetry"]
+    assert telemetry["version"] == "manager_run_telemetry_v1"
+    assert telemetry["venue"] == "kis"
+    assert telemetry["action_count"] == 2
 
 
 def test_manager_sanitizes_native_contract_payload_actions(tmp_path: Path) -> None:
@@ -5884,8 +6382,8 @@ def test_kis_manager_prompt_contains_jue_workflow_pack(tmp_path: Path) -> None:
     assert "research" in wiki_calls[0]["page_types"]
     assert "performance" in wiki_calls[0]["page_types"]
     assert (
-        prompt["jue_workflow"]["model_policy"]["expected_runtime_model"]
-        == "gpt-5.5"
+            prompt["jue_workflow"]["model_policy"]["expected_runtime_model"]
+            == "gpt-5.6-sol"
     )
     skill_ids = {row["skill_id"] for row in prompt["jue_workflow"]["skills"]}
     assert {"block_design", "risk_sizing", "thesis_tracker"}.issubset(skill_ids)
@@ -6673,6 +7171,21 @@ def test_manager_prompt_includes_decision_packet_v2_for_horizon_stop_review(
     assert prompt["decision_packet_v2"]["version"] == "decision_packet_v2"
     assert prompt["decision_packet_v2"]["schema"]["target_scope"] == "kis"
     assert prompt["decision_packet_v2"]["market_pulse"]["regime"] == "risk_off"
+    assert "manager_action_required" in prompt["decision_inputs"]
+    assert prompt["manager_action_required"]["status"] == "action_required"
+    assert prompt["manager_action_required"]["resolution_contract"] == (
+        "close_or_explicit_hold_review"
+    )
+    action_required_item = prompt["manager_action_required"]["items"][0]
+    assert action_required_item["block_id"] == block["block_id"]
+    assert action_required_item["symbol"] == "277810"
+    assert action_required_item["name"] == "레인보우로보틱스"
+    assert action_required_item["horizon"] == "mid"
+    assert action_required_item["reason"] == "stop_reached"
+    assert action_required_item["signal_type"] == "stop_signal"
+    assert action_required_item["policy_action"] == "manager_review"
+    assert action_required_item["current_price"] == 95_000.0
+    assert action_required_item["signal_price"] == 95_000.0
     first_block = prompt["decision_packet_v2"]["blocks"][0]
     assert first_block["block_id"] == block["block_id"]
     assert first_block["stop_policy"]["touch_action"] == "manager_review"
@@ -11913,6 +12426,7 @@ def test_kis_jue_wiki_prompt_context_attaches_application_metadata() -> None:
     )
 
     assert prompt["decision_inputs"] == [
+        "jue_wiki",
         "jue_wiki_memory_card_quality",
         "jue_wiki_repair_contract",
     ]
@@ -13820,7 +14334,7 @@ def test_kis_jue_wiki_prompt_context_removes_stale_decision_adjustments_input() 
     )
 
     assert "decision_adjustments" not in prompt["jue_wiki_application"]
-    assert prompt["decision_inputs"] == ["account"]
+    assert prompt["decision_inputs"] == ["account", "jue_wiki"]
 
 
 def test_kis_jue_wiki_decision_adjustment_audit_contract_attaches_and_clears() -> None:

@@ -21,6 +21,7 @@ from tradecraft.services.jue_wiki_prompt_quality import (
     canonical_jue_wiki_evidence_quality,
     jue_wiki_quality_status_from_evidence,
 )
+from tradecraft.services.jue_wiki_contract import WIKI_GATE_IDENTITY_MAX_CHARS
 from tradecraft.services.manager_prompt_budget import (
     attach_prompt_budget as attach_manager_prompt_budget,
     format_prompt_budget_alert_message as build_format_prompt_budget_alert_message,
@@ -642,7 +643,88 @@ def compact_kis_manager_actions_for_storage(
         payload["prompt_budget"] = value["prompt_budget"]
     if value.get("status") not in (None, ""):
         payload["status"] = _clean_text(value.get("status"), limit=80)
+    preserve_wiki_gate_storage_contracts(payload, value)
     return payload
+
+
+def _bounded_wiki_identity(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value[:WIKI_GATE_IDENTITY_MAX_CHARS]
+
+
+def compact_wiki_gate_storage_contracts(value: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    gate = value.get("jue_wiki_decision_gate")
+    if isinstance(gate, dict):
+        compact_gate: dict[str, Any] = {}
+        for key in ("allow_new_risk", "allow_exit_actions"):
+            if type(gate.get(key)) is bool:
+                compact_gate[key] = gate[key]
+        for key in ("reason", "snapshot_id"):
+            if gate.get(key) not in (None, ""):
+                compact_gate[key] = _bounded_wiki_identity(gate.get(key))
+        for key, limit in (("read_mode", 16), ("version", 40)):
+            if gate.get(key) not in (None, ""):
+                compact_gate[key] = _clean_text(gate.get(key), limit=limit)
+        out["jue_wiki_decision_gate"] = compact_gate
+    policy = value.get("jue_wiki_decision_gate_policy")
+    if isinstance(policy, dict):
+        out["jue_wiki_decision_gate_policy"] = {
+            "instruction": _clean_text(policy.get("instruction"), limit=120)
+        }
+    strip_audit = value.get("jue_wiki_raw_rag_strip_audit")
+    if isinstance(strip_audit, dict):
+        out["jue_wiki_raw_rag_strip_audit"] = {
+            "read_mode": _clean_text(strip_audit.get("read_mode"), limit=16),
+            "snapshot_id": _bounded_wiki_identity(strip_audit.get("snapshot_id")),
+            "removed_path_count": _safe_int(strip_audit.get("removed_path_count")),
+            "removed_paths": [
+                _clean_text(path, limit=48)
+                for path in _normalize_list(strip_audit.get("removed_paths"))[:2]
+            ],
+        }
+    suppression = value.get("jue_wiki_suppression_audit")
+    if isinstance(suppression, dict):
+        rows: list[dict[str, Any]] = []
+        for row in _normalize_list(suppression.get("suppressed_actions"))[:1]:
+            if not isinstance(row, dict):
+                continue
+            rows.append(
+                {
+                    key: _clean_text(row.get(key), limit=80)
+                    for key in (
+                        "action_kind",
+                        "symbol",
+                        "block_id",
+                    )
+                    if row.get(key) not in (None, "")
+                }
+            )
+        out["jue_wiki_suppression_audit"] = {
+            "venue": _clean_text(suppression.get("venue"), limit=16),
+            "snapshot_id": _bounded_wiki_identity(suppression.get("snapshot_id")),
+            "read_mode": _clean_text(suppression.get("read_mode"), limit=16),
+            "reason": _bounded_wiki_identity(suppression.get("reason")),
+            "original_action_count": _safe_int(
+                suppression.get("original_action_count")
+            ),
+            "filtered_action_count": _safe_int(
+                suppression.get("filtered_action_count")
+            ),
+            "suppressed_new_risk_count": _safe_int(
+                suppression.get("suppressed_new_risk_count")
+            ),
+            "suppressed_actions": rows,
+        }
+    return out
+
+
+def preserve_wiki_gate_storage_contracts(
+    compact: dict[str, Any],
+    original: dict[str, Any],
+) -> None:
+    compact.update(compact_wiki_gate_storage_contracts(original))
 
 
 def _fit_kis_manager_prompt_emergency_payload(
@@ -746,6 +828,7 @@ def _fit_kis_manager_prompt_emergency_payload(
 
 
 KIS_STORAGE_CRITICAL_PROMPT_SECTIONS: tuple[tuple[str, int, int], ...] = (
+    ("manager_action_required", 4, 140),
     ("investment_memory", 2, 120),
     ("jue_wiki", 2, 120),
     ("jue_wiki_application", 2, 120),
@@ -761,6 +844,86 @@ KIS_STORAGE_CRITICAL_PROMPT_SECTIONS: tuple[tuple[str, int, int], ...] = (
     ("opportunity_research_brief", 3, 140),
     ("execution_gate", 2, 120),
 )
+
+
+def build_kis_manager_action_required(
+    decision_packet_v2: Any,
+) -> dict[str, Any]:
+    packet = decision_packet_v2 if isinstance(decision_packet_v2, dict) else {}
+    items: list[dict[str, Any]] = []
+    for block in _normalize_list(packet.get("blocks")):
+        if not isinstance(block, dict):
+            continue
+        stop_policy = (
+            block.get("stop_policy") if isinstance(block.get("stop_policy"), dict) else {}
+        )
+        latest_signal = (
+            stop_policy.get("latest_signal")
+            if isinstance(stop_policy.get("latest_signal"), dict)
+            else {}
+        )
+        reason = _clean_text(
+            latest_signal.get("reason")
+            or ("stop_reached" if stop_policy.get("stop_touched_now") else ""),
+            limit=80,
+        )
+        if reason != "stop_reached":
+            continue
+        if _clean_text(stop_policy.get("touch_action"), limit=80) != "manager_review":
+            continue
+        symbol = _clean_text(block.get("symbol"), limit=20)
+        block_id = _clean_text(block.get("block_id"), limit=120)
+        if not symbol and not block_id:
+            continue
+        technical = (
+            block.get("technical") if isinstance(block.get("technical"), dict) else {}
+        )
+        item: dict[str, Any] = {
+            "block_id": block_id,
+            "symbol": symbol,
+            "name": _clean_text(block.get("name"), limit=80),
+            "horizon": _clean_text(
+                block.get("horizon") or stop_policy.get("horizon"),
+                limit=40,
+            ),
+            "reason": reason,
+            "signal_type": "stop_signal",
+            "policy_action": "manager_review",
+        }
+        current_price = _safe_float(
+            block.get("current_price") or technical.get("price")
+        )
+        if current_price > 0:
+            item["current_price"] = current_price
+        signal_price = _safe_float(latest_signal.get("price"))
+        if signal_price <= 0:
+            signal_price = _safe_float(block.get("stop_price")) or _safe_float(
+                stop_policy.get("stop_price")
+            )
+        if signal_price > 0:
+            item["signal_price"] = signal_price
+        signal_at = _clean_text(latest_signal.get("created_at"), limit=80)
+        if signal_at:
+            item["signal_at"] = signal_at
+        item = {key: value for key, value in item.items() if value not in ("", None)}
+        if item not in items:
+            items.append(item)
+
+    if not items:
+        return {}
+    return {
+        "status": "action_required",
+        "version": "kis_manager_action_required_v1",
+        "source": "decision_packet_v2.stop_policy.latest_signal",
+        "resolution_contract": "close_or_explicit_hold_review",
+        "instruction": (
+            "Each item must be resolved by a matching close_blocks row or by "
+            "hold_decision.next_triggers that names the symbol/block, stop reason, "
+            "and concrete next review trigger."
+        ),
+        "item_count": len(items),
+        "items": items[:8],
+    }
 
 
 def preserve_kis_storage_prompt_context(
@@ -785,10 +948,24 @@ def preserve_kis_storage_prompt_context(
             list_limit=max(min(int(list_limit), 8), 1),
             string_limit=max(min(int(string_limit), 180), 48),
         )
+    action_required = (
+        original.get("manager_action_required")
+        if isinstance(original.get("manager_action_required"), dict)
+        else build_kis_manager_action_required(original.get("decision_packet_v2"))
+    )
+    if action_required:
+        compact["manager_action_required"] = compact_prompt_section(
+            "manager_action_required",
+            action_required,
+            list_limit=max(min(int(list_limit), 4), 1),
+            string_limit=max(min(int(string_limit), 140), 48),
+        )
     for section, default_list_limit, default_string_limit in (
         KIS_STORAGE_CRITICAL_PROMPT_SECTIONS
     ):
         if section not in original:
+            continue
+        if section == "manager_action_required" and "manager_action_required" in compact:
             continue
         section_list_limit = max(min(int(list_limit), default_list_limit), 1)
         section_string_limit = max(min(int(string_limit), default_string_limit), 48)
@@ -1022,6 +1199,7 @@ def compact_manager_storage_payload(
             list_limit=list_limit,
             string_limit=string_limit,
         )
+    preserve_wiki_gate_storage_contracts(compact, value)
     if isinstance(value.get("prompt_budget"), dict):
         compact["prompt_budget"] = value["prompt_budget"]
     if isinstance(value.get("prompt_compaction"), dict):
@@ -1055,6 +1233,7 @@ def compact_manager_storage_payload(
                 list_limit=list_limit,
                 string_limit=string_limit,
             )
+        preserve_wiki_gate_storage_contracts(compact, value)
         if isinstance(value.get("prompt_budget"), dict):
             compact["prompt_budget"] = value["prompt_budget"]
         compact["_storage_compaction"] = manager_storage_compaction_meta(
@@ -1198,6 +1377,7 @@ def compact_manager_storage_payload(
                 string_limit=120,
             )
         )
+    preserve_wiki_gate_storage_contracts(emergency_payload, value)
     return _fit_kis_manager_prompt_emergency_payload(
         emergency_payload,
         storage_limit=storage_limit,
@@ -6404,6 +6584,97 @@ def _kis_memory_card_quality_resolution_has_specific_evidence(
     return False
 
 
+def _kis_rule_signal_review_pressure(prompt: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(prompt, dict):
+        return {}
+    pressure = (
+        prompt.get("manager_action_required")
+        if isinstance(prompt.get("manager_action_required"), dict)
+        else {}
+    )
+    if _normalize_list(pressure.get("items")):
+        return pressure
+    return build_kis_manager_action_required(prompt.get("decision_packet_v2"))
+
+
+def _kis_rule_signal_review_items(prompt: dict[str, Any]) -> list[dict[str, Any]]:
+    pressure = _kis_rule_signal_review_pressure(prompt)
+    return [row for row in _normalize_list(pressure.get("items")) if isinstance(row, dict)]
+
+
+def _kis_prompt_has_rule_signal_review_pressure(prompt: dict[str, Any]) -> bool:
+    return bool(_kis_rule_signal_review_items(prompt))
+
+
+def _kis_actions_resolve_rule_signal_review(
+    *,
+    prompt: dict[str, Any],
+    actions: dict[str, Any],
+) -> bool:
+    items = _kis_rule_signal_review_items(prompt)
+    if not items:
+        return True
+    close_rows = [
+        row for row in _normalize_list((actions or {}).get("close_blocks")) if isinstance(row, dict)
+    ]
+    if not close_rows:
+        return False
+    for item in items:
+        block_id = _clean_text(item.get("block_id"), limit=160).lower()
+        symbol = _clean_text(item.get("symbol"), limit=20)
+        resolved = False
+        for row in close_rows:
+            row_block_ids = _kis_action_identity_block_ids(row)
+            row_symbols = _kis_action_identity_symbols(row)
+            if block_id and block_id in row_block_ids:
+                resolved = True
+            elif symbol and symbol in row_symbols:
+                resolved = True
+            elif block_id and _kis_payload_mentions_any_term(row, [block_id]):
+                resolved = True
+            elif symbol and _kis_payload_mentions_any_term(row, [symbol]):
+                resolved = True
+            if resolved:
+                break
+        if not resolved:
+            return False
+    return True
+
+
+def _kis_hold_resolves_rule_signal_review(
+    *,
+    prompt: dict[str, Any],
+    hold_decision: dict[str, Any],
+) -> bool:
+    items = _kis_rule_signal_review_items(prompt)
+    if not items:
+        return True
+    for item in items:
+        symbol = _clean_text(item.get("symbol"), limit=20)
+        symbols = {symbol} if _is_symbol(symbol) else set()
+        block_id = _clean_text(item.get("block_id"), limit=160).lower()
+        reason = _clean_text(item.get("reason"), limit=80).lower()
+        terms = [
+            term
+            for term in (
+                block_id,
+                symbol,
+                reason,
+                "stop_reached",
+                "stop reached",
+                "manager_review",
+                "manager review",
+                "손절",
+            )
+            if term
+        ]
+        if not _kis_hold_has_concrete_next_step_for_symbols(hold_decision, symbols):
+            return False
+        if terms and not _kis_payload_mentions_any_term(hold_decision, terms):
+            return False
+    return True
+
+
 def kis_manager_response_contract_error(
     *,
     prompt: dict[str, Any],
@@ -6416,6 +6687,15 @@ def kis_manager_response_contract_error(
     if _kis_execution_gate_blocks_contract(prompt):
         return ""
     action_count = _kis_manager_action_item_count(actions)
+    if _kis_prompt_has_rule_signal_review_pressure(prompt):
+        if not (
+            _kis_actions_resolve_rule_signal_review(prompt=prompt, actions=actions)
+            or _kis_hold_resolves_rule_signal_review(
+                prompt=prompt,
+                hold_decision=hold_decision,
+            )
+        ):
+            return "rule_signal_review_resolution_missing_from_model"
     if action_count > 0 and _kis_research_spine_memory_resolution_missing(
         prompt=prompt,
         response=response,
@@ -8210,6 +8490,9 @@ def build_kis_manager_prompt_payload(
         and "opportunity_research_brief" not in decision_inputs
     ):
         decision_inputs.append("opportunity_research_brief")
+    manager_action_required = build_kis_manager_action_required(decision_packet_v2)
+    if manager_action_required and "manager_action_required" not in decision_inputs:
+        decision_inputs.append("manager_action_required")
 
     prompt: dict[str, Any] = {
         "task": "Manage independent KIS stock trading blocks. Return JSON only.",
@@ -8244,6 +8527,7 @@ def build_kis_manager_prompt_payload(
         ),
         "execution_gate": execution_gate,
         "aggressive_opportunities": aggressive_opportunities,
+        "manager_action_required": manager_action_required,
         "decision_packet_policy": decision_bundle["decision_packet_policy"],
         "untrusted_data_boundary": untrusted_data_boundary,
         "decision_inputs": decision_inputs,
@@ -11788,7 +12072,7 @@ def compact_live_authority_prompt_value(
     return payload
 
 
-def finalize_prompt_budget(
+def _finalize_prompt_budget_impl(
     prompt: dict[str, Any],
     *,
     target_chars: int,
@@ -11962,6 +12246,135 @@ def finalize_prompt_budget(
         effective_max_chars=final_target,
         sections=final_sections,
     )
+    attach_prompt_budget(
+        prompt,
+        target_chars=target_chars,
+        warn_chars=warn_chars,
+        max_chars=configured_max,
+    )
+
+
+def finalize_prompt_budget(
+    prompt: dict[str, Any],
+    *,
+    target_chars: int,
+    warn_chars: int,
+    max_chars: int,
+) -> None:
+    """Apply the budget without changing the manager core sequence contracts."""
+
+    optional_specs: tuple[tuple[str, int, int], ...] = (
+        ("decision_packet", 4, 120),
+        ("decision_packet_v2", 4, 120),
+        ("pre_adoption_symbol_analysis", 6, 120),
+        ("jue_wiki", 3, 120),
+        ("research_spine", 6, 140),
+        ("opportunity_research_brief", 4, 120),
+        ("recent_events", 20, 100),
+        ("candidate_policy_impacts", 16, 100),
+    )
+
+    def collection_count(value: Any) -> int:
+        if isinstance(value, list):
+            return len(value)
+        if not isinstance(value, dict):
+            return 0
+        for key in ("items", "packets", "candidates", "events", "rows", "pages"):
+            rows = value.get(key)
+            if isinstance(rows, list):
+                return len(rows)
+        return sum(len(rows) for rows in value.values() if isinstance(rows, list))
+
+    original_optional_counts = {
+        section: collection_count(prompt.get(section))
+        for section, _list_limit, _string_limit in optional_specs
+        if section in prompt
+    }
+    warn_limit = max(int(warn_chars), int(target_chars), 10_000)
+    pre_budget_sections: list[dict[str, Any]] = []
+    if len(_json_dumps(prompt)) > warn_limit:
+        pre_budget_sections = compact_prompt_sections_for_warn_budget(
+            prompt,
+            sections_to_compact=optional_specs,
+        )
+
+    original_core = {
+        key: list(value)
+        for key in ("decision_inputs", "candidates", "blocks")
+        if isinstance((value := prompt.get(key, [])), list)
+    }
+    _finalize_prompt_budget_impl(
+        prompt,
+        target_chars=target_chars,
+        warn_chars=warn_chars,
+        max_chars=max_chars,
+    )
+
+    configured_max = max(int(max_chars), 10_000)
+    compact_list_limit = 8 if configured_max >= 60_000 else 4
+    compact_string_limit = 140 if configured_max >= 60_000 else 80
+    retained_counts: dict[str, int] = {}
+    for key in ("decision_inputs", "candidates", "blocks"):
+        original = original_core.get(key)
+        if original is None:
+            continue
+        if key == "decision_inputs":
+            compacted = [
+                _clean_text(item, limit=100)
+                for item in original[:60]
+                if str(item or "").strip()
+            ]
+        else:
+            compacted = compact_prompt_section(
+                key,
+                original,
+                list_limit=compact_list_limit,
+                string_limit=compact_string_limit,
+            )
+            if not isinstance(compacted, list):
+                compacted = []
+        prompt[key] = compacted
+        retained_counts[key] = len(compacted)
+
+    prompt["compaction_meta"] = {
+        "version": "manager_prompt_compaction_meta_v1",
+        "sections": {
+            key: {
+                "item_count": len(original_core.get(key, [])),
+                "retained_item_count": retained_counts.get(key, 0),
+                "omitted_item_count": max(
+                    len(original_core.get(key, [])) - retained_counts.get(key, 0),
+                    0,
+                ),
+            }
+            for key in ("decision_inputs", "candidates", "blocks")
+        },
+    }
+    current_prompt_compaction = (
+        dict(prompt.get("prompt_compaction"))
+        if isinstance(prompt.get("prompt_compaction"), dict)
+        else {}
+    )
+    current_prompt_compaction.update(
+        {
+            "version": str(
+                current_prompt_compaction.get("version")
+                or "prompt_compaction_v1"
+            ),
+            "original_counts": original_optional_counts,
+            "included_counts": {
+                section: collection_count(prompt.get(section))
+                for section in original_optional_counts
+            },
+        }
+    )
+    if pre_budget_sections:
+        current_prompt_compaction["sections"] = [
+            *pre_budget_sections,
+            *list(current_prompt_compaction.get("sections") or []),
+        ]
+    prompt["prompt_compaction"] = current_prompt_compaction
+    prompt.pop("prompt_budget", None)
     attach_prompt_budget(
         prompt,
         target_chars=target_chars,

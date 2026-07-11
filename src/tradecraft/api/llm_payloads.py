@@ -48,6 +48,7 @@ def enrich_llm_usage_component_recovery(
 
     latest_by_component: dict[str, sqlite3.Row] = {}
     latest_error_at: dict[str, str] = {}
+    latest_large_prompt_at: dict[str, str] = {}
     for row in latest_rows:
         component = str(row["component"] or "")
         if not component:
@@ -55,6 +56,11 @@ def enrich_llm_usage_component_recovery(
         latest_by_component.setdefault(component, row)
         if str(row["status"] or "").lower() != "ok" and component not in latest_error_at:
             latest_error_at[component] = str(row["started_at"] or "")
+        if (
+            int(row["input_chars"] or 0) >= 250_000
+            and component not in latest_large_prompt_at
+        ):
+            latest_large_prompt_at[component] = str(row["started_at"] or "")
 
     for row in rows:
         if not isinstance(row, dict):
@@ -86,6 +92,17 @@ def enrich_llm_usage_component_recovery(
                 row["ok_after_latest_error_count"] = 0
         else:
             row["ok_after_latest_error_count"] = 0
+        large_at = latest_large_prompt_at.get(component, "")
+        row["latest_large_prompt_at"] = large_at
+        row["ok_under_warn_after_large_count"] = sum(
+            1
+            for call in latest_rows
+            if str(call["component"] or "") == component
+            and str(call["status"] or "").lower() == "ok"
+            and int(call["input_chars"] or 0) < 150_000
+            and bool(large_at)
+            and str(call["started_at"] or "") > large_at
+        )
     return summary
 
 
@@ -146,13 +163,21 @@ def build_llm_usage_semantic_check(
             "avg_input_chars": avg_input_chars,
             "latest_started_at": row.get("latest_started_at"),
             "latest_input_chars": latest_input_chars,
+            "latest_large_prompt_at": row.get("latest_large_prompt_at"),
+            "ok_under_warn_after_large_count": int(
+                row.get("ok_under_warn_after_large_count") or 0
+            ),
         }
         if near_limit:
             prompt_near_limit_components.append(large_payload)
         if max_input_chars >= 250_000 or avg_input_chars >= 190_000:
-            if llm_usage_stale_after_process_restart(row, processes):
+            if llm_usage_large_prompt_stale_after_process_restart(row, processes):
                 stale_prompt_large_components.append(large_payload)
-            elif latest_status == "ok" and 0 < latest_input_chars < 190_000:
+            elif (
+                latest_status == "ok"
+                and 0 < latest_input_chars < 150_000
+                and int(row.get("ok_under_warn_after_large_count") or 0) >= 3
+            ):
                 recovered_prompt_large_components.append(large_payload)
             else:
                 prompt_large_components.append(large_payload)
@@ -254,6 +279,19 @@ def llm_usage_stale_after_process_restart(
     except (TypeError, ValueError, OSError):
         return False
     return bool(process_started_at > latest_started_at + timedelta(seconds=1))
+
+
+def llm_usage_large_prompt_stale_after_process_restart(
+    row: dict[str, Any],
+    processes: Mapping[str, Mapping[str, Any]] | None,
+) -> bool:
+    large_prompt_at = str(row.get("latest_large_prompt_at") or "").strip()
+    if not large_prompt_at:
+        return llm_usage_stale_after_process_restart(row, processes)
+    return llm_usage_stale_after_process_restart(
+        {**row, "latest_started_at": large_prompt_at},
+        processes,
+    )
 
 
 def _iso_to_utc(value: Any) -> datetime | None:

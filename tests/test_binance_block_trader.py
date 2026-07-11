@@ -39,6 +39,355 @@ from tradecraft.services.jue_skill_registry import JueSkillValidationError
 from tradecraft.services.live_authority import LiveAuthorityConfig, build_authority_packet
 from tradecraft.services.live_performance import LivePerformanceRepository
 
+
+def _required_wiki_gate_payload(
+    venue: str,
+    *,
+    read_mode: str = "required",
+) -> dict[str, Any]:
+    snapshot_id = f"snapshot:{venue}:required"
+    return {
+        "status": "ok",
+        "read_mode": read_mode,
+        "prompt_mode": "assist",
+        "jue_wiki_context_packet": {
+            "version": "wiki_context_packet_v1",
+            "status": "ok",
+            "read_mode": read_mode,
+            "snapshot_id": snapshot_id,
+            "selected_pages": [],
+            "rejected_page_ids": [],
+            "coverage_status": "sufficient",
+            "quality_warnings": [],
+            "repair_required": False,
+            "char_count": 2,
+            "required_eligible": False,
+        },
+        "jue_wiki_decision_gate": {
+            "allow_new_risk": read_mode != "required",
+            "allow_exit_actions": True,
+            "reason": "wiki_required_coverage_missing",
+            "read_mode": read_mode,
+            "snapshot_id": snapshot_id,
+            "version": "wiki_decision_gate_v1",
+        },
+        "pages": [],
+        "budget_report": {"selected_count": 0},
+        "raw_rag": {
+            "source_contract": "raw_rag",
+            "marker": "BINANCE_RAW_RAG_MUST_NOT_REACH_LLM",
+        },
+    }
+
+
+def test_binance_required_wiki_gate_filters_manager_actions_before_executor(
+    tmp_path: Path,
+) -> None:
+    recorded_envelopes: list[Any] = []
+    llm = _FakeLLM(
+        {
+            "create_blocks": [
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "entry_price": 50_000,
+                    "target_price": 51_000,
+                    "stop_price": 49_000,
+                    "qty": 0.001,
+                    "thesis": "required Wiki gap must block this entry",
+                }
+            ],
+            "close_blocks": [],
+            "hold_decision": {"summary": "Wiki gate blocks new risk only"},
+        }
+    )
+    trader = _trader(
+        tmp_path,
+        llm=llm,
+        jue_wiki_read_mode="required",
+        wiki_context_provider=lambda **_: _required_wiki_gate_payload("binance"),
+        memory_provider=lambda **_: {
+            "status": "ok",
+            "raw_rag": {
+                "source_contract": "raw_rag",
+                "marker": "BINANCE_RAW_RAG_MUST_NOT_REACH_LLM",
+            },
+        },
+        wiki_shadow_recording_recorder=recorded_envelopes.append,
+    )
+    existing = trader.create_block(
+        {
+            "symbol": "ETHUSDT",
+            "market": "spot",
+            "qty": 0.1,
+            "entry_price": 3_000,
+            "target_price": 3_200,
+            "stop_price": 2_900,
+            "status": "proposed",
+        }
+    )
+    llm.payload["close_blocks"] = [
+        {"block_id": existing["block_id"], "reason": "cancel waiting entry"}
+    ]
+    executor_actions: list[dict[str, Any]] = []
+
+    async def capture_executor(actions: dict[str, Any], **_: Any) -> dict[str, Any]:
+        executor_actions.append(actions)
+        return {
+            "adopted": [],
+            "created": [],
+            "updated": [],
+            "closed": [{"block_id": existing["block_id"]}],
+            "paused": [],
+        }
+
+    trader._apply_manager_actions = capture_executor  # type: ignore[method-assign]
+
+    result = asyncio.run(
+        trader.run_manager_once(
+            candidates=[
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "entry_price": 50_000,
+                    "target_price": 51_000,
+                    "stop_price": 49_000,
+                    "confidence": 0.8,
+                }
+            ]
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert len(executor_actions) == 1
+    assert executor_actions[0]["create_blocks"] == []
+    assert executor_actions[0]["close_blocks"] == [
+        {"block_id": existing["block_id"], "reason": "cancel waiting entry"}
+    ]
+    assert result["jue_wiki_suppression_audit"]["suppressed_new_risk_count"] == 1
+    runtime_prompt = llm.calls[0]["payload"]
+    assert runtime_prompt["jue_wiki_decision_gate"] == (
+        _required_wiki_gate_payload("binance")["jue_wiki_decision_gate"]
+    )
+    assert "jue_wiki_decision_gate" in runtime_prompt["decision_inputs"]
+    assert runtime_prompt["jue_wiki_raw_rag_strip_audit"]["read_mode"] == "required"
+    assert runtime_prompt["jue_wiki_raw_rag_strip_audit"]["removed_path_count"] >= 1
+    assert "BINANCE_RAW_RAG_MUST_NOT_REACH_LLM" not in json.dumps(runtime_prompt)
+    assert "account" in runtime_prompt
+    assert recorded_envelopes == []
+
+
+def test_binance_required_invalid_wiki_gate_fails_before_llm(tmp_path: Path) -> None:
+    payload = _required_wiki_gate_payload("binance")
+    payload["jue_wiki_decision_gate"] = {
+        "allow_new_risk": True,
+        "allow_exit_actions": True,
+        "reason": "wiki_context_eligible",
+        "read_mode": "required",
+        "snapshot_id": "x" * 100_000,
+        "version": "wiki_decision_gate_v1",
+    }
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(
+        tmp_path,
+        llm=llm,
+        jue_wiki_read_mode="required",
+        wiki_context_provider=lambda **_: payload,
+    )
+
+    result = asyncio.run(
+        trader.run_manager_once(
+            candidates=[
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "entry_price": 50_000,
+                    "target_price": 51_000,
+                    "stop_price": 49_000,
+                    "confidence": 0.8,
+                }
+            ]
+        )
+    )
+
+    assert result["status"] == "error"
+    assert llm.calls == []
+    assert "wiki_required_gate_invalid:snapshot_id" in result["error_message"]
+
+
+def test_binance_wiki_audits_survive_executor_failure(tmp_path: Path) -> None:
+    llm = _FakeLLM(
+        {
+            "create_blocks": [
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "entry_price": 50_000,
+                    "target_price": 51_000,
+                    "stop_price": 49_000,
+                    "qty": 0.001,
+                    "thesis": "executor failure audit",
+                }
+            ],
+            "hold_decision": {"summary": "required gate"},
+        }
+    )
+    trader = _trader(
+        tmp_path,
+        llm=llm,
+        jue_wiki_read_mode="required",
+        wiki_context_provider=lambda **_: _required_wiki_gate_payload(
+            "binance", read_mode="required"
+        ),
+    )
+
+    async def failing_executor(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("executor partial failure")
+
+    trader._apply_manager_actions = failing_executor  # type: ignore[method-assign]
+
+    result = asyncio.run(
+        trader.run_manager_once(
+            candidates=[
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "entry_price": 50_000,
+                    "target_price": 51_000,
+                    "stop_price": 49_000,
+                    "confidence": 0.8,
+                }
+            ]
+        )
+    )
+
+    assert result["status"] == "error"
+    stored = trader.repository.latest_manager_run(include_payload=True)
+    assert stored["response"]["jue_wiki_suppression_audit"][
+        "suppressed_new_risk_count"
+    ] == 1
+    assert stored["prompt"]["jue_wiki_decision_gate"]["read_mode"] == "required"
+
+
+@pytest.mark.parametrize("read_mode", ["shadow", "prefer"])
+def test_binance_advisory_wiki_modes_preserve_full_manager_action_flow(
+    tmp_path: Path,
+    read_mode: str,
+) -> None:
+    recorded: list[Any] = []
+    llm = _FakeLLM(
+        {
+            "create_blocks": [
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "entry_price": 50_000,
+                    "target_price": 51_000,
+                    "stop_price": 49_000,
+                    "qty": 0.001,
+                    "thesis": "advisory mode preserves action",
+                }
+            ],
+            "hold_decision": {"summary": "advisory"},
+        }
+    )
+    trader = _trader(
+        tmp_path,
+        llm=llm,
+        jue_wiki_read_mode=read_mode,
+        wiki_context_provider=lambda **_: _required_wiki_gate_payload("binance"),
+        wiki_shadow_recording_recorder=lambda row: (
+            recorded.append(row) or row.recording_id
+        ),
+    )
+    executor_actions: list[dict[str, Any]] = []
+
+    async def capture_executor(actions: dict[str, Any], **_: Any) -> dict[str, Any]:
+        executor_actions.append(actions)
+        return {
+            "adopted": [],
+            "created": [],
+            "updated": [],
+            "closed": [],
+            "paused": [],
+        }
+
+    trader._apply_manager_actions = capture_executor  # type: ignore[method-assign]
+
+    result = asyncio.run(
+        trader.run_manager_once(
+            candidates=[
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "entry_price": 50_000,
+                    "target_price": 51_000,
+                    "stop_price": 49_000,
+                    "confidence": 0.8,
+                }
+            ]
+        )
+    )
+
+    assert len(executor_actions[0]["create_blocks"]) == 1
+    assert result["jue_wiki_suppression_audit"]["suppressed_new_risk_count"] == 0
+    runtime_prompt = llm.calls[0]["payload"]
+    assert runtime_prompt["jue_wiki_decision_gate"]["read_mode"] == read_mode
+    assert "jue_wiki_raw_rag_strip_audit" not in runtime_prompt
+    assert len(recorded) == 1
+    assert recorded[0].manager_run_id == str(result["manager_run_id"])
+    assert json.loads(recorded[0].final_actions_json) == executor_actions[0]
+    assert result["wiki_shadow_recording_id"] == recorded[0].recording_id
+    stored = trader.repository.latest_manager_run(include_payload=True)
+    assert stored["response"]["manager_run_telemetry"][
+        "wiki_shadow_recording_id"
+    ] == recorded[0].recording_id
+    assert stored["actions"]["_manager_run_telemetry"][
+        "wiki_shadow_recording_id"
+    ] == recorded[0].recording_id
+
+
+def test_binance_final_contract_failure_captures_no_shadow_recording(
+    tmp_path: Path,
+) -> None:
+    recorded: list[Any] = []
+    trader = _trader(
+        tmp_path,
+        llm=_FakeLLM(
+            {
+                "create_blocks": [
+                    {
+                        "symbol": "ETHUSDT", "market": "spot", "side": "long",
+                        "qty": 1, "entry_price": 3000, "target_price": 3200,
+                        "stop_price": 2900,
+                    }
+                ]
+            },
+            include_lane_review=False,
+        ),
+        wiki_context_provider=lambda **_: _required_wiki_gate_payload("binance"),
+        wiki_shadow_recording_recorder=recorded.append,
+    )
+
+    result = asyncio.run(
+        trader.run_manager_once(
+            candidates=[
+                {"symbol": "BTCUSDT", "market": "spot", "side": "long"}
+            ]
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "lane_review_missing_from_model" in result["error_message"]
+    assert recorded == []
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -1991,6 +2340,16 @@ class _FilteredFillingEntryBinance(_FillingEntryBinance):
         }
 
 
+class _FilteredBookTickerFillingEntryBinance(_BookTickerFillingEntryBinance):
+    async def fetch_futures_exchange_filters(self, symbol: str) -> dict[str, dict[str, Any]]:
+        assert symbol == "LINKUSDT"
+        return {
+            "PRICE_FILTER": {"tickSize": "0.01"},
+            "LOT_SIZE": {"minQty": "0.01", "stepSize": "0.01"},
+            "MIN_NOTIONAL": {"notional": "20"},
+        }
+
+
 class _FuturesMinNotionalResponseErrorBinance(_FillingEntryBinance):
     async def fetch_futures_exchange_filters(self, symbol: str) -> dict[str, dict[str, Any]]:
         assert symbol == "LINKUSDT"
@@ -2190,6 +2549,8 @@ def _trader(
     llm: _FakeLLM | None = None,
     memory_provider: Any | None = None,
     wiki_context_provider: Any | None = None,
+    wiki_shadow_recording_recorder: Any | None = None,
+    jue_wiki_read_mode: str = "shadow",
     quant_provider: Any | None = None,
     quant_context_limit: int = 16,
     execute_spot: bool = False,
@@ -2215,6 +2576,7 @@ def _trader(
             max_futures_leverage=2,
             min_liquidation_distance_pct=12.0,
             upbit_usdt_krw_rate=1_000.0,
+            jue_wiki_read_mode=jue_wiki_read_mode,
         ),
         adapter=adapter or _FakeBinance(),
         upbit=upbit,
@@ -2222,6 +2584,7 @@ def _trader(
         memory_provider=memory_provider
         or (lambda **kwargs: {"status": "ok", "symbols": kwargs.get("symbols", [])}),
         wiki_context_provider=wiki_context_provider,
+        wiki_shadow_recording_recorder=wiki_shadow_recording_recorder,
         quant_provider=quant_provider,
         telegram=telegram,
     )
@@ -2252,6 +2615,13 @@ def test_binance_status_exposes_latest_proactive_decision_pressure(
                 "status": "action_required",
                 "pressure_level": "high",
                 "zero_action_streak": 2,
+                "binance_zero_action_streak": 4,
+                "effective_zero_action_streak": 4,
+                "pressure_source": "binance_activity_gap",
+                "binance_market_activity_gap": {
+                    "status": "stale_binance_entries",
+                    "binance_entry_stale_hours": 72.0,
+                },
                 "candidate_count": 12,
                 "strong_candidate_count": 5,
             },
@@ -2273,11 +2643,17 @@ def test_binance_status_exposes_latest_proactive_decision_pressure(
         model="gpt-5.5",
     )
 
-    latest = trader.status()["latest_decision_input"]
+    status = trader.status()
+    latest = status["latest_decision_input"]
 
     assert latest["proactive_pressure_status"] == "action_required"
     assert latest["proactive_pressure_level"] == "high"
     assert latest["proactive_zero_action_streak"] == 2
+    assert latest["proactive_binance_zero_action_streak"] == 4
+    assert latest["proactive_effective_zero_action_streak"] == 4
+    assert latest["proactive_pressure_source"] == "binance_activity_gap"
+    assert latest["proactive_binance_activity_gap_status"] == "stale_binance_entries"
+    assert latest["proactive_binance_entry_stale_hours"] == 72.0
     assert latest["proactive_candidate_count"] == 12
     assert latest["proactive_strong_candidate_count"] == 5
     assert latest["action_count"] == 1
@@ -2293,6 +2669,601 @@ def test_binance_status_exposes_latest_proactive_decision_pressure(
     assert latest["active_block_count"] == 3
     assert latest["waiting_entry_block_count"] == 2
     assert latest["pending_order_block_count"] == 1
+
+
+def test_binance_status_replays_current_binance_activity_pressure(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    old_binance_at = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    old_order = trader.repository.add_order(
+        {
+            "block_id": "old_btc_spot_entry",
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "side": "buy",
+            "qty": 0.1,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE block_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+            (old_binance_at, old_binance_at, old_order["id"]),
+        )
+    for _ in range(2):
+        trader.repository.save_manager_run(
+            prompt={"decision_inputs": ["validation_repair"]},
+            response={
+                "validation_repair_resolution": {
+                    "resolved_candidates": [
+                        {
+                            "symbol": "ETHUSDT",
+                            "market": "futures",
+                            "resolution": "candidate_rejected",
+                            "evidence_gap": "waiting for executable gate",
+                            "next_trigger": "ETHUSDT <= 3200",
+                        }
+                    ]
+                }
+            },
+            actions={
+                "create_blocks": [],
+                "update_blocks": [],
+                "close_blocks": [],
+                "pause_blocks": [],
+            },
+            status="error",
+            error_message="validation_repair_resolution_missing_from_model",
+        )
+    trader.repository.save_manager_run(
+        prompt={
+            "growth_governor": {"allow_new_blocks": True, "mode": "edge_rebuild"},
+            "live_authority": {"live_grade": "insufficient"},
+            "proactive_decision_pressure": {
+                "status": "candidate_present",
+                "pressure_level": "low",
+                "top_candidates": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "score": 72,
+                        "confidence": 0.59,
+                        "entry_style": "wait_for_price",
+                        "entry_price": 3200.0,
+                        "target_price": 3300.0,
+                        "stop_price": 3160.0,
+                    }
+                ],
+            },
+        },
+        response={
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": "waiting for executable gate",
+                        "next_trigger": "ETHUSDT <= 3200",
+                    }
+                ]
+            }
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        status="error",
+        error_message="validation_repair_resolution_missing_from_model",
+    )
+
+    status = trader.status()
+    latest = status["latest_decision_input"]
+
+    assert latest["proactive_pressure_status"] == "candidate_present"
+    assert latest["current_replay_pressure_status"] == "action_required"
+    assert latest["current_replay_pressure_level"] == "high"
+    assert latest["current_replay_pressure_source"] == "binance_activity_gap"
+    assert latest["current_replay_binance_activity_gap_status"] == (
+        "stale_binance_entries"
+    )
+    assert latest["current_replay_binance_candidate_symbols"] == ["ETHUSDT"]
+    assert latest["current_contract_error"] == ""
+    assert latest["current_replay_watch_symbols"] == ["ETHUSDT"]
+    assert latest["current_replay_next_triggers"] == [
+        {
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "condition": "ETHUSDT <= 3200",
+            "price": 3200.0,
+            "reason": "waiting for executable gate",
+        }
+    ]
+    assert latest["current_replay_data_gaps"] == ["waiting for executable gate"]
+    assert latest["contract_replay_status"] == (
+        "stored_error_resolved_by_current_contract"
+    )
+    assert status["latest_manager_error_recovered"] is True
+    assert status["latest_unresolved_manager_error"] == {}
+    assert status["manager_operational_status"] == "manager_contract_replay_recovered"
+
+
+def test_binance_status_exposes_read_only_entry_activity_when_binance_stale(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    old_binance_at = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    recent_upbit_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    old_order = trader.repository.add_order(
+        {
+            "block_id": "old_btc_spot_entry",
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "side": "buy",
+            "qty": 0.1,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+        }
+    )
+    upbit_order = trader.repository.add_order(
+        {
+            "block_id": "recent_sol_upbit_entry",
+            "symbol": "KRW-SOL",
+            "market": "upbit_spot",
+            "side": "buy",
+            "qty": 0.05,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE block_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+            (old_binance_at, old_binance_at, old_order["id"]),
+        )
+        conn.execute(
+            "UPDATE block_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+            (recent_upbit_at, recent_upbit_at, upbit_order["id"]),
+        )
+
+    entry_activity = trader.status()["entry_activity"]
+
+    assert entry_activity["status"] == "stale_binance_entries"
+    assert entry_activity["latest_binance_entry_at"] == old_binance_at
+    assert entry_activity["latest_binance_entry_market"] == "spot"
+    assert entry_activity["latest_upbit_entry_at"] == recent_upbit_at
+    assert entry_activity["binance_entry_count"] == 1
+    assert entry_activity["upbit_entry_count"] == 1
+    assert entry_activity["binance_entry_stale_hours"] == pytest.approx(72.0, abs=0.1)
+
+
+def test_binance_status_replays_latest_manager_contract_with_current_code(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    trader.repository.save_manager_run(
+        prompt={
+            "validation_repair": {
+                "status": "needs_repair",
+                "repair_item_count": 1,
+            },
+            "execution_gate": {
+                "status": "ok",
+                "kill_switch": {"enabled": False},
+                "execution": {"futures_orders_enabled": True},
+            },
+            "proactive_decision_pressure": {
+                "status": "candidate_present",
+                "top_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                    }
+                ],
+            },
+        },
+        response={
+            "hold_decision": {
+                "summary": "ESPUSDT validation repair rejected with trigger",
+                "next_triggers": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "condition": "fresh pattern prior and stop <= 3%",
+                        "reason": "stop risk exceeds repair cap",
+                    }
+                ],
+            },
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": "stop risk exceeds repair cap",
+                        "next_trigger": "fresh pattern prior and stop <= 3%",
+                    }
+                ]
+            },
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        status="error",
+        error_message="validation_repair_resolution_missing_from_model",
+    )
+
+    latest = trader.status()["latest_decision_input"]
+
+    assert latest["manager_run_status"] == "error"
+    assert latest["stored_error_message"] == (
+        "validation_repair_resolution_missing_from_model"
+    )
+    assert latest["current_contract_error"] == ""
+    assert latest["contract_replay_status"] == (
+        "stored_error_resolved_by_current_contract"
+    )
+
+
+def test_binance_status_replays_latest_manager_contract_with_materialized_actions(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    trader.repository.save_manager_run(
+        prompt={
+            "validation_repair": {
+                "status": "needs_repair",
+                "repair_item_count": 1,
+                "max_budget_multiplier": 0.25,
+                "min_reward_risk": 2.0,
+                "max_stop_risk_pct": 3.0,
+            },
+            "proactive_decision_pressure": {
+                "status": "candidate_present",
+                "top_candidates": [
+                    {
+                        "symbol": "KRW-SOL",
+                        "market": "upbit_spot",
+                        "side": "long",
+                        "horizon": "short",
+                        "entry_style": "wait_for_price",
+                        "entry_price": 115_410.07,
+                        "target_price": 117_256.63,
+                        "stop_price": 114_486.79,
+                        "confidence": 0.58,
+                    }
+                ],
+            },
+        },
+        response={
+            "hold_decision": {
+                "summary": "KRW-SOL 대기 프로브를 선택했지만 저장 actions는 비어 있음",
+                "watch_symbols": ["KRW-SOL"],
+            },
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "KRW-SOL",
+                        "market": "upbit_spot",
+                        "resolution": "probe_waiting_block",
+                        "evidence_gap": "validation repair probe only",
+                        "next_trigger": "KRW-SOL <= 115410.07",
+                    }
+                ]
+            },
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        status="error",
+        error_message="validation_repair_resolution_missing_from_model",
+    )
+
+    latest = trader.status()["latest_decision_input"]
+
+    assert latest["action_count"] == 0
+    assert latest["current_replay_action_count"] == 1
+    assert latest["current_replay_auto_action_count"] == 1
+    assert latest["current_replay_action_sections"] == {"create_blocks": 1}
+    assert latest["current_contract_error"] == ""
+    assert latest["current_replay_hold_summary"] == (
+        "KRW-SOL 대기 프로브를 선택했지만 저장 actions는 비어 있음"
+    )
+    assert latest["current_replay_watch_symbols"] == ["KRW-SOL"]
+    assert latest["contract_replay_status"] == (
+        "stored_error_resolved_by_current_contract"
+    )
+
+
+def test_binance_status_replay_does_not_resolve_non_contract_errors(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    trader.repository.save_manager_run(
+        prompt={},
+        response={
+            "hold_decision": {
+                "summary": "lane review missing before contract replay",
+            },
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        status="error",
+        error_message="lane_review_missing_from_model",
+    )
+
+    latest = trader.status()["latest_decision_input"]
+
+    assert latest["current_contract_error"] == ""
+    assert latest["contract_replay_status"] == "stored_non_contract_error"
+
+
+def test_binance_status_replays_futures_materialized_validation_repair_action(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    trader.repository.save_manager_run(
+        prompt={
+            "validation_repair": {
+                "status": "needs_repair",
+                "repair_item_count": 1,
+                "max_budget_multiplier": 0.25,
+                "min_reward_risk": 2.0,
+                "max_stop_risk_pct": 3.0,
+            },
+            "proactive_decision_pressure": {
+                "status": "candidate_present",
+                "top_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "horizon": "futures",
+                        "entry_style": "wait_for_price",
+                        "entry_price": 0.07156,
+                        "target_price": 0.06397,
+                        "stop_price": 0.075262,
+                        "confidence": 0.58,
+                        "quote_budget_usdt": 8.68,
+                    }
+                ],
+            },
+        },
+        response={
+            "hold_decision": {
+                "summary": "ESPUSDT 대기 숏 프로브를 선택했지만 저장 actions는 비어 있음",
+                "watch_symbols": ["ESPUSDT"],
+            },
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "resolution": "probe_waiting_block",
+                        "evidence_gap": "validation repair probe only",
+                        "next_trigger": "ESPUSDT >= 0.07156",
+                    }
+                ]
+            },
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        status="error",
+        error_message="validation_repair_action_missing_from_model",
+    )
+
+    latest = trader.status()["latest_decision_input"]
+
+    assert latest["action_count"] == 0
+    assert latest["current_replay_action_count"] == 1
+    assert latest["current_replay_auto_action_count"] == 1
+    assert latest["current_contract_error"] == ""
+    assert latest["contract_replay_status"] == (
+        "stored_error_resolved_by_current_contract"
+    )
+
+
+def test_binance_status_replay_materializes_rejected_candidate_from_current_pressure_design(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    current_pressure = {
+        "status": "action_required",
+        "top_candidates": [
+            {
+                "symbol": "HMSTRUSDT",
+                "market": "futures",
+                "side": "short",
+                "entry_style": "wait_for_price",
+                "entry_price": 0.000204,
+                "target_price": 0.00019,
+                "stop_price": 0.000222,
+                "quote_budget_usdt": 8.68,
+                "validation_repair_probe_design": {
+                    "resolution": "probe_waiting_block",
+                    "entry_price": 0.000204,
+                    "target_price": 0.00019,
+                    "stop_price": 0.000210,
+                    "reward_risk": 2.333333,
+                    "min_executable_notional_usdt": 20.0,
+                    "min_executable_qty": 98_039.21568627,
+                },
+            }
+        ],
+    }
+    trader._current_replay_proactive_pressure = lambda prompt: current_pressure  # type: ignore[method-assign]
+    trader.repository.save_manager_run(
+        prompt={
+            "validation_repair": {
+                "status": "needs_repair",
+                "repair_item_count": 1,
+                "max_budget_multiplier": 0.25,
+                "min_reward_risk": 2.0,
+                "max_stop_risk_pct": 3.0,
+            },
+            "proactive_decision_pressure": {
+                "status": "candidate_present",
+                "top_candidates": [
+                    {
+                        "symbol": "HMSTRUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "entry_price": 0.000204,
+                        "target_price": 0.00019,
+                        "stop_price": 0.000222,
+                        "quote_budget_usdt": 8.68,
+                    }
+                ],
+            },
+        },
+        response={
+            "hold_decision": {
+                "summary": "HMSTRUSDT 원래 geometry 기준으로 reject",
+                "watch_symbols": ["HMSTRUSDT"],
+            },
+            "validation_repair_resolution": {
+                "resolved_candidates": [
+                    {
+                        "symbol": "HMSTRUSDT",
+                        "market": "futures",
+                        "resolution": "candidate_rejected",
+                        "evidence_gap": (
+                            "original stop risk exceeded validation repair max stop cap"
+                        ),
+                        "next_trigger": "tightened stop later",
+                    }
+                ]
+            },
+        },
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        status="error",
+        error_message="validation_repair_probe_design_ignored_from_model",
+    )
+
+    latest = trader.status()["latest_decision_input"]
+
+    assert latest["action_count"] == 0
+    assert latest["current_replay_action_count"] == 1
+    assert latest["current_replay_auto_action_count"] == 1
+    assert latest["current_replay_auto_create_preview"] == [
+        {
+            "symbol": "HMSTRUSDT",
+            "market": "futures",
+            "side": "short",
+            "entry_style": "wait_for_price",
+            "entry_trigger_price": 0.000204,
+            "entry_trigger_operator": ">=",
+            "entry_price": 0.000204,
+            "target_price": 0.00019,
+            "stop_price": 0.00021,
+            "qty": pytest.approx(98_039.21568627),
+            "quote_budget_usdt": 20.0,
+            "min_executable_notional_usdt": 20.0,
+            "min_executable_qty": pytest.approx(98_039.21568627),
+            "notional_estimate_usdt": pytest.approx(20.0),
+            "auto_materialized_reason": (
+                "manager_rejected_probe_design_without_current_execution_gate"
+            ),
+        }
+    ]
+    assert latest["current_contract_error"] == ""
+    assert latest["contract_replay_status"] == (
+        "stored_error_resolved_by_current_contract"
+    )
+
+
+def test_binance_status_replay_attaches_prompt_wiki_adjustments_before_contract(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    adjustment = {
+        "action": "shift_to_preferred_risk_posture",
+        "target_risk_posture": "repair_probe",
+        "reason": "current_risk_posture_degraded",
+        "evidence_grade": {"instruction": "usable_with_live_cross_check"},
+    }
+    trader.repository.save_manager_run(
+        prompt={
+            "candidates": {
+                "items": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "market": "spot",
+                        "side": "long",
+                    }
+                ]
+            },
+            "jue_wiki_decision_adjustments": {
+                "status": "active",
+                "target_scope": "binance",
+                "adjustments": [adjustment],
+            },
+            "jue_wiki_application": {
+                "decision_adjustments": [adjustment],
+            },
+        },
+        response={
+            "hold_decision": {
+                "summary": "액션 실행: 매니저가 블록 변경을 선택했습니다.",
+            },
+        },
+        actions={
+            "create_blocks": [
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "side": "long",
+                    "entry_price": 50_000,
+                    "target_price": 51_000,
+                    "stop_price": 49_500,
+                    "qty": 0.01,
+                    "thesis": "위키 decision adjustment가 replay에서 붙어야 함",
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        status="error",
+        error_message="validation_repair_resolution_missing_from_model",
+    )
+
+    latest = trader.status()["latest_decision_input"]
+
+    assert latest["action_count"] == 1
+    assert latest["current_replay_action_count"] == 1
+    assert latest["current_replay_auto_action_count"] == 0
+    assert latest["current_contract_error"] == ""
+    assert latest["contract_replay_status"] == (
+        "stored_error_resolved_by_current_contract"
+    )
 
 
 def test_binance_status_preserves_latest_wiki_attention_summary(
@@ -2725,6 +3696,1355 @@ def test_binance_status_surfaces_validation_repair_memory_contract_resolution(
     ]
 
 
+def test_manager_contract_rejects_probe_resolution_without_matching_action() -> None:
+    response = {
+        "create_blocks": [],
+        "update_blocks": [],
+        "close_blocks": [],
+        "pause_blocks": [],
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "resolution": "probe_waiting_block",
+                    "next_trigger": "ESPUSDT >= 0.07156 대기 숏 프로브",
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: validation_repair를 반영해 "
+                        "소액 대기 프로브로 제한"
+                    ),
+                }
+            ]
+        },
+    }
+
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {
+                "status": "needs_repair",
+                "repair_item_count": 1,
+            },
+            "candidates": [
+                {"symbol": "ESPUSDT", "market": "futures", "side": "short"}
+            ],
+        },
+        response=response,
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={
+            "summary": "ESPUSDT 대기 프로브를 선택했다고 보고했지만 액션 없음",
+            "watch_symbols": ["ESPUSDT"],
+            "next_triggers": [
+                {
+                    "symbol": "ESPUSDT",
+                    "condition": "0.07156 이상 재검토",
+                    "reason": "validation repair",
+                }
+            ],
+        },
+    )
+
+    assert error == "validation_repair_action_missing_from_model"
+
+
+def test_manager_auto_materializes_probe_resolution_from_candidate_design() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "max_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        "proactive_decision_pressure": {
+            "status": "action_required",
+            "top_candidates": [
+                {
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "horizon": "intraday",
+                    "confidence": 0.72,
+                    "entry_price": 0.033983,
+                    "entry_trigger_price": 0.033983,
+                    "entry_trigger_operator": "<=",
+                    "target_price": 0.035219,
+                    "stop_price": 0.03296351,
+                    "quote_budget_usdt": 20.0,
+                    "margin_type": "isolated",
+                    "leverage": 1,
+                    "liquidation_price": 0.025,
+                    "validation_repair_probe_design": {
+                        "resolution": "probe_waiting_block",
+                        "entry_price": 0.033983,
+                        "target_price": 0.035219,
+                        "stop_price": 0.03296351,
+                        "reward_risk": 2.0,
+                        "min_executable_notional_usdt": 20.0,
+                        "min_executable_qty": 588.52955949,
+                        "liquidation_price": 0.025,
+                    },
+                    "calculated": {
+                        "entry_price": 0.033983,
+                        "target_price": 0.035219,
+                        "stop_price": 0.03296351,
+                        "quote_budget_usdt": 20.0,
+                        "margin_type": "isolated",
+                        "leverage": 1,
+                        "liquidation_price": 0.025,
+                    },
+                }
+            ],
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "resolution": "probe_waiting_block",
+                    "next_trigger": "CHIPUSDT <= 0.033983 waiting long probe",
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: validation repair probe로 축소 실행"
+                    ),
+                }
+            ]
+        }
+    }
+    actions = {
+        "create_blocks": [],
+        "update_blocks": [],
+        "close_blocks": [],
+        "pause_blocks": [],
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        actions,
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    create = adjusted["create_blocks"][0]
+    assert create["symbol"] == "CHIPUSDT"
+    assert create["market"] == "futures"
+    assert create["entry_style"] == "wait_for_price"
+    assert create["entry_trigger_price"] == pytest.approx(0.033983)
+    assert create["qty"] == pytest.approx(588.52955949)
+    assert create["quote_budget_usdt"] == pytest.approx(20.0)
+    assert create["liquidation_price"] == pytest.approx(0.025)
+    assert create["metadata"]["auto_materialized_validation_repair_action"] is True
+    assert create["metadata"]["validation_repair_resolution"]["resolution"] == (
+        "probe_waiting_block"
+    )
+    assert (
+        manager_response_contract_error(
+            prompt=prompt,
+            response=response,
+            actions=adjusted,
+            hold_decision={},
+        )
+        == ""
+    )
+
+
+def test_manager_auto_materializes_upbit_probe_resolution_from_krw_candidate() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "max_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        "candidates": {
+            "items": [
+                {
+                    "symbol": "KRW-SOL",
+                    "market": "upbit_spot",
+                    "side": "long",
+                    "horizon": "short",
+                    "confidence": 0.61,
+                    "entry_style": "wait_for_price",
+                    "entry_price_krw": 118_095.37,
+                    "entry_trigger_price_krw": 118_095.37,
+                    "entry_trigger_operator": "<=",
+                    "target_price_krw": 119_984.89,
+                    "stop_price_krw": 117_150.61,
+                    "quote_budget_krw": 10_000.0,
+                    "calculated": {
+                        "entry_style": "wait_for_price",
+                        "entry_price_krw": 118_095.37,
+                        "target_price_krw": 119_984.89,
+                        "stop_price_krw": 117_150.61,
+                        "quote_budget_krw": 10_000.0,
+                    },
+                }
+            ]
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "KRW-SOL",
+                    "market": "upbit_spot",
+                    "resolution": "probe_waiting_block",
+                    "next_trigger": "KRW-SOL <= 118095.37 waiting spot probe",
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: validation repair 기준으로 "
+                        "KRW 소액 대기 프로브"
+                    ),
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    create = adjusted["create_blocks"][0]
+    assert create["symbol"] == "KRW-SOL"
+    assert create["market"] == "upbit_spot"
+    assert create["entry_trigger_price"] == pytest.approx(118_095.37)
+    assert create["quote_budget_krw"] == pytest.approx(10_000.0)
+    assert create["min_executable_notional_krw"] == pytest.approx(10_000.0)
+    assert create["metadata"]["auto_materialized_validation_repair_action"] is True
+    assert (
+        manager_response_contract_error(
+            prompt=prompt,
+            response=response,
+            actions=adjusted,
+            hold_decision={},
+        )
+        == ""
+    )
+
+
+def test_manager_auto_materializes_probe_resolution_with_synthesized_repair_geometry() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "max_budget_multiplier": 0.25,
+            "risk_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        "candidates": {
+            "items": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "horizon": "futures",
+                    "confidence": 0.58,
+                    "entry_style": "wait_for_price",
+                    "entry_price": 0.07156,
+                    "entry_trigger_price": 0.07156,
+                    "entry_trigger_operator": ">=",
+                    "target_price": 0.06397,
+                    "stop_price": 0.075262,
+                    "quote_budget_usdt": 8.68,
+                    "margin_type": "isolated",
+                    "leverage": 1,
+                    "liquidation_price": 0.096606,
+                    "calculated": {
+                        "entry_style": "wait_for_price",
+                        "entry_price": 0.07156,
+                        "target_price": 0.06397,
+                        "stop_price": 0.075262,
+                        "quote_budget_usdt": 8.68,
+                        "margin_type": "isolated",
+                        "leverage": 1,
+                        "liquidation_price": 0.096606,
+                    },
+                }
+            ]
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "resolution": "probe_waiting_block",
+                    "next_trigger": "ESPUSDT >= 0.07156 waiting short probe",
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: repair 기준으로 손절폭을 줄인 대기 숏"
+                    ),
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    create = adjusted["create_blocks"][0]
+    assert create["symbol"] == "ESPUSDT"
+    assert create["market"] == "futures"
+    assert create["side"] == "short"
+    assert create["entry_style"] == "wait_for_price"
+    assert create["entry_trigger_operator"] == ">="
+    assert create["entry_price"] == pytest.approx(0.07156)
+    assert create["stop_price"] == pytest.approx(0.0737068)
+    assert create["target_price"] == pytest.approx(0.06397)
+    assert create["quote_budget_usdt"] == pytest.approx(20.0)
+    assert create["qty"] == pytest.approx(20.0 / 0.07156)
+    assert create["liquidation_price"] == pytest.approx(0.096606)
+    assert create["metadata"]["auto_materialized_validation_repair_action"] is True
+    assert create["metadata"]["synthesized_validation_repair_probe_design"] is True
+    assert create["metadata"]["validation_repair_resolution"]["resolution"] == (
+        "probe_waiting_block"
+    )
+    assert (
+        manager_response_contract_error(
+            prompt=prompt,
+            response=response,
+            actions=adjusted,
+            hold_decision={},
+        )
+        == ""
+    )
+
+
+def test_manager_auto_materializes_probe_resolution_with_entry_trigger_repair_geometry() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "max_budget_multiplier": 0.25,
+            "risk_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        "candidates": {
+            "items": [
+                {
+                    "symbol": "XPLUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "horizon": "futures",
+                    "confidence": 0.5,
+                    "entry_style": "wait_for_price",
+                    "entry_price": 0.094454,
+                    "entry_trigger_price": 0.094454,
+                    "entry_trigger_operator": ">=",
+                    "target_price": 0.091904,
+                    "stop_price": 0.096154,
+                    "quote_budget_usdt": 24.79,
+                    "calculated": {
+                        "entry_style": "wait_for_price",
+                        "entry_price": 0.094454,
+                        "target_price": 0.091904,
+                        "stop_price": 0.096154,
+                        "quote_budget_usdt": 24.79,
+                        "reward_risk": 1.5,
+                    },
+                }
+            ]
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "XPLUSDT",
+                    "market": "futures",
+                    "resolution": "probe_waiting_block",
+                    "next_trigger": "XPLUSDT >= 0.09473733 waiting short probe",
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: RR 2.0을 만족하는 대기 숏 프로브"
+                    ),
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    create = adjusted["create_blocks"][0]
+    assert create["symbol"] == "XPLUSDT"
+    assert create["market"] == "futures"
+    assert create["side"] == "short"
+    assert create["entry_style"] == "wait_for_price"
+    assert create["entry_trigger_price"] == pytest.approx(0.09473733)
+    assert create["entry_trigger_operator"] == ">="
+    assert create["entry_price"] == pytest.approx(0.09473733)
+    assert create["target_price"] == pytest.approx(0.091904)
+    assert create["stop_price"] == pytest.approx(0.096154)
+    assert create["quote_budget_usdt"] == pytest.approx(20.0)
+    assert create["qty"] == pytest.approx(20.0 / 0.09473733)
+    assert create["metadata"]["auto_materialized_validation_repair_action"] is True
+    assert create["metadata"]["synthesized_validation_repair_probe_design"] is True
+    assert (
+        manager_response_contract_error(
+            prompt=prompt,
+            response=response,
+            actions=adjusted,
+            hold_decision={},
+        )
+        == ""
+    )
+
+
+def test_manager_auto_materializes_updated_geometry_from_candidate_probe_design() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "max_budget_multiplier": 0.25,
+            "risk_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        "proactive_decision_pressure": {
+            "status": "action_required",
+            "top_candidates": [
+                {
+                    "symbol": "XPLUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "horizon": "futures",
+                    "confidence": 0.5,
+                    "entry_style": "wait_for_price",
+                    "entry_price": 0.094454,
+                    "entry_trigger_price": 0.094454,
+                    "entry_trigger_operator": ">=",
+                    "target_price": 0.091904,
+                    "stop_price": 0.096154,
+                    "quote_budget_usdt": 24.79,
+                    "validation_repair_probe_design": {
+                        "resolution": "probe_waiting_block",
+                        "entry_price": 0.09473733,
+                        "entry_trigger_price": 0.09473733,
+                        "entry_trigger_operator": ">=",
+                        "target_price": 0.091904,
+                        "stop_price": 0.096154,
+                        "reward_risk": 2.0,
+                        "min_executable_notional_usdt": 20.0,
+                        "min_executable_qty": 211.11002389,
+                    },
+                }
+            ],
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "XPLUSDT",
+                    "market": "futures",
+                    "resolution": "updated_price_geometry",
+                    "evidence_gap": (
+                        "후보 RR 1.50을 repair 설계의 대기 진입가로 조정하면 "
+                        "RR 2.0을 만족합니다."
+                    ),
+                    "next_trigger": "XPLUSDT >= 0.09473733 waiting short probe",
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: embedded repair probe design을 "
+                        "대기 숏 프로브로 적용"
+                    ),
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    create = adjusted["create_blocks"][0]
+    assert create["symbol"] == "XPLUSDT"
+    assert create["market"] == "futures"
+    assert create["side"] == "short"
+    assert create["entry_style"] == "wait_for_price"
+    assert create["entry_trigger_price"] == pytest.approx(0.09473733)
+    assert create["entry_trigger_operator"] == ">="
+    assert create["entry_price"] == pytest.approx(0.09473733)
+    assert create["target_price"] == pytest.approx(0.091904)
+    assert create["stop_price"] == pytest.approx(0.096154)
+    assert create["quote_budget_usdt"] == pytest.approx(20.0)
+    assert create["qty"] == pytest.approx(211.11002389)
+    assert create["metadata"]["auto_materialized_validation_repair_action"] is True
+    assert create["metadata"]["validation_repair_resolution"]["resolution"] == (
+        "updated_price_geometry"
+    )
+    assert (
+        create["metadata"]["auto_materialized_reason"]
+        == "manager_selected_updated_price_geometry_with_probe_design_without_action"
+    )
+    assert (
+        manager_response_contract_error(
+            prompt=prompt,
+            response=response,
+            actions=adjusted,
+            hold_decision={},
+        )
+        == ""
+    )
+
+
+def test_manager_does_not_auto_materialize_updated_geometry_from_empty_probe_design() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "risk_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        "proactive_decision_pressure": {
+            "status": "action_required",
+            "top_candidates": [
+                {
+                    "symbol": "XPLUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "entry_price": 0.094454,
+                    "target_price": 0.091904,
+                    "stop_price": 0.096154,
+                    "quote_budget_usdt": 24.79,
+                    "validation_repair_probe_design": {},
+                }
+            ],
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "XPLUSDT",
+                    "market": "futures",
+                    "resolution": "updated_price_geometry",
+                    "next_trigger": "XPLUSDT >= 0.09473733 waiting short probe",
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    assert adjusted["create_blocks"] == []
+
+
+def test_manager_auto_materializes_rejected_candidate_when_probe_design_repairs_only_original_geometry() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "risk_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        "proactive_decision_pressure": {
+            "status": "action_required",
+            "top_candidates": [
+                {
+                    "symbol": "HMSTRUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "entry_style": "wait_for_price",
+                    "entry_price": 0.000204,
+                    "entry_trigger_price": 0.000204,
+                    "entry_trigger_operator": ">=",
+                    "target_price": 0.00019,
+                    "stop_price": 0.000222,
+                    "quote_budget_usdt": 8.68,
+                    "validation_repair_probe_design": {
+                        "resolution": "probe_waiting_block",
+                        "entry_price": 0.000204,
+                        "entry_trigger_price": 0.000204,
+                        "entry_trigger_operator": ">=",
+                        "target_price": 0.00019,
+                        "stop_price": 0.000210,
+                        "reward_risk": 2.333333,
+                        "min_executable_notional_usdt": 20.0,
+                        "min_executable_qty": 98_039.21568627,
+                    },
+                }
+            ],
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "HMSTRUSDT",
+                    "market": "futures",
+                    "resolution": "candidate_rejected",
+                    "evidence_gap": (
+                        "original stop risk exceeded validation repair max stop cap"
+                    ),
+                    "next_trigger": "tightened stop later",
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    create = adjusted["create_blocks"][0]
+    assert create["symbol"] == "HMSTRUSDT"
+    assert create["market"] == "futures"
+    assert create["entry_style"] == "wait_for_price"
+    assert create["entry_price"] == pytest.approx(0.000204)
+    assert create["stop_price"] == pytest.approx(0.000210)
+    assert create["quote_budget_usdt"] == pytest.approx(20.0)
+    assert create["metadata"]["auto_materialized_validation_repair_action"] is True
+    assert (
+        create["metadata"]["auto_materialized_reason"]
+        == "manager_rejected_probe_design_without_current_execution_gate"
+    )
+
+
+def test_manager_auto_materializes_rejected_candidate_preferring_pressure_probe_design() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "risk_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        "candidates": [
+            {
+                "symbol": "HMSTRUSDT",
+                "market": "futures",
+                "side": "short",
+                "entry_price": 0.000217,
+                "target_price": 0.000179,
+                "stop_price": 0.000236,
+                "quote_budget_usdt": 8.68,
+            }
+        ],
+        "proactive_decision_pressure": {
+            "status": "action_required",
+            "top_candidates": [
+                {
+                    "symbol": "HMSTRUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "entry_price": 0.000217,
+                    "target_price": 0.000179,
+                    "stop_price": 0.000236,
+                    "quote_budget_usdt": 8.68,
+                    "validation_repair_probe_design": {
+                        "resolution": "probe_waiting_block",
+                        "entry_price": 0.000217,
+                        "target_price": 0.000179,
+                        "stop_price": 0.00022351,
+                        "reward_risk": 5.837174,
+                        "min_executable_notional_usdt": 20.0,
+                        "min_executable_qty": 92_165.89861751,
+                    },
+                }
+            ],
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "HMSTRUSDT",
+                    "market": "futures",
+                    "resolution": "candidate_rejected",
+                    "evidence_gap": (
+                        "pattern_live_crosscheck=no_pattern_prior, "
+                        "recommended_entry_mode=research_only, calculated risk_pct="
+                        "8.6063% > validation_repair max_stop_risk_pct=3.0%"
+                    ),
+                    "next_trigger": "tightened stop later",
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    create = adjusted["create_blocks"][0]
+    assert create["symbol"] == "HMSTRUSDT"
+    assert create["stop_price"] == pytest.approx(0.00022351)
+    assert create["quote_budget_usdt"] == pytest.approx(20.0)
+    assert create["metadata"]["auto_materialized_validation_repair_action"] is True
+
+
+def test_manager_does_not_auto_materialize_rejected_candidate_with_current_live_gate() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "risk_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        "proactive_decision_pressure": {
+            "status": "action_required",
+            "top_candidates": [
+                {
+                    "symbol": "XPLUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "entry_price": 0.09473733,
+                    "target_price": 0.091904,
+                    "stop_price": 0.096154,
+                    "quote_budget_usdt": 24.79,
+                    "validation_repair_probe_design": {
+                        "resolution": "probe_waiting_block",
+                        "entry_price": 0.09473733,
+                        "target_price": 0.091904,
+                        "stop_price": 0.096154,
+                        "reward_risk": 2.0,
+                        "min_executable_notional_usdt": 20.0,
+                    },
+                }
+            ],
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "XPLUSDT",
+                    "market": "futures",
+                    "resolution": "candidate_rejected",
+                    "evidence_gap": (
+                        "confidence 0.50 below waiting threshold and "
+                        "live_authority validation_probe"
+                    ),
+                    "next_trigger": "confidence >= 0.58",
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    assert adjusted["create_blocks"] == []
+
+
+def test_manager_contract_rejects_ignoring_candidate_repair_probe_design() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+        },
+        "candidates": {
+            "items": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "validation_repair_probe_design": {
+                        "resolution": "probe_waiting_block",
+                        "entry_price": 0.07156,
+                        "target_price": 0.06397,
+                        "stop_price": 0.0737068,
+                        "reward_risk": 2.0,
+                        "min_executable_notional_usdt": 20.0,
+                        "min_executable_qty": 279.48518726,
+                    },
+                }
+            ]
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "resolution": "candidate_rejected",
+                    "evidence_gap": "missing_pattern_prior only",
+                    "memory_contract_resolution": (
+                        "reject_memory_with_reason: 패턴 선행근거가 없어 보류"
+                    ),
+                    "next_trigger": "pattern prior 확보 후 재검토",
+                }
+            ]
+        }
+    }
+
+    error = manager_response_contract_error(
+        prompt=prompt,
+        response=response,
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={"summary": "ESPUSDT 패턴 prior까지 보류"},
+    )
+
+    assert error == "validation_repair_probe_design_ignored_from_model"
+
+
+def test_manager_contract_does_not_treat_next_trigger_as_current_repair_probe_gate() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+        },
+        "candidates": {
+            "items": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "validation_repair_probe_design": {
+                        "resolution": "probe_waiting_block",
+                        "entry_price": 0.07156,
+                        "target_price": 0.06397,
+                        "stop_price": 0.0737068,
+                        "reward_risk": 2.0,
+                        "min_executable_notional_usdt": 20.0,
+                    },
+                }
+            ]
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "resolution": "candidate_rejected",
+                    "evidence_gap": (
+                        "volatile_attack 후보지만 missing_pattern_prior 상태입니다."
+                    ),
+                    "memory_contract_resolution": (
+                        "reject_memory_with_reason: 패턴 선행근거 부재로 보류"
+                    ),
+                    "next_trigger": (
+                        "pattern_prior, funding/depth 재확인, spread <= 10bps "
+                        "충족 시 0.25 이하 probe 재검토"
+                    ),
+                }
+            ]
+        }
+    }
+
+    error = manager_response_contract_error(
+        prompt=prompt,
+        response=response,
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={"summary": "ESPUSDT는 다음 funding/depth 확인까지 보류"},
+    )
+
+    assert error == "validation_repair_probe_design_ignored_from_model"
+
+
+def test_manager_auto_materializes_probe_resolution_when_candidate_geometry_is_valid() -> None:
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "max_budget_multiplier": 0.25,
+            "risk_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        "candidates": {
+            "items": [
+                {
+                    "symbol": "ICPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "horizon": "futures",
+                    "confidence": 0.58,
+                    "entry_style": "wait_for_price",
+                    "entry_price": 2.2266,
+                    "entry_trigger_price": 2.2266,
+                    "entry_trigger_operator": "<=",
+                    "target_price": 2.3006,
+                    "stop_price": 2.1905,
+                    "quote_budget_usdt": 8.68,
+                    "margin_type": "isolated",
+                    "leverage": 1,
+                    "liquidation_price": 1.4473,
+                    "calculated": {
+                        "entry_style": "wait_for_price",
+                        "entry_price": 2.2266,
+                        "target_price": 2.3006,
+                        "stop_price": 2.1905,
+                        "quote_budget_usdt": 8.68,
+                        "margin_type": "isolated",
+                        "leverage": 1,
+                        "liquidation_price": 1.4473,
+                    },
+                }
+            ]
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "ICPUSDT",
+                    "market": "futures",
+                    "resolution": "probe_waiting_block",
+                    "next_trigger": "ICPUSDT <= 2.2266 waiting long probe",
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: repair 기준을 통과한 대기 롱"
+                    ),
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    create = adjusted["create_blocks"][0]
+    assert create["symbol"] == "ICPUSDT"
+    assert create["market"] == "futures"
+    assert create["side"] == "long"
+    assert create["entry_trigger_operator"] == "<="
+    assert create["entry_price"] == pytest.approx(2.2266)
+    assert create["stop_price"] == pytest.approx(2.1905)
+    assert create["target_price"] == pytest.approx(2.3006)
+    assert create["quote_budget_usdt"] == pytest.approx(20.0)
+    assert create["qty"] == pytest.approx(20.0 / 2.2266)
+    assert create["liquidation_price"] == pytest.approx(1.4473)
+    assert create["metadata"]["auto_materialized_validation_repair_action"] is True
+    assert create["metadata"]["validated_existing_repair_probe_geometry"] is True
+    assert (
+        manager_response_contract_error(
+            prompt=prompt,
+            response=response,
+            actions=adjusted,
+            hold_decision={},
+        )
+        == ""
+    )
+
+
+def test_manager_applies_auto_materialized_futures_waiting_probe(
+    tmp_path: Path,
+) -> None:
+    adapter = _FakeBinance()
+    adapter.prices["ICPUSDT"] = 2.2266
+    adapter.account = {
+        "status": "ok",
+        "spot_cash_usdt": 5_000.0,
+        "futures_cash_usdt": 5_000.0,
+        "positions": [],
+    }
+    trader = _trader(tmp_path, adapter=adapter, enabled=True, execute_futures=True)
+    trader.live_authority_provider = lambda: {
+        "status": "ok",
+        "live_grade": "qualified",
+        "allow_scale_up": False,
+        "max_budget_multiplier": 1.0,
+        "scorecard_count": 20,
+        "validation_gate": {"status": "clear", "readiness": "scale_ready"},
+        "lane_authority": {
+            "futures:long": {
+                "status": "qualified",
+                "live_grade": "qualified",
+                "max_budget_multiplier": 1.0,
+            }
+        },
+    }
+    trader._last_account_snapshot = _normalize_test_account(trader, adapter.account)
+    trader._last_live_authority_context = trader.live_authority_provider()
+    trader._last_manager_entry_gate_policy = trader._entry_gate_policy(
+        performance={},
+        memory_context={},
+    )
+    trader._last_manager_entry_gate_policy["min_confidence"] = 0.62
+    trader._last_manager_entry_gate_policy["base_min_confidence"] = 0.62
+    trader._last_manager_growth_governor = {
+        "status": "steady",
+        "mode": "steady",
+        "allow_new_blocks": True,
+        "max_new_blocks": 2,
+    }
+    trader._runtime_market_universe = {
+        "spot": [],
+        "futures": ["ICPUSDT"],
+        "upbit_spot": [],
+    }
+    candidate = {
+        "symbol": "ICPUSDT",
+        "market": "futures",
+        "side": "long",
+        "horizon": "futures",
+        "stance": "long",
+        "confidence": 0.58,
+        "entry_style": "wait_for_price",
+        "entry_price": 2.2266,
+        "entry_trigger_price": 2.2266,
+        "entry_trigger_operator": "<=",
+        "target_price": 2.3006,
+        "stop_price": 2.1905,
+        "quote_budget_usdt": 8.68,
+        "margin_type": "isolated",
+        "leverage": 1,
+        "liquidation_price": 1.4473,
+        "calculated": {
+            "entry_style": "wait_for_price",
+            "entry_price": 2.2266,
+            "target_price": 2.3006,
+            "stop_price": 2.1905,
+            "quote_budget_usdt": 8.68,
+            "margin_type": "isolated",
+            "leverage": 1,
+            "liquidation_price": 1.4473,
+        },
+    }
+    trader._last_manager_candidate_index = trader._manager_candidate_index([candidate])
+    prompt = {
+        "validation_repair": {
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "max_budget_multiplier": 0.25,
+            "risk_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        "candidates": {"items": [candidate]},
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "ICPUSDT",
+                    "market": "futures",
+                    "resolution": "probe_waiting_block",
+                    "next_trigger": "ICPUSDT <= 2.2266 waiting long probe",
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: repair 기준을 통과한 대기 롱"
+                    ),
+                }
+            ]
+        }
+    }
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+    create = adjusted["create_blocks"][0]
+    assert candidate["quote_budget_usdt"] == pytest.approx(8.68)
+    assert create["quote_budget_usdt"] == pytest.approx(20.0)
+    assert create["min_executable_notional_usdt"] == pytest.approx(20.0)
+    assert create["qty"] == pytest.approx(20.0 / 2.2266)
+
+    applied = asyncio.run(
+        trader._apply_manager_actions(adjusted, manager_run_id=77)
+    )
+
+    assert applied["created"][0]["status"] == "waiting_entry"
+    block = trader.list_blocks(include_closed=False)[0]
+    assert block["symbol"] == "ICPUSDT"
+    assert block["market"] == "futures"
+    assert block["side"] == "long"
+    assert block["status"] == "proposed"
+    assert block["qty_initial"] == pytest.approx(20.0 / 2.2266)
+    assert block["entry_price"] == pytest.approx(2.2266)
+    assert block["target_price"] == pytest.approx(2.3006)
+    assert block["stop_price"] == pytest.approx(2.1905)
+    assert block["liquidation_price"] == pytest.approx(1.4473)
+    assert block["metadata"]["auto_materialized_validation_repair_action"] is True
+    assert block["metadata"]["validation_repair"]["max_stop_risk_pct"] == pytest.approx(
+        3.0
+    )
+    assert (
+        block["metadata"]["entry_gate"]["candidate"][
+            "validation_repair_probe_confidence_relaxed"
+        ]
+        is True
+    )
+    assert "candidate_budget_cap" not in block["metadata"]
+
+
+def test_candidate_budget_cap_preserves_min_executable_repair_notional(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    candidate = {
+        "symbol": "ICPUSDT",
+        "market": "futures",
+        "side": "long",
+        "horizon": "futures",
+        "quote_budget_usdt": 8.68,
+        "calculated": {"quote_budget_usdt": 8.68},
+    }
+    trader._last_manager_candidate_index = trader._manager_candidate_index([candidate])
+    row = {
+        "symbol": "ICPUSDT",
+        "market": "futures",
+        "side": "long",
+        "horizon": "futures",
+        "entry_price": 2.2266,
+        "entry_trigger_price": 2.2266,
+        "quote_budget_usdt": 20.0,
+        "qty": 20.0 / 2.2266,
+        "min_executable_notional_usdt": 20.0,
+        "min_executable_qty": 20.0 / 2.2266,
+        "metadata": {
+            "auto_materialized_validation_repair_action": True,
+        },
+    }
+
+    adjusted = trader._apply_candidate_budget_cap_to_row(row)
+
+    assert adjusted["quote_budget_usdt"] == pytest.approx(20.0)
+    assert adjusted["qty"] == pytest.approx(20.0 / 2.2266)
+    assert "candidate_budget_cap" not in adjusted["metadata"]
+
+
+def test_manager_rejects_active_repair_row_metadata_spoof_without_response_resolution(
+    tmp_path: Path,
+) -> None:
+    adapter = _FakeBinance()
+    adapter.prices["ICPUSDT"] = 2.2266
+    adapter.account = {
+        "status": "ok",
+        "spot_cash_usdt": 5_000.0,
+        "futures_cash_usdt": 5_000.0,
+        "positions": [],
+    }
+    trader = _trader(tmp_path, adapter=adapter, enabled=True, execute_futures=True)
+    trader._last_account_snapshot = _normalize_test_account(trader, adapter.account)
+    trader._last_live_authority_context = {
+        "status": "ok",
+        "live_grade": "qualified",
+        "allow_scale_up": False,
+        "max_budget_multiplier": 1.0,
+        "validation_gate": {"status": "clear", "readiness": "scale_ready"},
+        "lane_authority": {
+            "futures:long": {
+                "status": "qualified",
+                "live_grade": "qualified",
+                "max_budget_multiplier": 1.0,
+            }
+        },
+    }
+    trader._last_manager_entry_gate_policy = trader._entry_gate_policy(
+        performance={},
+        memory_context={},
+    )
+    trader._last_manager_entry_gate_policy["min_confidence"] = 0.62
+    trader._last_manager_entry_gate_policy["base_min_confidence"] = 0.62
+    trader._last_manager_growth_governor = {
+        "status": "steady",
+        "mode": "steady",
+        "allow_new_blocks": True,
+        "max_new_blocks": 2,
+    }
+    trader._runtime_market_universe = {
+        "spot": [],
+        "futures": ["ICPUSDT"],
+        "upbit_spot": [],
+    }
+    candidate = {
+        "symbol": "ICPUSDT",
+        "market": "futures",
+        "side": "long",
+        "horizon": "futures",
+        "stance": "long_watch",
+        "confidence": 0.45,
+    }
+    trader._last_manager_candidate_index = trader._manager_candidate_index([candidate])
+    actions = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [
+                {
+                    "symbol": "ICPUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "horizon": "futures",
+                    "confidence": 0.45,
+                    "entry_style": "wait_for_price",
+                    "entry_trigger_price": 2.2266,
+                    "entry_trigger_operator": "<=",
+                    "entry_price": 2.2266,
+                    "target_price": 2.3006,
+                    "stop_price": 2.1905,
+                    "liquidation_price": 1.4473,
+                    "qty": 20.0 / 2.2266,
+                    "metadata": {
+                        "validation_repair_resolution": {
+                            "resolution": "probe_waiting_block",
+                        },
+                    },
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair={
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "max_budget_multiplier": 0.25,
+            "risk_budget_multiplier": 0.25,
+            "min_reward_risk": 2.0,
+            "max_stop_risk_pct": 3.0,
+        },
+        manager_response={},
+        prompt={},
+    )
+
+    applied = asyncio.run(trader._apply_manager_actions(actions, manager_run_id=78))
+
+    assert applied["created"][0]["status"] == "rejected"
+    assert "candidate_confidence_too_low" in applied["created"][0]["reason"]
+    assert trader.list_blocks(include_closed=True) == []
+
+
+def test_manager_contract_rejects_probe_resolution_with_negative_gap_without_action() -> None:
+    response = {
+        "create_blocks": [],
+        "update_blocks": [],
+        "close_blocks": [],
+        "pause_blocks": [],
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "resolution": "probe_waiting_block",
+                    "evidence_gap": "no orderbook depth",
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: 검증 수리 후보를 소액 프로브로 "
+                        "제한한다고 했지만 실행 블록은 비어 있음"
+                    ),
+                }
+            ]
+        },
+    }
+
+    error = manager_response_contract_error(
+        prompt={
+            "validation_repair": {
+                "status": "needs_repair",
+                "repair_item_count": 1,
+            },
+            "candidates": [
+                {"symbol": "ESPUSDT", "market": "futures", "side": "short"}
+            ],
+        },
+        response=response,
+        actions={
+            "create_blocks": [],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        hold_decision={},
+    )
+
+    assert error == "validation_repair_action_missing_from_model"
+
+
 def test_binance_manager_prompt_contains_jue_workflow_pack(tmp_path: Path) -> None:
     llm = _FakeLLM({"create_blocks": []})
     wiki_calls: list[dict] = []
@@ -2780,6 +5100,8 @@ def test_binance_manager_prompt_contains_jue_workflow_pack(tmp_path: Path) -> No
     assert result["status"] == "ok"
     prompt = llm.calls[0]["payload"]
     assert prompt["jue_workflow"]["workflow_id"] == "binance_cycle"
+    assert prompt["native_thread_mode"] == "daily"
+    assert prompt["native_thread_key"] == "binance:block_manager:{date}"
     wiki = prompt["jue_wiki"]
     assert wiki["status"] == "ok"
     assert wiki["selection_run_id"]
@@ -2827,8 +5149,8 @@ def test_binance_manager_prompt_contains_jue_workflow_pack(tmp_path: Path) -> No
         in prompt["policy"]["live_authority_policy"]["probe_mandate"]
     )
     assert (
-        prompt["jue_workflow"]["model_policy"]["expected_runtime_model"]
-        == "gpt-5.5"
+            prompt["jue_workflow"]["model_policy"]["expected_runtime_model"]
+            == "gpt-5.6-sol"
     )
     assert prompt["jue_workflow"]["cadence"]["interval_sec"] == trader.config.manager_interval_sec
     assert (
@@ -4022,7 +6344,12 @@ def test_manager_prompt_latency_guard_compacts_policy_impacts_after_timeout(
     assert prompt["latency_guard"]["active"] is True
     assert prompt["latency_guard"]["reason"] == "recent_manager_timeout"
     assert prompt["latency_guard"]["target_chars"] == 24_000
+    assert prompt["native_thread_mode"] == "ephemeral"
+    assert "native_thread_key" not in prompt
     assert prompt["prompt_budget"]["total_chars"] <= 24_000
+    assert isinstance(prompt["decision_inputs"], list)
+    assert isinstance(prompt["candidates"], list)
+    assert isinstance(prompt["blocks"], list)
     assert len(prompt["candidate_policy_impacts"]) <= 25
     assert "T00USDT" in prompt["candidate_policy_impacts"]
     assert "T59USDT" not in prompt["candidate_policy_impacts"]
@@ -5205,6 +7532,33 @@ def test_binance_manager_prompt_over_max_fails_before_llm_call(tmp_path: Path) -
     assert latest["prompt"]["prompt_budget"]["over_max"] is True
 
 
+def test_binance_manager_prompt_contract_violation_fails_before_llm_or_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(tmp_path, llm=llm)
+
+    def reject_contract(*args: Any, **kwargs: Any) -> Any:
+        _ = args, kwargs
+        raise binance_block_trader_module.ManagerPromptContractViolation(
+            "prompt_budget_contract_violation: blocks must be a list"
+        )
+
+    monkeypatch.setattr(
+        binance_block_trader_module,
+        "build_manager_prompt_bundle",
+        reject_contract,
+    )
+
+    result = asyncio.run(trader.run_manager_once())
+
+    assert result["status"] == "error"
+    assert "prompt_budget_contract_violation" in result["error_message"]
+    assert llm.calls == []
+    assert trader.repository.list_orders(limit=10) == []
+
+
 def test_binance_manager_prompt_over_max_sends_telegram_alert(tmp_path: Path) -> None:
     marker = "BINANCE_PROMPT_TELEGRAM_LIMIT_MARKER"
 
@@ -5646,6 +8000,295 @@ def test_validation_repair_forces_binance_waiting_probe_create_action() -> None:
     assert enforcement["budget_multiplier"] == pytest.approx(0.25)
     assert enforcement["last_repair_statuses"] == ["queued_external_runner"]
     assert row["metadata"]["validation_repair_enforcement"] == enforcement
+
+
+def test_validation_repair_response_resolution_adds_wiki_repair_metadata_for_action_contract() -> None:
+    prompt = {
+        "execution_gate": {
+            "status": "ok",
+            "execution": {"spot_orders_enabled": True, "upbit_orders_enabled": True},
+        },
+        "jue_wiki": {
+            "pages": [
+                {
+                    "page_id": "binance.risk.trading_validation",
+                    "effectiveness": {
+                        "status": "degraded",
+                        "reasons": ["validation repair evidence degraded"],
+                    },
+                }
+            ]
+        },
+        "validation_repair": {
+            "version": "validation_repair_action_v1",
+            "scope": "binance",
+            "repair_item_count": 1,
+            "allowed_entry_postures": ["fractional_kelly_probe"],
+            "scale_up_blocked": True,
+            "scale_blockers": ["validation_cost_simulation_repair"],
+            "risk_budget_multiplier": 0.25,
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "KRW-XPL",
+                    "market": "upbit_spot",
+                    "resolution": "updated_price_geometry",
+                    "evidence_gap": "원 후보 진입가가 2R 조건에 부족해 가격을 낮췄다.",
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: 검증 복구 메모리를 적용해 "
+                        "대기형 소액 프로브로 재설계"
+                    ),
+                    "next_trigger": "162.69원 이하 대기 진입",
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [
+                {
+                    "symbol": "KRW-XPL",
+                    "market": "upbit_spot",
+                    "side": "long",
+                    "entry_style": "wait_for_price",
+                    "entry_price": 162.69,
+                    "target_price": 166.02,
+                    "stop_price": 161.03,
+                    "qty": 30.7,
+                    "thesis": "검증 복구 가격 재설계",
+                    "metadata": {
+                        "validation_repair_resolution": {"symbol": "STALE"},
+                        "jue_wiki_repair_pressure": "handled",
+                        "jue_wiki_repair_resolution": "handled",
+                    },
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    row = adjusted["create_blocks"][0]
+    metadata = row["metadata"]
+    assert metadata["validation_repair_resolution"]["symbol"] == "KRW-XPL"
+    assert metadata["validation_repair_resolution"]["resolution"] == (
+        "updated_price_geometry"
+    )
+    assert "binance.risk.trading_validation" in json.dumps(
+        metadata["jue_wiki_repair_pressure"],
+        ensure_ascii=False,
+    )
+    assert metadata["jue_wiki_repair_resolution"] == metadata[
+        "jue_wiki_repair_pressure"
+    ]
+    assert (
+        manager_response_contract_error(
+            prompt=prompt,
+            response=response,
+            actions=adjusted,
+            hold_decision={"summary": "액션 실행"},
+        )
+        == ""
+    )
+
+
+def test_validation_repair_action_metadata_accepts_applied_unfinished_repair_state() -> None:
+    prompt = {
+        "execution_gate": {
+            "status": "ok",
+            "execution": {"futures_orders_enabled": True},
+        },
+        "jue_wiki": {
+            "pages": [
+                {
+                    "page_id": "binance.risk.trading_validation",
+                    "effectiveness": {
+                        "status": "degraded",
+                        "reasons": [
+                            "status_mix:volatile_attack:active,futures:degraded",
+                            "samples:120",
+                        ],
+                    },
+                }
+            ]
+        },
+        "validation_repair": {
+            "version": "validation_repair_action_v1",
+            "scope": "binance",
+            "repair_item_count": 2,
+            "allowed_entry_postures": ["fractional_kelly_probe"],
+            "required_checks": [
+                "require_risk_budget_review",
+                "require_memory_contract_resolution",
+            ],
+            "scale_up_blocked": True,
+            "risk_budget_multiplier": 0.25,
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "resolution": "probe_waiting_block",
+                    "evidence_gap": (
+                        "패턴 prior와 비용/몬테카를로 검증 수리가 미완료라 "
+                        "즉시/증액 진입은 금지."
+                    ),
+                    "memory_contract": (
+                        "manager_contract_error.binance."
+                        "validation_repair_resolution_missing_from_model"
+                    ),
+                    "memory_contract_error": (
+                        "validation_repair_resolution_missing_from_model"
+                    ),
+                    "memory_contract_resolution": (
+                        "cite_memory_and_apply: 검증 수리 미완료를 적용해 "
+                        "0.25x 이하 초소형 waiting/probe만 생성하고 scale-up은 차단."
+                    ),
+                    "next_trigger": (
+                        "0.07156 이상 반등, spread<=10bps, 1x isolated 유지."
+                    ),
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "entry_style": "wait_for_price",
+                    "entry_price": 0.07156,
+                    "target_price": 0.06397,
+                    "stop_price": 0.07370,
+                    "qty": 121,
+                    "thesis": "검증 수리 상태를 적용한 초소형 대기 숏",
+                }
+            ],
+            "update_blocks": [],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    metadata = adjusted["create_blocks"][0]["metadata"]
+    assert metadata["validation_repair_resolution"]["symbol"] == "ESPUSDT"
+    assert metadata["jue_wiki_repair_pressure"]["degraded_wiki_page_ids"] == [
+        "binance.risk.trading_validation"
+    ]
+    assert (
+        manager_response_contract_error(
+            prompt=prompt,
+            response=response,
+            actions=adjusted,
+            hold_decision={"summary": "액션 실행"},
+        )
+        == ""
+    )
+
+
+def test_validation_repair_response_resolution_matches_block_id_only_update_action() -> None:
+    prompt = {
+        "execution_gate": {
+            "status": "ok",
+            "execution": {"futures_orders_enabled": True},
+        },
+        "blocks": [
+            {
+                "block_id": "chip-waiting",
+                "symbol": "CHIPUSDT",
+                "market": "futures",
+                "side": "long",
+                "qty_initial": 600.0,
+                "entry_price": 0.033983,
+            }
+        ],
+        "jue_wiki": {
+            "pages": [
+                {
+                    "page_id": "binance.risk.trading_validation",
+                    "effectiveness": {
+                        "status": "degraded",
+                        "reasons": ["validation repair evidence degraded"],
+                    },
+                }
+            ]
+        },
+        "validation_repair": {
+            "version": "validation_repair_action_v1",
+            "scope": "binance",
+            "repair_item_count": 1,
+            "allowed_entry_postures": ["fractional_kelly_probe"],
+            "scale_up_blocked": True,
+            "risk_budget_multiplier": 0.25,
+        },
+    }
+    response = {
+        "validation_repair_resolution": {
+            "resolved_candidates": [
+                {
+                    "symbol": "CHIPUSDT",
+                    "market": "futures",
+                    "resolution": "updated_price_geometry",
+                    "evidence_gap": "원 후보 손절폭을 검증 복구 한도 안으로 조정했다.",
+                    "next_trigger": "0.033983 이하 대기 진입",
+                }
+            ]
+        }
+    }
+
+    adjusted = BinanceBlockTrader._apply_validation_repair_to_actions(
+        {
+            "create_blocks": [],
+            "update_blocks": [
+                {
+                    "block_id": "chip-waiting",
+                    "entry_price": 0.033983,
+                    "target_price": 0.035219,
+                    "stop_price": 0.03296351,
+                }
+            ],
+            "close_blocks": [],
+            "pause_blocks": [],
+        },
+        validation_repair=prompt["validation_repair"],
+        manager_response=response,
+        prompt=prompt,
+    )
+
+    metadata = adjusted["update_blocks"][0]["metadata"]
+    assert metadata["validation_repair_resolution"]["symbol"] == "CHIPUSDT"
+    assert metadata["validation_repair_resolution"]["resolution"] == (
+        "updated_price_geometry"
+    )
+    assert metadata["jue_wiki_repair_resolution"] == metadata[
+        "jue_wiki_repair_pressure"
+    ]
+    assert (
+        manager_response_contract_error(
+            prompt=prompt,
+            response=response,
+            actions=adjusted,
+            hold_decision={"summary": "액션 실행"},
+        )
+        == ""
+    )
 
 
 def test_lane_scale_validation_repair_caps_binance_budget_and_checks_reward_risk() -> None:
@@ -7191,6 +9834,570 @@ def test_binance_manager_prompt_escalates_after_repeated_no_action_with_candidat
     assert "proactive_decision_pressure" in prompt["decision_inputs"]
 
 
+def test_binance_manager_prompt_counts_repair_resolution_errors_as_no_action_pressure(
+    tmp_path: Path,
+) -> None:
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(tmp_path, llm=llm)
+    for _ in range(2):
+        trader.repository.save_manager_run(
+            prompt={"decision_inputs": ["validation_repair"]},
+            response={
+                "validation_repair_resolution": {
+                    "resolved_candidates": [
+                        {
+                            "symbol": "ESPUSDT",
+                            "market": "futures",
+                            "resolution": "candidate_rejected",
+                            "evidence_gap": "original stop risk exceeded repair cap",
+                            "next_trigger": "tightened 3% stop repair probe",
+                        }
+                    ]
+                },
+                "hold_decision": {
+                    "summary": "ESPUSDT repairable but no block created",
+                    "watch_symbols": ["ESPUSDT"],
+                },
+            },
+            actions={
+                "create_blocks": [],
+                "update_blocks": [],
+                "close_blocks": [],
+                "pause_blocks": [],
+            },
+            status="error",
+            error_message="validation_repair_resolution_missing_from_model",
+        )
+    trader.crypto_research_provider = type(
+        "CryptoResearch",
+        (),
+        {
+            "latest_context": lambda self, **_kwargs: {
+                "status": "ok",
+                "candidates": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "horizon": "futures",
+                        "score": 81,
+                        "confidence": 0.58,
+                    }
+                ],
+                "items": [
+                    {
+                        "symbol": "ESPUSDT",
+                        "features": {
+                            "price": 0.07156,
+                            "bid_price": 0.07155,
+                            "ask_price": 0.07157,
+                            "derivatives_status": "available",
+                        },
+                    }
+                ],
+            }
+        },
+    )()
+
+    asyncio.run(trader.run_manager_once(candidates=[]))
+    pressure = llm.calls[0]["payload"]["proactive_decision_pressure"]
+
+    assert pressure["status"] == "action_required"
+    assert pressure["pressure_level"] == "high"
+    assert pressure["zero_action_streak"] == 2
+    assert pressure["previous_error_streak"] == 2
+
+
+def test_binance_manager_prompt_counts_activity_gap_contract_errors_as_binance_pressure(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    old_binance_at = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    old_order = trader.repository.add_order(
+        {
+            "block_id": "old_eth_futures_entry",
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "buy",
+            "qty": 0.1,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE block_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+            (old_binance_at, old_binance_at, old_order["id"]),
+        )
+
+    pressure = trader._proactive_decision_pressure(
+        previous_manager_runs=[
+            {
+                "status": "error",
+                "actions": {
+                    "create_blocks": [
+                        {
+                            "symbol": "KRW-SOL",
+                            "market": "upbit_spot",
+                            "side": "long",
+                        }
+                    ]
+                },
+                "response": {},
+                "error_message": "binance_activity_gap_resolution_missing_from_model",
+            },
+            {
+                "status": "error",
+                "actions": {"create_blocks": []},
+                "response": {},
+                "error_message": "binance_activity_gap_resolution_missing_from_model",
+            },
+        ],
+        executable_candidates=[
+            {
+                "symbol": "ETHUSDT",
+                "market": "futures",
+                "side": "long",
+                "score": 72,
+                "confidence": 0.59,
+                "calculated": {
+                    "entry_style": "wait_for_price",
+                    "entry_price": 3200.0,
+                    "target_price": 3300.0,
+                    "stop_price": 3160.0,
+                    "quote_budget_usdt": 20.0,
+                },
+            }
+        ],
+        growth_governor={"allow_new_blocks": True, "mode": "edge_rebuild"},
+        live_authority={"live_grade": "insufficient"},
+    )
+
+    assert pressure["zero_action_streak"] == 0
+    assert pressure["binance_zero_action_streak"] == 2
+    assert pressure["binance_previous_error_streak"] == 2
+    assert pressure["status"] == "action_required"
+    assert pressure["pressure_source"] == "binance_activity_gap"
+
+
+def test_binance_manager_prompt_exposes_binance_entry_activity_gap(
+    tmp_path: Path,
+) -> None:
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(tmp_path, llm=llm)
+    old_binance_at = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    recent_upbit_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    old_order = trader.repository.add_order(
+        {
+            "block_id": "old_btc_spot_entry",
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "side": "buy",
+            "qty": 0.1,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+        }
+    )
+    upbit_order = trader.repository.add_order(
+        {
+            "block_id": "recent_sol_upbit_entry",
+            "symbol": "KRW-SOL",
+            "market": "upbit_spot",
+            "side": "buy",
+            "qty": 0.05,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE block_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+            (old_binance_at, old_binance_at, old_order["id"]),
+        )
+        conn.execute(
+            "UPDATE block_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+            (recent_upbit_at, recent_upbit_at, upbit_order["id"]),
+        )
+    trader.crypto_research_provider = type(
+        "CryptoResearch",
+        (),
+        {
+            "latest_context": lambda self, **_kwargs: {
+                "status": "ok",
+                "candidates": [
+                    {
+                        "symbol": "KRW-SOL",
+                        "market": "upbit_spot",
+                        "side": "long",
+                        "horizon": "short",
+                        "score": 78,
+                        "confidence": 0.58,
+                        "calculated": {
+                            "entry_style": "wait_for_price",
+                            "entry_price_krw": 117_279.4,
+                            "target_price_krw": 119_155.87,
+                            "stop_price_krw": 116_341.17,
+                            "quote_budget_krw": 10_000,
+                        },
+                    },
+                    {
+                        "symbol": "UNIUSDT",
+                        "market": "futures",
+                        "side": "long",
+                        "horizon": "futures",
+                        "score": 76,
+                        "confidence": 0.58,
+                        "calculated": {
+                            "entry_style": "wait_for_price",
+                            "entry_price": 3.3135,
+                            "target_price": 3.4679,
+                            "stop_price": 3.2363,
+                            "quote_budget_usdt": 20.0,
+                        },
+                    },
+                ],
+                "items": [
+                    {
+                        "symbol": "UNIUSDT",
+                        "features": {
+                            "price": 3.32,
+                            "bid_price": 3.313,
+                            "ask_price": 3.314,
+                            "derivatives_status": "available",
+                        },
+                    }
+                ],
+            }
+        },
+    )()
+
+    asyncio.run(trader.run_manager_once(candidates=[]))
+    pressure = llm.calls[0]["payload"]["proactive_decision_pressure"]
+
+    gap = pressure["binance_market_activity_gap"]
+    assert gap["status"] == "stale_binance_entries"
+    assert gap["latest_binance_entry_market"] == "spot"
+    assert gap["latest_upbit_entry_at"] == recent_upbit_at
+    assert gap["binance_candidate_count"] == 2
+    assert gap["candidate_markets"] == ["futures", "spot"]
+    assert gap["candidate_symbols"] == ["UNIUSDT"]
+    assert "do not bypass validation gates" in gap["manager_instruction"]
+
+
+def test_binance_activity_gap_uses_candidates_beyond_pressure_top_limit(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    old_binance_at = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    old_order = trader.repository.add_order(
+        {
+            "block_id": "old_eth_futures_entry",
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "buy",
+            "qty": 0.1,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE block_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+            (old_binance_at, old_binance_at, old_order["id"]),
+        )
+    upbit_candidates = [
+        {
+            "symbol": f"KRW-UPBIT{index}",
+            "market": "upbit_spot",
+            "side": "long",
+            "score": 80 - index,
+            "confidence": 0.6,
+            "calculated": {
+                "entry_style": "wait_for_price",
+                "entry_price_krw": 1000 + index,
+                "target_price_krw": 1030 + index,
+                "stop_price_krw": 990 + index,
+                "quote_budget_krw": 10_000,
+            },
+        }
+        for index in range(8)
+    ]
+    candidates = [
+        *upbit_candidates,
+        {
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "long",
+            "score": 70,
+            "confidence": 0.58,
+            "calculated": {
+                "entry_style": "wait_for_price",
+                "entry_price": 3200.0,
+                "target_price": 3300.0,
+                "stop_price": 3160.0,
+                "quote_budget_usdt": 20.0,
+            },
+        },
+    ]
+
+    pressure = trader._proactive_decision_pressure(
+        previous_manager_runs=[
+            {"status": "ok", "actions": {"create_blocks": []}, "response": {}},
+            {"status": "ok", "actions": {"create_blocks": []}, "response": {}},
+        ],
+        executable_candidates=candidates,
+        growth_governor={"allow_new_blocks": True, "mode": "edge_rebuild"},
+        live_authority={"live_grade": "insufficient"},
+    )
+
+    assert [row["market"] for row in pressure["top_candidates"]] == ["upbit_spot"] * 8
+    gap = pressure["binance_market_activity_gap"]
+    assert gap["status"] == "stale_binance_entries"
+    assert gap["candidate_symbols"] == ["ETHUSDT"]
+    assert gap["candidate_markets"] == ["futures"]
+    assert gap["candidate_snapshots"] == [
+        {
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "long",
+            "confidence": 0.58,
+            "entry_style": "wait_for_price",
+            "entry_price": 3200.0,
+            "target_price": 3300.0,
+            "stop_price": 3160.0,
+            "quote_budget_usdt": 20.0,
+        }
+    ]
+
+
+def test_binance_activity_gap_uses_binance_candidate_when_pressure_candidates_empty(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    old_binance_at = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    old_order = trader.repository.add_order(
+        {
+            "block_id": "old_eth_futures_entry",
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "buy",
+            "qty": 0.1,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE block_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+            (old_binance_at, old_binance_at, old_order["id"]),
+        )
+
+    pressure = trader._proactive_decision_pressure(
+        previous_manager_runs=[
+            {"status": "ok", "actions": {"create_blocks": []}, "response": {}},
+            {"status": "ok", "actions": {"create_blocks": []}, "response": {}},
+        ],
+        executable_candidates=[
+            *[
+                {
+                    "symbol": f"KRW-UPBIT{index}",
+                    "market": "upbit_spot",
+                    "side": "long",
+                    "score": 80 - index,
+                    "confidence": 0.6,
+                }
+                for index in range(8)
+            ],
+            {
+                "symbol": "ETHUSDT",
+                "market": "futures",
+                "side": "long",
+                "score": 70,
+                "confidence": 0.58,
+            }
+        ],
+        growth_governor={"allow_new_blocks": True, "mode": "edge_rebuild"},
+        live_authority={"live_grade": "insufficient"},
+    )
+
+    assert pressure["status"] == "action_required"
+    assert pressure["pressure_source"] == "binance_activity_gap"
+    assert pressure["candidate_count"] == 0
+    assert pressure["binance_market_activity_gap"]["candidate_symbols"] == ["ETHUSDT"]
+
+
+def test_manager_binance_action_count_requires_explicit_binance_evidence() -> None:
+    count = binance_block_trader_module._manager_binance_action_item_count
+
+    assert count({"create_blocks": [{"symbol": "KRW-SOL"}]}) == 0
+    assert count({"close_blocks": [{"block_id": "upbit_entry"}]}) == 0
+    assert count({"pause_blocks": [{"symbol": "SOLUSDT", "market": "unknown"}]}) == 0
+    assert count({"create_blocks": [{"symbol": "SOLUSDT"}]}) == 1
+    assert count({"update_blocks": [{"block_id": "binance_entry", "market": "futures"}]}) == 1
+    assert count({"close_blocks": [{"block_id": "binance_entry", "market": "futures"}]}) == 0
+    assert count({"pause_blocks": [{"block_id": "binance_entry", "market": "futures"}]}) == 0
+
+
+def test_binance_activity_gap_ignores_upbit_only_manager_actions(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    old_binance_at = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    old_order = trader.repository.add_order(
+        {
+            "block_id": "old_eth_futures_entry",
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "buy",
+            "qty": 0.1,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE block_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+            (old_binance_at, old_binance_at, old_order["id"]),
+        )
+
+    pressure = trader._proactive_decision_pressure(
+        previous_manager_runs=[
+            {
+                "status": "ok",
+                "actions": {
+                    "create_blocks": [
+                        {
+                            "symbol": "KRW-SOL",
+                            "side": "long",
+                        }
+                    ]
+                },
+                "response": {},
+            },
+            {"status": "ok", "actions": {"create_blocks": []}, "response": {}},
+        ],
+        executable_candidates=[
+            {
+                "symbol": "ETHUSDT",
+                "market": "futures",
+                "side": "long",
+                "score": 72,
+                "confidence": 0.59,
+                "calculated": {
+                    "entry_style": "wait_for_price",
+                    "entry_price": 3200.0,
+                    "target_price": 3300.0,
+                    "stop_price": 3160.0,
+                    "quote_budget_usdt": 20.0,
+                },
+            }
+        ],
+        growth_governor={"allow_new_blocks": True, "mode": "edge_rebuild"},
+        live_authority={"live_grade": "insufficient"},
+    )
+
+    assert pressure["zero_action_streak"] == 0
+    assert pressure["binance_zero_action_streak"] == 2
+    assert pressure["status"] == "action_required"
+    assert pressure["pressure_level"] == "high"
+    assert pressure["pressure_source"] == "binance_activity_gap"
+    gap = pressure["binance_market_activity_gap"]
+    assert gap["status"] == "stale_binance_entries"
+    assert gap["candidate_symbols"] == ["ETHUSDT"]
+
+
+def test_binance_activity_gap_ignores_unknown_explicit_candidate_market(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+
+    gap = trader._binance_market_activity_gap(
+        [
+            {
+                "symbol": "FAKEUSDT",
+                "market": "unknown",
+                "side": "long",
+                "score": 99,
+                "confidence": 0.99,
+            }
+        ]
+    )
+
+    assert gap == {}
+
+
+def test_binance_close_or_pause_does_not_reset_activity_gap_pressure(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path)
+    old_binance_at = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    old_order = trader.repository.add_order(
+        {
+            "block_id": "old_eth_futures_entry",
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "buy",
+            "qty": 0.1,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE block_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+            (old_binance_at, old_binance_at, old_order["id"]),
+        )
+
+    pressure = trader._proactive_decision_pressure(
+        previous_manager_runs=[
+            {
+                "status": "ok",
+                "actions": {
+                    "close_blocks": [
+                        {
+                            "block_id": "stopped_btc",
+                            "symbol": "BTCUSDT",
+                            "market": "futures",
+                        }
+                    ]
+                },
+                "response": {},
+            },
+            {"status": "ok", "actions": {"pause_blocks": []}, "response": {}},
+        ],
+        executable_candidates=[
+            {
+                "symbol": "ETHUSDT",
+                "market": "futures",
+                "side": "long",
+                "score": 72,
+                "confidence": 0.59,
+                "calculated": {
+                    "entry_style": "wait_for_price",
+                    "entry_price": 3200.0,
+                    "target_price": 3300.0,
+                    "stop_price": 3160.0,
+                    "quote_budget_usdt": 20.0,
+                },
+            }
+        ],
+        growth_governor={"allow_new_blocks": True, "mode": "edge_rebuild"},
+        live_authority={"live_grade": "insufficient"},
+    )
+
+    assert pressure["zero_action_streak"] == 0
+    assert pressure["binance_zero_action_streak"] == 2
+    assert pressure["status"] == "action_required"
+    assert pressure["pressure_source"] == "binance_activity_gap"
+
+
 def test_binance_pressure_candidates_drop_upbit_rows_without_krw_price() -> None:
     candidates = [
         {
@@ -7228,6 +10435,225 @@ def test_binance_pressure_candidates_drop_upbit_rows_without_krw_price() -> None
     assert rows[0]["entry_price"] == 4_200_000
     assert rows[0]["target_price"] == 4_300_000
     assert rows[0]["stop_price"] == 4_100_000
+
+
+def test_binance_pressure_candidates_keep_upbit_rows_with_generic_krw_prices() -> None:
+    candidates = [
+        {
+            "symbol": "KRW-TRX",
+            "market": "upbit_spot",
+            "side": "long",
+            "score": 67,
+            "confidence": 0.54,
+            "entry_price": 493.94,
+            "target_price": 503.13,
+            "stop_price": 488.01,
+            "spread_bps": 20.18,
+            "book_fresh": True,
+            "calculated": {
+                "entry_style": "wait_for_price",
+                "pattern_live_crosscheck": {
+                    "recommended_entry_mode": "research_only",
+                    "status": "no_pattern_prior",
+                },
+            },
+        }
+    ]
+
+    rows = BinanceBlockTrader._compact_pressure_candidates(candidates, limit=8)
+
+    assert [row["symbol"] for row in rows] == ["KRW-TRX"]
+    assert rows[0]["market"] == "upbit_spot"
+    assert rows[0]["entry_price"] == pytest.approx(493.94)
+    assert rows[0]["target_price"] == pytest.approx(503.13)
+    assert rows[0]["stop_price"] == pytest.approx(488.01)
+    assert rows[0]["spread_bps"] == pytest.approx(20.18)
+    assert rows[0]["book_fresh"] is True
+
+
+def test_binance_pressure_candidates_preserve_execution_evidence() -> None:
+    candidates = [
+        {
+            "symbol": "CHIPUSDT",
+            "market": "futures",
+            "side": "long",
+            "score": 73,
+            "confidence": 0.53,
+            "spread_bps": 2.74,
+            "book_fresh": True,
+            "calculated": {
+                "entry_style": "wait_for_price",
+                "entry_price": 0.03608,
+                "target_price": 0.036657,
+                "stop_price": 0.035791,
+                "quote_budget_usdt": 205.28,
+                "pattern_live_crosscheck": {
+                    "funding_rate": -0.00003876,
+                    "recommended_entry_mode": "wait_for_price",
+                    "status": "wait",
+                },
+            },
+        },
+        {
+            "symbol": "KRW-SOL",
+            "market": "upbit_spot",
+            "side": "long",
+            "score": 78,
+            "confidence": 0.58,
+            "calculated": {
+                "entry_style": "wait_for_price",
+                "entry_price_krw": 117_903.09,
+                "target_price_krw": 119_789.54,
+                "stop_price_krw": 116_959.86,
+                "quote_budget_krw": 10_000,
+                "market_inputs": {
+                    "spread_bps": 12.5,
+                    "book_fresh": True,
+                },
+            },
+        },
+    ]
+
+    rows = BinanceBlockTrader._compact_pressure_candidates(candidates, limit=8)
+
+    futures = rows[0]
+    upbit = rows[1]
+    assert futures["quote_budget_usdt"] == pytest.approx(205.28)
+    assert futures["spread_bps"] == pytest.approx(2.74)
+    assert futures["book_fresh"] is True
+    assert futures["funding_rate"] == pytest.approx(-0.00003876)
+    assert futures["recommended_entry_mode"] == "wait_for_price"
+    assert futures["pattern_status"] == "wait"
+    assert upbit["quote_budget_krw"] == pytest.approx(10_000)
+    assert upbit["spread_bps"] == pytest.approx(12.5)
+    assert upbit["book_fresh"] is True
+
+
+def test_binance_pressure_candidates_include_validation_repair_probe_design() -> None:
+    candidates = [
+        {
+            "symbol": "ESPUSDT",
+            "market": "futures",
+            "side": "short",
+            "lane": "volatile_attack",
+            "score": 81.103,
+            "confidence": 0.58,
+            "calculated": {
+                "entry_style": "wait_for_price",
+                "entry_price": 0.07156,
+                "target_price": 0.06397,
+                "stop_price": 0.075262,
+            },
+        }
+    ]
+
+    rows = BinanceBlockTrader._compact_pressure_candidates(
+        candidates,
+        limit=8,
+        validation_repair={
+            "status": "needs_repair",
+            "repair_item_count": 2,
+            "max_stop_risk_pct": 3.0,
+            "min_reward_risk": 2.0,
+            "risk_budget_multiplier": 0.25,
+        },
+    )
+
+    design = rows[0]["validation_repair_probe_design"]
+    assert design["resolution"] == "probe_waiting_block"
+    assert design["entry_price"] == pytest.approx(0.07156)
+    assert design["target_price"] == pytest.approx(0.06397)
+    assert design["stop_price"] == pytest.approx(0.0737068)
+    assert design["max_stop_risk_pct"] == pytest.approx(3.0)
+    assert design["reward_risk"] >= 2.0
+    assert design["risk_budget_multiplier"] == pytest.approx(0.25)
+    assert design["min_executable_notional_usdt"] == pytest.approx(20.0)
+    assert design["min_executable_qty"] == pytest.approx(20.0 / 0.07156)
+
+
+def test_binance_pressure_candidates_include_entry_trigger_repair_probe_design() -> None:
+    candidates = [
+        {
+            "symbol": "XPLUSDT",
+            "market": "futures",
+            "side": "short",
+            "lane": "futures",
+            "score": 66.0,
+            "confidence": 0.5,
+            "calculated": {
+                "entry_style": "wait_for_price",
+                "entry_price": 0.094454,
+                "target_price": 0.091904,
+                "stop_price": 0.096154,
+                "reward_risk": 1.5,
+            },
+        }
+    ]
+
+    rows = BinanceBlockTrader._compact_pressure_candidates(
+        candidates,
+        limit=8,
+        validation_repair={
+            "status": "needs_repair",
+            "repair_item_count": 2,
+            "max_stop_risk_pct": 3.0,
+            "min_reward_risk": 2.0,
+            "risk_budget_multiplier": 0.25,
+        },
+    )
+
+    design = rows[0]["validation_repair_probe_design"]
+    assert design["resolution"] == "probe_waiting_block"
+    assert design["entry_price"] == pytest.approx(0.09473733)
+    assert design["entry_trigger_price"] == pytest.approx(0.09473733)
+    assert design["entry_trigger_operator"] == ">="
+    assert design["target_price"] == pytest.approx(0.091904)
+    assert design["stop_price"] == pytest.approx(0.096154)
+    assert design["original_entry_price"] == pytest.approx(0.094454)
+    assert design["reward_risk"] >= 2.0
+    assert design["stop_risk_pct"] <= 3.0
+    assert design["min_executable_notional_usdt"] == pytest.approx(20.0)
+    assert design["min_executable_qty"] == pytest.approx(20.0 / 0.09473733)
+
+
+def test_binance_pressure_candidates_include_upbit_validation_repair_probe_floor() -> None:
+    candidates = [
+        {
+            "symbol": "KRW-ETH",
+            "market": "upbit_spot",
+            "side": "long",
+            "lane": "upbit_spot:long",
+            "score": 80.0,
+            "confidence": 0.6,
+            "calculated": {
+                "entry_style": "wait_for_price",
+                "entry_price_krw": 4_200_000,
+                "target_price_krw": 4_500_000,
+                "stop_price_krw": 4_000_000,
+                "quote_budget_krw": 50_000,
+            },
+        }
+    ]
+
+    rows = BinanceBlockTrader._compact_pressure_candidates(
+        candidates,
+        limit=8,
+        validation_repair={
+            "status": "needs_repair",
+            "repair_item_count": 1,
+            "max_stop_risk_pct": 3.0,
+            "min_reward_risk": 2.0,
+            "risk_budget_multiplier": 0.25,
+        },
+    )
+
+    design = rows[0]["validation_repair_probe_design"]
+    assert design["resolution"] == "probe_waiting_block"
+    assert design["min_executable_notional_krw"] == pytest.approx(10_000.0)
+    assert design["min_executable_qty"] == pytest.approx(
+        10_000.0 / 4_200_000,
+        abs=1e-8,
+    )
 
 
 def test_manager_errors_when_lane_review_is_missing_from_model(
@@ -7337,6 +10763,93 @@ def test_manager_rejects_near_duplicate_same_symbol_price_structure(
         "bnb_futures_BTCUSDT_"
     )
     assert len(trader.list_blocks(include_closed=True)) == 1
+
+
+def test_manager_ignores_stale_waiting_entry_for_near_duplicate_create(
+    tmp_path: Path,
+) -> None:
+    llm = _FakeLLM(
+        {
+            "create_blocks": [
+                {
+                    "symbol": "AAVEUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "horizon": "futures",
+                    "entry_style": "wait_for_price",
+                    "entry_trigger_price": 86.1,
+                    "entry_trigger_operator": "<=",
+                    "qty": 0.25,
+                    "entry_price": 86.1,
+                    "target_price": 88.2,
+                    "stop_price": 85.0,
+                    "liquidation_price": 60.0,
+                    "confidence": 0.86,
+                    "margin_type": "isolated",
+                    "leverage": 1,
+                    "thesis": "Fresh AAVE waiting probe after stale one aged out.",
+                }
+            ]
+        }
+    )
+    trader = _trader(tmp_path, llm=llm)
+    trader.config.waiting_entry_max_age_sec = 48 * 60 * 60
+    stale_created_at = (datetime.now(timezone.utc) - timedelta(hours=60)).isoformat()
+    stale = trader.repository.create_block(
+        {
+            "block_id": "stale_aave_duplicate_waiting",
+            "symbol": "AAVEUSDT",
+            "market": "futures",
+            "side": "long",
+            "horizon": "futures",
+            "qty_initial": 0.24,
+            "qty_open": 0.0,
+            "entry_price": 86.087,
+            "target_price": 88.153,
+            "stop_price": 85.054,
+            "liquidation_price": 60.0,
+            "margin_type": "isolated",
+            "leverage": 1,
+            "status": "proposed",
+            "created_at": stale_created_at,
+            "updated_at": stale_created_at,
+            "thesis": "Stale waiting entry should not block fresh manager create.",
+            "metadata": {
+                "horizon": "futures",
+                "entry_style": "wait_for_price",
+                "entry_trigger_operator": "<=",
+                "entry_trigger_price": 86.087,
+            },
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE blocks SET created_at = ?, updated_at = ? WHERE block_id = ?",
+            (stale_created_at, stale_created_at, stale["block_id"]),
+        )
+
+    result = asyncio.run(
+        trader.run_manager_once(
+            candidates=[
+                {
+                    "symbol": "AAVEUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "horizon": "futures",
+                    "stance": "long_watch",
+                    "confidence": 0.86,
+                    "price": 86.0,
+                }
+            ]
+        )
+    )
+
+    created = result["applied"]["created"][0]
+    assert created["status"] != "rejected"
+    assert not str(created.get("reason") or "").startswith("near_duplicate_block")
+    blocks = trader.list_blocks(include_closed=True)
+    assert len(blocks) == 2
+    assert trader.get_block(stale["block_id"])["status"] == "proposed"
 
 
 def test_manager_rejects_near_duplicate_calculated_price_plan_action(
@@ -7560,6 +11073,117 @@ def test_binance_manager_prompt_surfaces_near_duplicate_active_blocks(
     assert "avoid adding" in duplicate_exposure["instruction"]
 
 
+def test_binance_manager_prompt_omits_inactive_error_blocks(
+    tmp_path: Path,
+) -> None:
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(tmp_path, llm=llm)
+    inactive = trader.create_block(
+        {
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "long",
+            "qty": 0.02,
+            "qty_open": 0.0,
+            "entry_price": 100.0,
+            "target_price": 104.0,
+            "stop_price": 98.0,
+            "liquidation_price": 80.0,
+            "margin_type": "isolated",
+            "leverage": 1,
+            "status": "error",
+            "risk_note": "entry order expired before fill",
+        }
+    )
+    active = trader.create_block(
+        {
+            "symbol": "BTCUSDT",
+            "market": "futures",
+            "side": "short",
+            "qty": 0.02,
+            "qty_open": 0.02,
+            "entry_price": 100.0,
+            "target_price": 98.0,
+            "stop_price": 101.5,
+            "liquidation_price": 150.0,
+            "margin_type": "isolated",
+            "leverage": 1,
+            "status": "open",
+            "thesis": "live exposure that should remain visible",
+        }
+    )
+
+    asyncio.run(trader.run_manager_once(candidates=[{"symbol": "SOLUSDT"}]))
+    prompt = llm.calls[0]["payload"]
+
+    prompt_block_ids = {
+        str(row.get("block_id") or "")
+        for row in prompt["blocks"]
+        if isinstance(row, dict)
+    }
+    assert active["block_id"] in prompt_block_ids
+    assert inactive["block_id"] not in prompt_block_ids
+    assert prompt["execution_gate"]["active_block_count"] == 1
+
+
+def test_binance_manager_prompt_omits_inactive_paused_blocks(
+    tmp_path: Path,
+) -> None:
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(tmp_path, llm=llm)
+    inactive = trader.create_block(
+        {
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "long",
+            "qty": 0.2,
+            "qty_open": 0.0,
+            "entry_price": 100.0,
+            "target_price": 104.0,
+            "stop_price": 98.0,
+            "liquidation_price": 80.0,
+            "margin_type": "isolated",
+            "leverage": 1,
+            "status": "paused",
+            "risk_note": "validation repair paused before entry fill",
+            "metadata": {
+                "entry_style": "wait_for_price",
+                "entry_trigger_price": 100.0,
+                "pause_reason": "validation_repair",
+            },
+        }
+    )
+    active = trader.create_block(
+        {
+            "symbol": "BTCUSDT",
+            "market": "futures",
+            "side": "short",
+            "qty": 0.02,
+            "qty_open": 0.02,
+            "entry_price": 100.0,
+            "target_price": 98.0,
+            "stop_price": 101.5,
+            "liquidation_price": 150.0,
+            "margin_type": "isolated",
+            "leverage": 1,
+            "status": "paused",
+            "opened_at": "2026-07-08T00:00:00+00:00",
+            "thesis": "paused live exposure that should remain visible",
+        }
+    )
+
+    asyncio.run(trader.run_manager_once(candidates=[{"symbol": "SOLUSDT"}]))
+    prompt = llm.calls[0]["payload"]
+
+    prompt_block_ids = {
+        str(row.get("block_id") or "")
+        for row in prompt["blocks"]
+        if isinstance(row, dict)
+    }
+    assert active["block_id"] in prompt_block_ids
+    assert inactive["block_id"] not in prompt_block_ids
+
+
 def test_binance_manager_prompt_requires_korean_user_facing_notes(tmp_path: Path) -> None:
     llm = _FakeLLM({"create_blocks": []})
     trader = _trader(tmp_path, llm=llm)
@@ -7673,8 +11297,13 @@ def test_binance_manager_prompt_compacts_large_futures_position_risk(
         "nonzero_count": 1,
         "visible_count": 1,
         "omitted_zero_count": 120,
+        "dust_count": 0,
     }
     assert account["futures_position_risk"][0]["symbol"] == "SUIUSDT"
+    assert account["futures_position_risk"][0]["management_status"] == "open_position"
+    assert account["futures_position_risk"][0]["position_notional_usdt"] == pytest.approx(
+        10.85
+    )
     assert "raw" not in rendered
     assert "DROP_ME" not in rendered
     assert len(rendered) < 6000
@@ -8282,6 +11911,57 @@ def test_validation_repair_qty_scale_keeps_minimum_executable_probe_notional() -
         "minimum_executable_notional_floor"
     )
     assert row["qty"] * row["entry_price"] >= 20.0 - 1e-9
+
+
+def test_validation_repair_qty_scale_lifts_too_small_futures_probe_notional() -> None:
+    row = {
+        "symbol": "XAUTUSDT",
+        "market": "futures",
+        "side": "short",
+        "qty": 0.0005,
+        "entry_price": 4117.22,
+        "entry_trigger_price": 4117.22,
+        "target_price": 3980.49,
+        "stop_price": 4183.92,
+    }
+    repair = {
+        "status": "needs_repair",
+        "scale_up_blocked": True,
+        "risk_budget_multiplier": 0.25,
+        "allowed_entry_postures": ["fractional_kelly_probe"],
+        "sizing_policies": ["fractional_kelly_probe_only"],
+    }
+
+    enforcement = BinanceBlockTrader._validation_repair_create_enforcement(row, repair)
+
+    adjustment = next(item for item in enforcement["adjustments"] if item["field"] == "qty")
+    assert adjustment["floor_reason"] == "minimum_executable_notional_floor"
+    assert row["qty"] * row["entry_price"] >= 20.0 - 1e-9
+
+
+def test_validation_repair_upbit_qty_scale_lifts_to_minimum_probe_notional() -> None:
+    row = {
+        "symbol": "KRW-SOL",
+        "market": "upbit_spot",
+        "side": "long",
+        "qty": 0.05,
+        "entry_price": 120_967.75,
+        "target_price": 122_903.23,
+        "stop_price": 120_000.01,
+    }
+    repair = {
+        "status": "needs_repair",
+        "scale_up_blocked": True,
+        "risk_budget_multiplier": 0.25,
+        "allowed_entry_postures": ["fractional_kelly_probe"],
+        "sizing_policies": ["fractional_kelly_probe_only"],
+    }
+
+    enforcement = BinanceBlockTrader._validation_repair_create_enforcement(row, repair)
+
+    adjustment = next(item for item in enforcement["adjustments"] if item["field"] == "qty")
+    assert adjustment["floor_reason"] == "minimum_executable_notional_floor"
+    assert row["qty"] * row["entry_price"] >= 10_000.0 - 1e-9
 
 
 def test_lane_authority_scale_keeps_validation_probe_above_minimum_notional() -> None:
@@ -9367,6 +13047,65 @@ def test_manager_prompt_exposes_exploratory_waiting_entry_policy_after_losses(
     assert policy["waiting_entry_policy"]["max_new_waiting_blocks_per_run"] == 1
 
 
+def test_manager_prompt_candidate_exposes_waiting_entry_gate_hint_after_losses(
+    tmp_path: Path,
+) -> None:
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(tmp_path, llm=llm)
+    for index in range(5):
+        trader.repository.save_performance_reflection(
+            {
+                "block_id": f"loss-{index}",
+                "symbol": "ESPUSDT",
+                "market": "futures",
+                "side": "short",
+                "entry_price": 0.071,
+                "exit_price": 0.073,
+                "stop_price": 0.073,
+                "target_price": 0.067,
+                "r_multiple": -1.0,
+                "lesson": {"result": "negative"},
+            }
+        )
+
+    asyncio.run(
+        trader.run_manager_once(
+            candidates=[
+                {
+                    "symbol": "ESPUSDT",
+                    "market": "futures",
+                    "side": "short",
+                    "horizon": "futures",
+                    "stance": "short_watch",
+                    "confidence": 0.58,
+                    "entry_price": 0.07156,
+                    "target_price": 0.06397,
+                    "stop_price": 0.075262,
+                    "quote_budget_usdt": 8.68,
+                    "calculated": {
+                        "entry_style": "wait_for_price",
+                        "entry_price": 0.07156,
+                        "target_price": 0.06397,
+                        "stop_price": 0.075262,
+                        "quote_budget_usdt": 8.68,
+                        "reward_risk": 2.0,
+                    },
+                }
+            ]
+        )
+    )
+
+    prompt_candidate = llm.calls[0]["payload"]["candidates"][0]
+    hint = prompt_candidate["waiting_entry_gate_hint"]
+
+    assert hint["status"] == "waiting_entry_base_gate_available"
+    assert hint["candidate_confidence"] == pytest.approx(0.58)
+    assert hint["immediate_min_confidence"] == pytest.approx(0.63)
+    assert hint["waiting_entry_min_confidence"] == pytest.approx(0.58)
+    assert hint["requires_price_trigger"] is True
+    assert "waiting-entry" in hint["instruction"]
+
+
 def test_manager_prompt_marks_negative_cost_drag_lane_as_cooldown(
     tmp_path: Path,
 ) -> None:
@@ -9969,6 +13708,94 @@ def test_manager_caps_create_budget_to_selected_candidate_budget(
     assert block["metadata"]["candidate_budget_cap"]["from_quote_budget_usdt"] == pytest.approx(200.0)
     assert block["metadata"]["candidate_budget_cap"]["to_quote_budget_usdt"] == pytest.approx(35.0)
     assert block["metadata"]["candidate_budget_cap"]["performance_budget_multiplier"] == pytest.approx(0.35)
+
+
+def test_manager_preserves_candidate_liquidation_for_futures_waiting_entry(
+    tmp_path: Path,
+) -> None:
+    adapter = _FakeBinance()
+    adapter.account = {
+        "status": "ok",
+        "spot_cash_usdt": 5_000.0,
+        "futures_cash_usdt": 5_000.0,
+        "positions": [],
+    }
+    trader = _trader(tmp_path, adapter=adapter, enabled=True, execute_futures=True)
+    trader.live_authority_provider = lambda: {
+        "status": "ok",
+        "live_grade": "qualified",
+        "allow_scale_up": True,
+        "max_budget_multiplier": 1.0,
+        "scorecard_count": 20,
+        "validation_gate": {"status": "clear", "readiness": "scale_ready"},
+    }
+    trader._last_account_snapshot = _normalize_test_account(trader, adapter.account)
+    trader._last_live_authority_context = trader.live_authority_provider()
+    trader._last_manager_entry_gate_policy = trader._entry_gate_policy(
+        performance={},
+        memory_context={},
+    )
+    trader._runtime_market_universe = {"spot": [], "futures": ["BTCUSDT"], "upbit_spot": []}
+    trader._last_manager_candidate_index = trader._manager_candidate_index(
+        [
+            {
+                "symbol": "BTCUSDT",
+                "market": "futures",
+                "side": "short",
+                "horizon": "futures",
+                "stance": "short",
+                "confidence": 0.88,
+                "entry_price": 50_000.0,
+                "target_price": 48_000.0,
+                "stop_price": 51_000.0,
+                "quote_budget_usdt": 35.0,
+                "calculated": {
+                    "entry_price": 50_000.0,
+                    "target_price": 48_000.0,
+                    "stop_price": 51_000.0,
+                    "quote_budget_usdt": 35.0,
+                    "margin_type": "isolated",
+                    "leverage": 1,
+                    "liquidation_price": 67_500.0,
+                },
+            }
+        ]
+    )
+
+    applied = asyncio.run(
+        trader._apply_manager_actions(
+            {
+                "create_blocks": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "market": "futures",
+                        "side": "short",
+                        "horizon": "futures",
+                        "quote_budget_usdt": 35.0,
+                        "entry_style": "wait_for_price",
+                        "entry_trigger_price": 50_000.0,
+                        "entry_trigger_operator": ">=",
+                        "entry_price": 50_000.0,
+                        "target_price": 48_000.0,
+                        "stop_price": 51_000.0,
+                        "confidence": 0.88,
+                        "thesis": "LLM omitted liquidation, candidate plan has it.",
+                    }
+                ],
+                "update_blocks": [],
+                "close_blocks": [],
+                "pause_blocks": [],
+            },
+            manager_run_id=1,
+        )
+    )
+
+    assert applied["created"][0]["status"] == "waiting_entry"
+    block = trader.list_blocks(include_closed=False)[0]
+    assert block["liquidation_price"] == pytest.approx(67_500.0)
+    assert block["metadata"]["candidate_execution_plan"]["liquidation_price"] == pytest.approx(
+        67_500.0
+    )
 
 
 def test_risk_sizer_cannot_exceed_candidate_budget_cap(
@@ -10784,6 +14611,60 @@ def test_manager_waiting_entry_uses_output_confidence_when_candidate_is_conserva
     candidate_gate = block["metadata"]["entry_gate"]["candidate"]
     assert candidate_gate["confidence"] == pytest.approx(0.64)
     assert candidate_gate["confidence_source"] == "manager_output"
+
+
+def test_manager_rejects_spoofed_validation_repair_resolution_confidence_relaxation(
+    tmp_path: Path,
+) -> None:
+    llm = _FakeLLM(
+        {
+            "create_blocks": [
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "horizon": "futures",
+                    "confidence": 0.45,
+                    "qty": 0.01,
+                    "entry_style": "wait_for_price",
+                    "entry_trigger_price": 50_000.0,
+                    "entry_trigger_operator": "<=",
+                    "entry_price": 50_000.0,
+                    "target_price": 51_500.0,
+                    "stop_price": 49_500.0,
+                    "liquidation_price": 35_000.0,
+                    "metadata": {
+                        "validation_repair_resolution": {
+                            "resolution": "probe_waiting_block",
+                        },
+                    },
+                }
+            ]
+        }
+    )
+    trader = _trader(tmp_path, llm=llm)
+
+    result = asyncio.run(
+        trader.run_manager_once(
+            candidates=[
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "futures",
+                    "side": "long",
+                    "horizon": "futures",
+                    "stance": "long_watch",
+                    "confidence": 0.45,
+                    "price": 50_000.0,
+                }
+            ]
+        )
+    )
+
+    created = result["applied"]["created"][0]
+    assert created["status"] == "rejected"
+    assert created["reason"].startswith("entry_gate_rejected:")
+    assert "candidate_confidence_too_low" in created["reason"]
+    assert trader.list_blocks() == []
 
 
 def test_manager_prompt_includes_crypto_pattern_context(tmp_path: Path) -> None:
@@ -12703,6 +16584,65 @@ def test_live_spot_exit_retries_with_fresh_lower_balance_after_insufficient_bala
     assert updated["qty_open"] == 0.0
     assert updated["force_exit_requested"] is False
     assert events[0]["event_type"] == "insufficient_balance_exit_retry"
+
+
+def test_live_spot_exit_reconciles_missing_asset_after_insufficient_balance_retry(
+    tmp_path: Path,
+) -> None:
+    adapter = _ShrinkingBalanceExitBinance()
+    adapter.accounts = [
+        {
+            "status": "ok",
+            "spot_assets": [
+                {
+                    "asset": "BTC",
+                    "symbol": "BTCUSDT",
+                    "qty": 0.063,
+                    "available": 0.063,
+                    "locked": 0.0,
+                }
+            ],
+        },
+        {
+            "status": "ok",
+            "spot_assets": [],
+        },
+    ]
+    trader = _trader(tmp_path, adapter=adapter, execute_spot=True, enabled=True)
+    block = trader.create_block(
+        {
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "qty": 0.063,
+            "qty_open": 0.063,
+            "entry_price": 206.88,
+            "target_price": 210.19,
+            "stop_price": 205.22,
+            "status": "open",
+            "force_exit_requested": True,
+        }
+    )
+    adapter.prices["BTCUSDT"] = 204.0
+
+    result = asyncio.run(trader.executor_tick())
+    updated = trader.get_block(block["block_id"])
+    orders = trader.repository.list_orders(block_id=block["block_id"], limit=10)
+    events = trader.repository.list_events(block_id=block["block_id"], limit=10)
+
+    assert result["action_count"] == 1
+    assert result["actions"][0]["status"] == "reconciled_missing_asset"
+    assert result["actions"][0]["requested_qty"] == pytest.approx(0.063)
+    assert len(adapter.spot_orders) == 1
+    assert len(orders) == 1
+    assert orders[0]["status"] == "error"
+    assert updated is not None
+    assert updated["status"] == "closed"
+    assert updated["qty_open"] == 0.0
+    assert updated["force_exit_requested"] is False
+    assert updated["metadata"]["exit_reconciled_missing_asset"]["status"] == (
+        "missing_asset_confirmed"
+    )
+    assert events[0]["event_type"] == "exit_reconciled_missing_asset"
 
 
 def test_live_spot_exit_records_retry_balance_lookup_failure_after_insufficient_balance(
@@ -15550,9 +19490,12 @@ def test_repository_migrates_existing_spot_schema(tmp_path: Path) -> None:
             """
         )
 
-    trader = BinanceBlockTrader(
-        config=BinanceBlockTraderConfig(db_path=str(db_path)),
-        adapter=_FakeBinance(),
+        trader = BinanceBlockTrader(
+            config=BinanceBlockTraderConfig(
+                db_path=str(db_path),
+                live_performance_db_path=str(tmp_path / "live_performance.db"),
+            ),
+            adapter=_FakeBinance(),
         codex_runtime=_FakeLLM({"create_blocks": []}),
     )
     block = trader.create_block(
@@ -15603,6 +19546,93 @@ def test_manager_accepts_complete_json_actions_and_creates_paper_blocks(
     assert len(blocks) == 1
     assert blocks[0]["status"] == "proposed"
     assert trader.repository.list_manager_runs()[0]["actions"]["create_blocks"]
+    telemetry = trader.repository.latest_manager_run()["response"][
+        "manager_run_telemetry"
+    ]
+    assert telemetry["version"] == "manager_run_telemetry_v1"
+    assert telemetry["venue"] == "binance"
+    assert telemetry["action_count"] == 1
+
+
+def test_manager_error_persists_normalized_actions_for_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = _FakeLLM(
+        {
+            "create_blocks": [
+                {
+                    "symbol": "BTCUSDT",
+                    "market": "spot",
+                    "qty": 0.1,
+                    "target_price": 120.0,
+                    "stop_price": 90.0,
+                    "thesis": "diagnostic block candidate",
+                }
+            ]
+        }
+    )
+    trader = _trader(tmp_path, llm=llm)
+    monkeypatch.setattr(
+        "tradecraft.services.binance_block_trader.build_manager_response_contract_error",
+        lambda **_: "forced_contract_error",
+    )
+
+    result = asyncio.run(trader.run_manager_once(candidates=[{"symbol": "BTCUSDT"}]))
+    run = trader.repository.list_manager_runs()[0]
+
+    assert result["status"] == "error"
+    assert result["error_message"] == "forced_contract_error"
+    assert run["status"] == "error"
+    assert run["actions"]["create_blocks"][0]["symbol"] == "BTCUSDT"
+    assert trader.list_blocks() == []
+
+
+def test_futures_waiting_probe_does_not_require_liquidation_price_when_live_enabled(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path, execute_futures=True)
+
+    normalized = trader._prepare_new_block_payload(
+        {
+            "symbol": "BTCUSDT",
+            "market": "futures",
+            "side": "long",
+            "status": "proposed",
+            "qty": 0.01,
+            "entry_price": 60_000.0,
+            "target_price": 62_000.0,
+            "stop_price": 59_000.0,
+            "entry_style": "wait_for_price",
+        }
+    )
+
+    trader._validate_block(normalized)
+
+
+def test_active_futures_block_still_requires_liquidation_price(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(tmp_path, execute_futures=True)
+
+    normalized = trader._prepare_new_block_payload(
+        {
+            "symbol": "BTCUSDT",
+            "market": "futures",
+            "side": "long",
+            "status": "entry_pending",
+            "qty": 0.01,
+            "entry_price": 60_000.0,
+            "target_price": 62_000.0,
+            "stop_price": 59_000.0,
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="active futures blocks require liquidation distance inputs",
+    ):
+        trader._validate_block(normalized)
 
 
 def test_manager_accepts_selected_contract_payload_and_merges_candidate_plan(
@@ -16937,6 +20967,372 @@ def test_executor_tick_triggers_waiting_spot_entry_without_llm(
     assert adapter.book_calls
 
 
+def test_executor_tick_reports_waiting_entry_trigger_not_reached(
+    tmp_path: Path,
+) -> None:
+    adapter = _BookTickerFillingEntryBinance()
+    adapter.book_tickers[("spot", "BTCUSDT")] = {"bid": 100.8, "ask": 101.0}
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(
+        tmp_path,
+        adapter=adapter,
+        llm=llm,
+        enabled=True,
+        execute_spot=True,
+    )
+    block = trader.create_block(
+        {
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "side": "long",
+            "qty": 0.1,
+            "entry_price": 100.0,
+            "target_price": 120.0,
+            "stop_price": 90.0,
+            "status": "proposed",
+            "metadata": {
+                "entry_style": "wait_for_price",
+                "entry_trigger_operator": "<=",
+                "entry_trigger_price": 100.0,
+            },
+        }
+    )
+
+    result = asyncio.run(trader.executor_tick())
+    updated = trader.get_block(block["block_id"])
+
+    assert result["action_count"] == 0
+    assert result["waiting_entry_checks"] == [
+        {
+            "block_id": block["block_id"],
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "side": "buy",
+            "status": "waiting",
+            "reason": "entry_trigger_not_reached",
+            "entry_trigger_price": 100.0,
+            "entry_trigger_operator": "<=",
+            "execution_price": 101.0,
+            "execution_source": "book_ticker",
+        }
+    ]
+    assert adapter.spot_orders == []
+    assert updated is not None
+    assert updated["status"] == "proposed"
+
+
+def test_executor_tick_blocks_waiting_futures_entry_without_liquidation_price(
+    tmp_path: Path,
+) -> None:
+    adapter = _BookTickerFillingEntryBinance()
+    adapter.book_tickers[("futures", "ETHUSDT")] = {"bid": 79.9, "ask": 80.0}
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(
+        tmp_path,
+        adapter=adapter,
+        llm=llm,
+        enabled=True,
+        execute_futures=True,
+    )
+    block = trader.create_block(
+        {
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "long",
+            "qty": 0.5,
+            "entry_price": 80.0,
+            "target_price": 84.0,
+            "stop_price": 78.0,
+            "status": "proposed",
+            "metadata": {
+                "entry_style": "wait_for_price",
+                "entry_trigger_operator": "<=",
+                "entry_trigger_price": 80.0,
+            },
+        }
+    )
+
+    result = asyncio.run(trader.executor_tick())
+    updated = trader.get_block(block["block_id"])
+    events = trader.repository.list_events(block_id=block["block_id"], limit=10)
+
+    assert result["action_count"] == 1
+    assert result["actions"][0]["status"] == "blocked"
+    assert result["actions"][0]["reason"] == "preflight_liquidation_price_missing"
+    assert adapter.futures_orders == []
+    assert updated is not None
+    assert updated["status"] == "paused"
+    assert updated["qty_open"] == pytest.approx(0.0)
+    assert updated["metadata"]["entry_trigger_status"] == "blocked"
+    assert updated["metadata"]["entry_trigger_reason"] == (
+        "preflight_liquidation_price_missing"
+    )
+    assert any(event["event_type"] == "entry_preflight_blocked" for event in events)
+
+
+def test_executor_tick_expires_stale_waiting_entries_before_trigger_checks(
+    tmp_path: Path,
+) -> None:
+    adapter = _BookTickerFillingEntryBinance()
+    adapter.book_tickers[("futures", "AAVEUSDT")] = {"bid": 86.0, "ask": 86.1}
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(
+        tmp_path,
+        adapter=adapter,
+        llm=llm,
+        enabled=True,
+        execute_futures=True,
+    )
+    trader.config.waiting_entry_max_age_sec = 48 * 60 * 60
+    now = datetime.now(timezone.utc)
+    stale_created_at = (now - timedelta(hours=49)).isoformat()
+    fresh_created_at = (now - timedelta(hours=1)).isoformat()
+    stale = trader.repository.create_block(
+        {
+            "block_id": "stale_aave_waiting",
+            "symbol": "AAVEUSDT",
+            "market": "futures",
+            "side": "long",
+            "qty_initial": 0.25,
+            "qty_open": 0.0,
+            "entry_price": 86.087,
+            "target_price": 88.153,
+            "stop_price": 85.054,
+            "thesis": "stale waiting entry",
+            "llm_reason": "",
+            "risk_note": "",
+            "status": "proposed",
+            "created_at": stale_created_at,
+            "updated_at": stale_created_at,
+            "metadata": {
+                "entry_style": "wait_for_price",
+                "entry_trigger_operator": "<=",
+                "entry_trigger_price": 86.087,
+            },
+        }
+    )
+    fresh = trader.repository.create_block(
+        {
+            "block_id": "fresh_eth_waiting",
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "long",
+            "qty_initial": 0.02,
+            "qty_open": 0.0,
+            "entry_price": 100.0,
+            "target_price": 105.0,
+            "stop_price": 98.0,
+            "thesis": "fresh waiting entry",
+            "llm_reason": "",
+            "risk_note": "",
+            "status": "proposed",
+            "created_at": fresh_created_at,
+            "updated_at": fresh_created_at,
+            "metadata": {
+                "entry_style": "wait_for_price",
+                "entry_trigger_operator": "<=",
+                "entry_trigger_price": 100.0,
+            },
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE blocks SET created_at = ?, updated_at = ? WHERE block_id = ?",
+            (stale_created_at, stale_created_at, stale["block_id"]),
+        )
+        conn.execute(
+            "UPDATE blocks SET created_at = ?, updated_at = ? WHERE block_id = ?",
+            (fresh_created_at, fresh_created_at, fresh["block_id"]),
+        )
+
+    result = asyncio.run(trader.executor_tick())
+    stale_updated = trader.get_block(stale["block_id"])
+    fresh_updated = trader.get_block(fresh["block_id"])
+    events = trader.repository.list_events(block_id=stale["block_id"], limit=10)
+
+    assert result["action_count"] == 1
+    assert result["actions"][0]["status"] == "expired_waiting_entry"
+    assert adapter.futures_orders == []
+    assert stale_updated is not None
+    assert stale_updated["status"] == "closed"
+    assert stale_updated["qty_open"] == 0.0
+    assert stale_updated["metadata"]["waiting_entry_expired"]["max_age_sec"] == 172800
+    assert fresh_updated is not None
+    assert fresh_updated["status"] == "proposed"
+    assert events[0]["event_type"] == "waiting_entry_expired"
+
+
+def test_executor_tick_expires_stale_waiting_entry_when_new_entries_halted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _BookTickerFillingEntryBinance()
+    adapter.book_tickers[("futures", "AAVEUSDT")] = {"bid": 86.0, "ask": 86.1}
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(
+        tmp_path,
+        adapter=adapter,
+        llm=llm,
+        enabled=True,
+        execute_futures=True,
+    )
+    monkeypatch.setattr(trader, "_entry_risk_guard_allows_new_entries", lambda: False)
+    trader.config.waiting_entry_max_age_sec = 48 * 60 * 60
+    created_at = (datetime.now(timezone.utc) - timedelta(hours=116)).isoformat()
+    block = trader.repository.create_block(
+        {
+            "block_id": "risk_halted_stale_aave_waiting",
+            "symbol": "AAVEUSDT",
+            "market": "futures",
+            "side": "long",
+            "qty_initial": 0.25,
+            "qty_open": 0.0,
+            "entry_price": 86.087,
+            "target_price": 88.153,
+            "stop_price": 85.054,
+            "thesis": "stale waiting entry while new entries are halted",
+            "llm_reason": "",
+            "risk_note": "",
+            "status": "proposed",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "metadata": {
+                "entry_style": "wait_for_price",
+                "entry_trigger_operator": "<=",
+                "entry_trigger_price": 86.087,
+            },
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE blocks SET created_at = ?, updated_at = ? WHERE block_id = ?",
+            (created_at, created_at, block["block_id"]),
+        )
+
+    result = asyncio.run(trader.executor_tick())
+    updated = trader.get_block(block["block_id"])
+    events = trader.repository.list_events(block_id=block["block_id"], limit=10)
+
+    assert result["action_count"] == 1
+    assert result["actions"][0]["status"] == "expired_waiting_entry"
+    assert updated is not None
+    assert updated["status"] == "closed"
+    assert updated["metadata"]["waiting_entry_expired"]["max_age_sec"] == 172800
+    assert events[0]["event_type"] == "waiting_entry_expired"
+
+
+def test_executor_tick_keeps_recently_refreshed_waiting_entry(
+    tmp_path: Path,
+) -> None:
+    adapter = _BookTickerFillingEntryBinance()
+    adapter.book_tickers[("futures", "AAVEUSDT")] = {"bid": 86.0, "ask": 86.1}
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(
+        tmp_path,
+        adapter=adapter,
+        llm=llm,
+        enabled=True,
+        execute_futures=True,
+    )
+    trader.config.waiting_entry_max_age_sec = 48 * 60 * 60
+    now = datetime.now(timezone.utc)
+    created_at = (now - timedelta(hours=49)).isoformat()
+    refreshed_at = (now - timedelta(hours=1)).isoformat()
+    block = trader.repository.create_block(
+        {
+            "block_id": "refreshed_aave_waiting",
+            "symbol": "AAVEUSDT",
+            "market": "futures",
+            "side": "long",
+            "qty_initial": 0.25,
+            "qty_open": 0.0,
+            "entry_price": 80.0,
+            "target_price": 88.153,
+            "stop_price": 78.5,
+            "thesis": "recently refreshed waiting entry",
+            "llm_reason": "",
+            "risk_note": "",
+            "status": "proposed",
+            "created_at": created_at,
+            "updated_at": refreshed_at,
+            "metadata": {
+                "entry_style": "wait_for_price",
+                "entry_trigger_operator": "<=",
+                "entry_trigger_price": 80.0,
+            },
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE blocks SET created_at = ?, updated_at = ? WHERE block_id = ?",
+            (created_at, refreshed_at, block["block_id"]),
+        )
+
+    result = asyncio.run(trader.executor_tick())
+    updated = trader.get_block(block["block_id"])
+    events = trader.repository.list_events(block_id=block["block_id"], limit=10)
+
+    assert result["actions"] == []
+    assert updated is not None
+    assert updated["status"] == "proposed"
+    assert not any(event["event_type"] == "waiting_entry_expired" for event in events)
+
+
+def test_executor_tick_does_not_expire_waiting_entry_when_entry_execution_disabled(
+    tmp_path: Path,
+) -> None:
+    adapter = _BookTickerFillingEntryBinance()
+    adapter.book_tickers[("futures", "AAVEUSDT")] = {"bid": 86.0, "ask": 86.1}
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(
+        tmp_path,
+        adapter=adapter,
+        llm=llm,
+        enabled=True,
+        execute_futures=False,
+    )
+    trader.config.waiting_entry_max_age_sec = 48 * 60 * 60
+    created_at = (datetime.now(timezone.utc) - timedelta(hours=49)).isoformat()
+    block = trader.repository.create_block(
+        {
+            "block_id": "paused_aave_waiting",
+            "symbol": "AAVEUSDT",
+            "market": "futures",
+            "side": "long",
+            "qty_initial": 0.25,
+            "qty_open": 0.0,
+            "entry_price": 86.087,
+            "target_price": 88.153,
+            "stop_price": 85.054,
+            "thesis": "paused waiting entry",
+            "llm_reason": "",
+            "risk_note": "",
+            "status": "proposed",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "metadata": {
+                "entry_style": "wait_for_price",
+                "entry_trigger_operator": "<=",
+                "entry_trigger_price": 86.087,
+            },
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE blocks SET created_at = ?, updated_at = ? WHERE block_id = ?",
+            (created_at, created_at, block["block_id"]),
+        )
+
+    result = asyncio.run(trader.executor_tick())
+    updated = trader.get_block(block["block_id"])
+    events = trader.repository.list_events(block_id=block["block_id"], limit=10)
+
+    assert result["actions"] == []
+    assert updated is not None
+    assert updated["status"] == "proposed"
+    assert not any(event["event_type"] == "waiting_entry_expired" for event in events)
+
+
 def test_waiting_futures_entry_rejects_exchange_minimum_before_order(
     tmp_path: Path,
 ) -> None:
@@ -16990,6 +21386,61 @@ def test_waiting_futures_entry_rejects_exchange_minimum_before_order(
     assert "exchange_min_order_rejected" in updated["risk_note"]
     assert events[0]["event_type"] == "entry_preflight_blocked"
     assert events[0]["payload"]["stage"] == "exchange_min_order"
+
+
+def test_waiting_futures_entry_persists_exchange_minimum_qty_bump(
+    tmp_path: Path,
+) -> None:
+    adapter = _FilteredBookTickerFillingEntryBinance()
+    adapter.book_tickers[("futures", "LINKUSDT")] = {"bid": 7.94, "ask": 7.95}
+    llm = _FakeLLM({"create_blocks": []})
+    trader = _trader(
+        tmp_path,
+        adapter=adapter,
+        llm=llm,
+        enabled=True,
+        execute_futures=True,
+    )
+    block = trader.repository.create_block(
+        {
+            "block_id": "waiting_link_min_notional_bump",
+            "symbol": "LINKUSDT",
+            "market": "futures",
+            "side": "short",
+            "qty_initial": 2.52,
+            "qty_open": 0.0,
+            "entry_price": 7.9362,
+            "target_price": 7.8092,
+            "stop_price": 7.9997,
+            "thesis": "waiting entry quote budget rounds just below exchange minimum",
+            "llm_reason": "",
+            "risk_note": "",
+            "status": "proposed",
+            "margin_type": "isolated",
+            "leverage": 1,
+            "liquidation_price": 10.714,
+            "metadata": {
+                "entry_style": "wait_for_price",
+                "entry_trigger_operator": ">=",
+                "entry_trigger_price": 7.9362,
+                "quote_budget_usdt": 20.0,
+            },
+        }
+    )
+
+    result = asyncio.run(trader.executor_tick())
+    updated = trader.get_block(block["block_id"])
+    order = adapter.futures_orders[0]
+    recorded_order = trader.repository.list_orders(block_id=block["block_id"])[0]
+
+    assert result["action_count"] == 1
+    assert result["actions"][0]["status"] == "opened"
+    assert order["quantity"] == pytest.approx(2.53)
+    assert result["actions"][0]["order"]["qty"] == pytest.approx(order["quantity"])
+    assert recorded_order["qty"] == pytest.approx(order["quantity"])
+    assert updated is not None
+    assert updated["qty_initial"] == pytest.approx(order["quantity"])
+    assert updated["qty_open"] == pytest.approx(order["quantity"])
 
 
 def test_waiting_entry_does_not_submit_when_book_preflight_is_stale(
@@ -20122,6 +24573,45 @@ def test_compact_manager_candidate_exposes_pattern_performance_scorecard() -> No
     )
 
 
+def test_compact_manager_candidate_attaches_validation_repair_probe_design() -> None:
+    compact = BinanceBlockTrader._compact_manager_candidate_for_prompt(
+        {
+            "symbol": "ESPUSDT",
+            "market": "futures",
+            "side": "short",
+            "horizon": "futures",
+            "score": 81.103,
+            "confidence": 0.58,
+            "calculated": {
+                "entry_style": "wait_for_price",
+                "entry_price": 0.07156,
+                "target_price": 0.06397,
+                "stop_price": 0.075262,
+                "quote_budget_usdt": 8.68,
+                "pattern_live_crosscheck": {
+                    "status": "no_pattern_prior",
+                    "recommended_entry_mode": "research_only",
+                },
+            },
+        },
+        validation_repair={
+            "status": "needs_repair",
+            "repair_item_count": 2,
+            "max_stop_risk_pct": 3.0,
+            "min_reward_risk": 2.0,
+            "risk_budget_multiplier": 0.25,
+        },
+    )
+
+    design = compact["validation_repair_probe_design"]
+    assert design["resolution"] == "probe_waiting_block"
+    assert design["entry_price"] == pytest.approx(0.07156)
+    assert design["stop_price"] == pytest.approx(0.0737068)
+    assert design["reward_risk"] >= 2.0
+    assert design["risk_budget_multiplier"] == pytest.approx(0.25)
+    assert design["min_executable_notional_usdt"] == pytest.approx(20.0)
+
+
 def test_manager_executable_candidates_annotates_near_duplicate_active_block(
     tmp_path: Path,
 ) -> None:
@@ -21400,15 +25890,22 @@ def test_enabled_false_prevents_live_order_even_if_flag_is_on(tmp_path: Path) ->
 
 def test_kill_switch_persists_across_service_instances(tmp_path: Path) -> None:
     db_path = str(tmp_path / "binance_blocks.db")
+    live_performance_db_path = str(tmp_path / "live_performance.db")
     first = BinanceBlockTrader(
-        config=BinanceBlockTraderConfig(db_path=db_path),
+        config=BinanceBlockTraderConfig(
+            db_path=db_path,
+            live_performance_db_path=live_performance_db_path,
+        ),
         adapter=_FakeBinance(),
         codex_runtime=_FakeLLM({"create_blocks": []}),
     )
     first.set_kill_switch(True, reason="shared")
 
     second = BinanceBlockTrader(
-        config=BinanceBlockTraderConfig(db_path=db_path),
+        config=BinanceBlockTraderConfig(
+            db_path=db_path,
+            live_performance_db_path=live_performance_db_path,
+        ),
         adapter=_FakeBinance(),
         codex_runtime=_FakeLLM({"create_blocks": []}),
     )
@@ -24826,6 +29323,341 @@ def test_upbit_spot_entry_routes_to_upbit_adapter(tmp_path: Path) -> None:
     assert upbit.orders[0]["limit_price"] % 1000 == 0
 
 
+def test_new_entry_order_response_preserves_entry_pending_block(
+    tmp_path: Path,
+) -> None:
+    class NewEntryUpbit(_FakeUpbit):
+        async def submit_spot_order(self, **kwargs: Any) -> dict[str, Any]:
+            self.orders.append(kwargs)
+            return {
+                "status": "NEW",
+                "executed_qty": "0",
+                "order_id": f"U{len(self.orders)}",
+                **kwargs,
+            }
+
+    upbit = NewEntryUpbit()
+    trader = _trader(
+        tmp_path,
+        upbit=upbit,
+        enabled=True,
+        execute_upbit=True,
+    )
+    block = trader.create_block(
+        {
+            "symbol": "KRW-BTC",
+            "market": "upbit_spot",
+            "side": "long",
+            "qty": 0.001,
+            "entry_price": 100_000_000.0,
+            "target_price": 108_000_000.0,
+            "stop_price": 95_000_000.0,
+            "status": "entry_pending",
+            "created_by": "llm",
+        }
+    )
+
+    result = asyncio.run(trader._submit_entry_for_block(block))
+    updated = trader.get_block(block["block_id"])
+    orders = trader.repository.list_orders()
+
+    assert result["status"] == "entry_pending"
+    assert updated is not None
+    assert updated["status"] == "entry_pending"
+    assert updated["qty_open"] == pytest.approx(block["qty_initial"])
+    assert "entry order pending: NEW" in updated["risk_note"]
+    assert orders[0]["status"] == "sent"
+    assert orders[0]["response"]["status"] == "NEW"
+    assert upbit.orders
+
+
+def test_executor_tick_opens_pending_upbit_entry_when_asset_appears(
+    tmp_path: Path,
+) -> None:
+    upbit = _FakeUpbit()
+    upbit.assets.append(
+        {
+            "asset": "BTC",
+            "symbol": "KRW-BTC",
+            "market": "upbit_spot",
+            "kind": "position",
+            "qty": 0.001,
+            "available": 0.001,
+            "locked": 0.0,
+            "value_krw": 100_000.0,
+        }
+    )
+    trader = _trader(
+        tmp_path,
+        upbit=upbit,
+        enabled=True,
+        execute_upbit=True,
+    )
+    block = trader.create_block(
+        {
+            "symbol": "KRW-BTC",
+            "market": "upbit_spot",
+            "side": "long",
+            "qty": 0.001,
+            "entry_price": 100_000_000.0,
+            "target_price": 108_000_000.0,
+            "stop_price": 95_000_000.0,
+            "status": "entry_pending",
+            "metadata": {
+                "entry_order_pending": {
+                    "status": "NEW",
+                    "order_id": "U1",
+                    "qty": 0.001,
+                }
+            },
+        }
+    )
+    trader.repository.add_order(
+        {
+            "block_id": block["block_id"],
+            "symbol": "KRW-BTC",
+            "market": "upbit_spot",
+            "side": "buy",
+            "qty": 0.001,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+            "response": {
+                "status": "NEW",
+                "order_id": "U1",
+                "executed_qty": "0",
+            },
+        }
+    )
+
+    result = asyncio.run(trader.executor_tick())
+    updated = trader.get_block(block["block_id"])
+    events = trader.repository.list_events(block_id=block["block_id"], limit=10)
+
+    assert result["action_count"] == 1
+    assert result["actions"][0]["status"] == "entry_reconciled_open"
+    assert updated is not None
+    assert updated["status"] == "open"
+    assert updated["qty_open"] == pytest.approx(0.001)
+    assert updated["opened_at"]
+    assert updated["metadata"]["entry_order_reconciliation"]["order_id"] == "U1"
+    assert events[0]["event_type"] == "entry_reconciled_open"
+
+
+def test_executor_tick_opens_pending_futures_entry_when_position_appears(
+    tmp_path: Path,
+) -> None:
+    adapter = _FakeBinance()
+    adapter.account = {
+        "status": "ok",
+        "futures_position_risk": [
+            {
+                "symbol": "ETHUSDT",
+                "position_amt": -0.25,
+                "entry_price": 3200.5,
+                "mark_price": 3195.0,
+                "liquidation_price": 4200.0,
+                "leverage": 2,
+                "margin_type": "isolated",
+                "unrealized_profit": 1.375,
+            }
+        ],
+    }
+    trader = _trader(
+        tmp_path,
+        adapter=adapter,
+        enabled=True,
+        execute_futures=True,
+    )
+    block = trader.create_block(
+        {
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "short",
+            "qty": 0.25,
+            "entry_price": 3200.0,
+            "target_price": 3100.0,
+            "stop_price": 3260.0,
+            "liquidation_price": 4200.0,
+            "margin_type": "isolated",
+            "leverage": 2,
+            "status": "entry_pending",
+            "metadata": {
+                "entry_order_pending": {
+                    "status": "NEW",
+                    "order_id": "F1",
+                    "qty": 0.25,
+                }
+            },
+        }
+    )
+    trader.repository.add_order(
+        {
+            "block_id": block["block_id"],
+            "symbol": "ETHUSDT",
+            "market": "futures",
+            "side": "sell",
+            "qty": 0.25,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+            "response": {
+                "status": "NEW",
+                "order_id": "F1",
+                "executed_qty": "0",
+            },
+        }
+    )
+
+    result = asyncio.run(trader.executor_tick())
+    updated = trader.get_block(block["block_id"])
+    events = trader.repository.list_events(block_id=block["block_id"], limit=10)
+
+    assert result["action_count"] == 1
+    assert result["actions"][0]["status"] == "entry_reconciled_open"
+    assert updated is not None
+    assert updated["status"] == "open"
+    assert updated["qty_open"] == pytest.approx(0.25)
+    assert updated["entry_price"] == pytest.approx(3200.5)
+    assert updated["opened_at"]
+    assert updated["metadata"]["entry_order_reconciliation"]["order_id"] == "F1"
+    assert updated["metadata"]["entry_order_reconciliation"]["position_amt"] == pytest.approx(
+        -0.25
+    )
+    assert events[0]["event_type"] == "entry_reconciled_open"
+
+
+def test_executor_tick_opens_pending_entry_from_recorded_fill(
+    tmp_path: Path,
+) -> None:
+    trader = _trader(
+        tmp_path,
+        adapter=_FailingAccountSnapshotBinance(),
+        enabled=True,
+        execute_spot=True,
+    )
+    block = trader.create_block(
+        {
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "side": "long",
+            "qty": 0.1,
+            "entry_price": 100.0,
+            "target_price": 108.0,
+            "stop_price": 95.0,
+            "status": "entry_pending",
+        }
+    )
+    trader.repository.add_order(
+        {
+            "block_id": block["block_id"],
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "side": "buy",
+            "qty": 0.1,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+            "response": {
+                "status": "PARTIALLY_FILLED",
+                "order_id": "S1",
+                "executed_qty": "0.08",
+                "avg_fill_price": "100.5",
+            },
+        }
+    )
+
+    result = asyncio.run(trader.executor_tick())
+    updated = trader.get_block(block["block_id"])
+    events = trader.repository.list_events(block_id=block["block_id"], limit=10)
+
+    assert result["action_count"] == 1
+    assert result["actions"][0]["status"] == "entry_reconciled_open"
+    assert updated is not None
+    assert updated["status"] == "open"
+    assert updated["qty_open"] == pytest.approx(0.08)
+    assert updated["entry_price"] == pytest.approx(100.5)
+    assert updated["opened_at"]
+    assert updated["metadata"]["entry_order_reconciliation"]["fill_qty"] == pytest.approx(
+        0.08
+    )
+    assert events[0]["event_type"] == "entry_reconciled_open"
+
+
+def test_executor_tick_releases_stale_binance_new_entry_without_fill_or_asset(
+    tmp_path: Path,
+) -> None:
+    adapter = _FakeBinance()
+    trader = _trader(
+        tmp_path,
+        adapter=adapter,
+        enabled=True,
+        execute_spot=True,
+    )
+    trader.config.entry_pending_max_age_sec = 10 * 60
+    old_at = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    block = trader.create_block(
+        {
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "side": "long",
+            "qty": 0.1,
+            "entry_price": 100.0,
+            "target_price": 108.0,
+            "stop_price": 95.0,
+            "status": "entry_pending",
+            "metadata": {
+                "entry_order_pending": {
+                    "status": "NEW",
+                    "order_id": "S1",
+                    "qty": 0.1,
+                }
+            },
+        }
+    )
+    order = trader.repository.add_order(
+        {
+            "block_id": block["block_id"],
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "side": "buy",
+            "qty": 0.1,
+            "order_type": "LIMIT_IOC",
+            "status": "sent",
+            "reason": "entry_order",
+            "response": {
+                "status": "NEW",
+                "order_id": "S1",
+                "executed_qty": "0",
+            },
+        }
+    )
+    with sqlite3.connect(trader.repository.path) as conn:
+        conn.execute(
+            "UPDATE blocks SET created_at = ?, updated_at = ? WHERE block_id = ?",
+            (old_at, old_at, block["block_id"]),
+        )
+        conn.execute(
+            "UPDATE block_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+            (old_at, old_at, order["id"]),
+        )
+
+    result = asyncio.run(trader.executor_tick())
+    updated = trader.get_block(block["block_id"])
+    events = trader.repository.list_events(block_id=block["block_id"], limit=10)
+
+    assert result["action_count"] == 1
+    assert result["actions"][0]["status"] == "stale_pending_entry_released"
+    assert updated is not None
+    assert updated["status"] == "closed"
+    assert updated["qty_open"] == pytest.approx(0.0)
+    release = updated["metadata"]["entry_order_stale_release"]
+    assert release["order_id"] == "S1"
+    assert release["max_age_sec"] == 600
+    assert release["account_status"] == "ok"
+    assert events[0]["event_type"] == "entry_pending_released"
+
+
 def test_upbit_spot_quote_budget_derives_qty_in_krw(tmp_path: Path) -> None:
     trader = _trader(tmp_path, upbit=_FakeUpbit())
 
@@ -25070,6 +29902,7 @@ def test_binance_jue_wiki_prompt_context_attaches_application_metadata() -> None
     )
 
     assert prompt["decision_inputs"] == [
+        "jue_wiki",
         "jue_wiki_memory_card_quality",
         "jue_wiki_repair_contract",
     ]
@@ -26410,7 +31243,7 @@ def test_binance_jue_wiki_prompt_context_removes_stale_decision_adjustments_inpu
 
     assert "decision_adjustments" not in prompt["jue_wiki_application"]
     assert "jue_wiki_decision_adjustments" not in prompt
-    assert prompt["decision_inputs"] == ["account"]
+    assert prompt["decision_inputs"] == ["account", "jue_wiki"]
 
 
 def test_binance_jue_wiki_decision_adjustment_audit_contract_attaches_and_clears() -> None:

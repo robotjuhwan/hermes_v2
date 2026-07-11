@@ -4,6 +4,7 @@
       admin_token_not_configured: "운영 토큰 미설정",
       binance_futures_not_ready_for_live_orders: "Binance 선물 실주문 준비 안됨",
       binance_kill_switch_enabled: "Binance 킬스위치 활성",
+      binance_block_manager_last_run_failed: "Binance 쥬 최근 판단 실패",
       binance_spot_not_ready_for_live_orders: "Binance 현물 실주문 준비 안됨",
       crypto_alpha_disabled: "Crypto alpha 중지",
       crypto_alpha_runner_stopped: "Crypto alpha 러너 중지",

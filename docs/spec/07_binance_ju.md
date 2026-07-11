@@ -22,7 +22,9 @@ distance, execution toggles, and the kill switch.
 
 The configured Binance block manager model is in `src/tradecraft/config.py`:
 `TRADECRAFT_BINANCE_BLOCK_TRADER_LLM_MODEL` defaults to
-`gpt-5.5`, and reasoning defaults to `xhigh`.
+`gpt-5.6-sol`, and reasoning defaults to `xhigh`. Supporting crypto research
+uses `gpt-5.6-terra` with `high`; repetitive alpha extraction uses
+`gpt-5.6-luna` with `medium` when an LLM path is active.
 
 ## Venue Split
 

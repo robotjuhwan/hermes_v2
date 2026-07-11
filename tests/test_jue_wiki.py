@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,12 @@ from tradecraft.api.ops_payloads import build_ops_jue_wiki_payload
 from tradecraft.services.daily_discovery import DailyDiscoveryRepository
 from tradecraft.services.jue_codex_lab_store import JueCodexLabStore
 from tradecraft.services.jue_wiki import JueWikiConfig, JueWikiService
+from tradecraft.services.jue_wiki_contract import (
+    EvidenceRefV1,
+    JueWikiPageV3,
+    WikiClaimV3,
+    WikiSnapshotV1,
+)
 from tradecraft.services.trading_validation import TradingValidationRepository
 
 
@@ -686,7 +693,7 @@ def test_jue_wiki_phase2_tables_are_created(tmp_path: Path) -> None:
         )
     )
 
-    service.status()
+    service.project_status_snapshot()
 
     with sqlite3.connect(tmp_path / "jue_wiki" / "wiki.db") as conn:
         names = {
@@ -695,10 +702,15 @@ def test_jue_wiki_phase2_tables_are_created(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
+        repair_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(wiki_repair_actions)").fetchall()
+        }
 
     assert "wiki_selection_runs" in names
     assert "wiki_selection_pages" in names
     assert "wiki_repair_actions" in names
+    assert {"repair_lane", "repair_lane_registered"} <= repair_columns
     assert "wiki_playbook_metrics" in names
 
 
@@ -710,7 +722,7 @@ def test_jue_wiki_phase3_tables_are_created(tmp_path: Path) -> None:
         )
     )
 
-    service.status()
+    service.project_status_snapshot()
 
     with sqlite3.connect(tmp_path / "jue_wiki" / "wiki.db") as conn:
         names = {
@@ -785,7 +797,60 @@ def test_status_reflects_disabled_config(tmp_path: Path) -> None:
         )
     )
 
-    assert service.status()["enabled"] is False
+    assert service.project_status_snapshot()["enabled"] is False
+
+
+def test_status_without_snapshot_does_not_initialize_wiki(tmp_path: Path) -> None:
+    service = JueWikiService(
+        JueWikiConfig(
+            root_path=tmp_path / "jue_wiki",
+            db_path=tmp_path / "jue_wiki" / "wiki.db",
+        )
+    )
+
+    status = service.status()
+
+    assert status["status"] == "unavailable"
+    assert status["snapshot_version"] == "ops_section_snapshot_v1"
+    assert status["snapshot_section"] == "jue_wiki"
+    assert status["reason"] == "ops_snapshot_missing"
+    assert not service.config.db_path.exists()
+
+
+def test_status_reads_ops_snapshot_without_recomputing_or_writing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service = JueWikiService(
+        JueWikiConfig(
+            root_path=tmp_path / "jue_wiki",
+            db_path=tmp_path / "jue_wiki" / "wiki.db",
+        )
+    )
+    projected = service.project_status_snapshot()
+    before_bytes = service.config.db_path.read_bytes()
+    before_mtime_ns = service.config.db_path.stat().st_mtime_ns
+
+    monkeypatch.setattr(
+        service,
+        "initialize",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("status read path must not initialize")
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_research_coverage_status",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("status read path must not recompute coverage")
+        ),
+    )
+
+    status = service.status()
+
+    assert status == projected
+    assert service.config.db_path.read_bytes() == before_bytes
+    assert service.config.db_path.stat().st_mtime_ns == before_mtime_ns
 
 
 def test_rebuild_reports_malformed_source_db_as_error(tmp_path: Path) -> None:
@@ -1546,7 +1611,7 @@ def test_rebuild_kis_symbols_resolves_manager_context_repair_after_strong_eviden
     )
 
     result = service.rebuild(scope="kis", force=True)
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert result["status"] == "ok"
     assert status["repair_queue"]["open_count"] == 0
@@ -1554,7 +1619,7 @@ def test_rebuild_kis_symbols_resolves_manager_context_repair_after_strong_eviden
     with sqlite3.connect(tmp_path / "jue_wiki" / "wiki.db") as conn:
         row = conn.execute(
             """
-            SELECT status, details_json
+            SELECT status, details_json, repair_lane, repair_lane_registered
             FROM wiki_repair_actions
             WHERE action_id = ?
             """,
@@ -1562,6 +1627,7 @@ def test_rebuild_kis_symbols_resolves_manager_context_repair_after_strong_eviden
         ).fetchone()
     assert row is not None
     assert row[0] == "resolved"
+    assert row[2:] == ("evidence", 1)
     details = json.loads(row[1])
     assert details["resolved_by"] == "manager_context_evidence_quality_recovered"
     assert details["resolved_manager_run_id"]
@@ -2592,6 +2658,64 @@ def test_rebuild_kis_symbols_uses_daily_discovery_research_without_blocks(
         row["source_type"] == "daily_discovery"
         for row in sources["source_refs"]
     )
+
+
+def test_rebuild_kis_symbols_marks_etf_daily_discovery_research(
+    tmp_path: Path,
+) -> None:
+    discovery_db = tmp_path / "jue_daily_discovery.db"
+    DailyDiscoveryRepository(str(discovery_db)).save_run(
+        {
+            "trading_day": "2026-07-03",
+            "status": "ok",
+            "selected_symbols": [
+                {
+                    "symbol": "069500",
+                    "name": "KODEX 200",
+                    "market": "ETF",
+                    "asset_class": "etf",
+                }
+            ],
+            "results": [
+                {
+                    "symbol": "069500",
+                    "name": "KODEX 200",
+                    "market": "ETF",
+                    "asset_class": "etf",
+                    "status": "ok",
+                    "score": 76.0,
+                    "analysis": {
+                        "name": "KODEX 200",
+                        "stance": "confirm",
+                        "confidence": 0.72,
+                        "summary": "KODEX 200 ETF discovery: core_etf 후보로 유동성과 추종지수 확인.",
+                        "reasons": ["거래대금 충분", "시장 대표 익스포저"],
+                        "risks": ["추적오차와 괴리 확인 필요"],
+                    },
+                }
+            ],
+            "summary": {
+                "selected_count": 1,
+                "etf_count": 1,
+            },
+        }
+    )
+    service = JueWikiService(
+        JueWikiConfig(
+            root_path=tmp_path / "jue_wiki",
+            db_path=tmp_path / "jue_wiki" / "wiki.db",
+            daily_discovery_db_path=discovery_db,
+        )
+    )
+
+    result = service.rebuild(scope="kis", force=True)
+    page = service.read_page("kis.symbol.069500")
+
+    assert result["updated_count"] == 1
+    assert "Daily Discovery Research" in page["content"]
+    assert "market=ETF" in page["content"]
+    assert "asset_class=etf" in page["content"]
+    assert "core_etf 후보" in page["content"]
 
 
 def test_rebuild_kis_symbols_reconstructs_daily_discovery_pre_surge(
@@ -4403,9 +4527,10 @@ def test_status_feeds_ops_payload_with_phase2_health_fields(
                 '2026-06-28T01:06:00+00:00', ''
             )
             """
-        )
+            )
 
-    status = service.status()
+    service.initialize()
+    status = service.project_status_snapshot()
     payload = build_ops_jue_wiki_payload(
         enabled=True,
         status=status,
@@ -4426,8 +4551,11 @@ def test_status_feeds_ops_payload_with_phase2_health_fields(
     assert payload["warnings"] == [
         "jue_wiki_stale_pages_high",
         "jue_wiki_prompt_pressure_high",
-        "jue_wiki_repair_queue_open",
+        "jue_wiki_repair_queue_overdue",
+        "jue_wiki_repair_queue_stalled",
     ]
+    assert "jue_wiki_repair_queue_open" in payload["advisories"]
+    assert "jue_wiki_shadow_knowledge_degraded" in payload["advisories"]
 
 
 def test_status_counts_age_stale_current_pages_as_stale(tmp_path: Path) -> None:
@@ -4462,7 +4590,7 @@ def test_status_counts_age_stale_current_pages_as_stale(tmp_path: Path) -> None:
             """
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert status["stale_page_count"] == 1
 
@@ -4511,9 +4639,23 @@ def test_status_exposes_repair_queue_counts(tmp_path: Path) -> None:
             """
         )
 
-    status = service.status()
+    service.initialize()
+    status = service.project_status_snapshot()
 
-    assert status["repair_queue"] == {
+    queue = status["repair_queue"]
+    legacy_queue = {
+        key: queue[key]
+        for key in (
+            "open_count",
+            "resolved_count",
+            "by_scope",
+            "open_by_action_type",
+            "open_by_warning",
+            "open_symbols",
+            "open_action_batches",
+        )
+    }
+    assert legacy_queue == {
         "open_count": 2,
         "resolved_count": 1,
         "by_scope": {
@@ -4547,7 +4689,346 @@ def test_status_exposes_repair_queue_counts(tmp_path: Path) -> None:
             },
         ],
     }
+    assert queue["oldest_open_at"] == "2026-07-03T01:00:00+00:00"
+    assert queue["last_resolved_at"] == "2026-07-03T02:00:00+00:00"
+    assert queue["opened_in_window"] == 0
+    assert queue["resolved_in_window"] == 0
+    assert queue["by_lane"]["evidence"]["repair_health"]["status"] == "warning"
+    assert queue["by_lane"]["evidence"]["repair_health"]["warning_signals"] == [
+        "jue_wiki_repair_queue_overdue",
+        "jue_wiki_repair_queue_stalled",
+    ]
+    assert queue["repair_health"]["status"] == "idle"
+    assert queue["repair_health"]["warning_signals"] == []
+    assert queue["repair_health"]["advisory_signals"] == []
     assert status["wiki_repair_queue_open_count"] == 2
+
+
+def test_status_exposes_progressing_repair_queue_health(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.initialize()
+    now = datetime.now(timezone.utc)
+    old_opened_at = (now - timedelta(days=2)).isoformat()
+    recently_created_at = (now - timedelta(minutes=10)).isoformat()
+    recently_resolved_at = (now - timedelta(minutes=5)).isoformat()
+    with sqlite3.connect(tmp_path / "jue_wiki" / "wiki.db") as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_repair_actions (
+                action_id, finding_id, page_id, action_type, status,
+                details_json, created_at, finished_at, error_message
+            ) VALUES (?, 'finding:open', 'kis.symbol.005930',
+                'refresh_financials', 'scheduled', '{}', ?, '', '')
+            """,
+            ("repair:open", old_opened_at),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_repair_actions (
+                action_id, finding_id, page_id, action_type, status,
+                details_json, created_at, finished_at, error_message
+            ) VALUES (?, 'finding:done', 'kis.symbol.000660',
+                'refresh_financials', 'resolved', '{}', ?, ?, '')
+            """,
+            ("repair:done", recently_created_at, recently_resolved_at),
+        )
+
+    queue = service.project_status_snapshot()["repair_queue"]
+
+    assert queue["oldest_open_at"] == old_opened_at
+    assert queue["last_resolved_at"] == recently_resolved_at
+    assert queue["opened_in_window"] == 1
+    assert queue["resolved_in_window"] == 1
+    assert queue["repair_health"]["status"] == "progressing"
+    assert queue["repair_health"]["warning_signals"] == []
+    assert queue["repair_health"]["advisory_signals"] == [
+        "jue_wiki_repair_queue_open"
+    ]
+
+
+def test_record_repair_action_reuses_equivalent_open_work(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    first = service.record_repair_action(
+        finding_id="financials:005930",
+        page_id="kis.symbol.005930",
+        action_type="refresh_financials",
+        status="scheduled",
+        details={"decision_scope": "kis", "symbols": ["005930"]},
+    )
+    second = service.record_repair_action(
+        finding_id="financials:005930",
+        page_id="kis.symbol.005930",
+        action_type="refresh_financials",
+        status="scheduled",
+        details={"decision_scope": "kis", "symbols": ["005930"]},
+    )
+
+    assert second["action_id"] == first["action_id"]
+    assert second["details"]["repair_identity"]
+    assert service.project_status_snapshot()["repair_queue"]["open_count"] == 1
+
+
+def test_repair_queue_health_uses_integrity_lane_only(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.initialize()
+    now = datetime.now(timezone.utc).isoformat()
+    with service._connect() as conn:
+        for index in range(30):
+            conn.execute(
+                """
+                INSERT INTO wiki_repair_actions (
+                    action_id, finding_id, page_id, action_type,
+                    repair_lane, repair_lane_registered, status,
+                    details_json, created_at, finished_at, error_message
+                ) VALUES (?, ?, ?, 'book_depth_gap', 'strategy', 1,
+                          'scheduled', '{}', ?, '', '')
+                """,
+                (f"strategy-{index}", f"strategy-finding-{index}", "binance.ops.queue", now),
+            )
+        conn.execute(
+            """
+            INSERT INTO wiki_repair_actions (
+                action_id, finding_id, page_id, action_type,
+                repair_lane, repair_lane_registered, status,
+                details_json, created_at, finished_at, error_message
+            ) VALUES ('integrity-1', 'integrity-finding-1', 'core.ops.queue',
+                      'repair_research_source_schema', 'integrity', 1,
+                      'scheduled', '{}', ?, '', '')
+            """,
+            (now,),
+        )
+
+    queue = service.project_status_snapshot()["repair_queue"]
+
+    assert queue["open_count"] == 31
+    assert queue["by_lane"]["strategy"]["open_count"] == 30
+    assert queue["by_lane"]["integrity"]["open_count"] == 1
+    assert queue["repair_health_inputs"]["open_count"] == 1
+
+
+def test_resolving_one_identity_resolves_all_equivalent_open_rows(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    service.initialize()
+    details = {
+        "decision_scope": "kis",
+        "symbols": ["005930"],
+        "repair_identity": "kis:financials:005930",
+    }
+    with service._connect() as conn:
+        for index in range(2):
+            conn.execute(
+                """
+                INSERT INTO wiki_repair_actions (
+                    action_id, finding_id, page_id, action_type, status,
+                    details_json, created_at, finished_at, error_message
+                ) VALUES (?, ?, ?, ?, 'scheduled', ?, ?, '', '')
+                """,
+                (
+                    f"legacy-{index}",
+                    "financials:005930",
+                    "kis.symbol.005930",
+                    "refresh_financials",
+                    json.dumps(details),
+                    f"2026-07-10T00:00:0{index}+00:00",
+                ),
+            )
+
+    result = service.resolve_repair_identity(
+        repair_identity="kis:financials:005930",
+        resolved_by="financials_refreshed",
+    )
+
+    assert result["resolved_count"] == 2
+    assert all(row["status"] == "resolved" for row in result["rows"])
+    assert all(
+        row["details"]["resolved_by"] == "financials_refreshed"
+        for row in result["rows"]
+    )
+
+
+def test_duplicate_open_repairs_are_preserved_as_resolved_audit_rows(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    service.initialize()
+    details = {"decision_scope": "kis", "symbols": ["005930"]}
+    with service._connect() as conn:
+        for index in range(2):
+            conn.execute(
+                """
+                INSERT INTO wiki_repair_actions (
+                    action_id, finding_id, page_id, action_type, status,
+                    details_json, created_at, finished_at, error_message
+                ) VALUES (?, 'financials:005930', 'kis.symbol.005930',
+                    'refresh_financials', 'scheduled', ?, ?, '', '')
+                """,
+                (
+                    f"duplicate-{index}",
+                    json.dumps(details),
+                    f"2026-07-10T00:00:0{index}+00:00",
+                ),
+            )
+
+    result = service.resolve_duplicate_open_repair_actions()
+
+    assert result["resolved_count"] == 1
+    assert service.project_status_snapshot()["repair_queue"]["open_count"] == 1
+    with service._connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT status, details_json
+            FROM wiki_repair_actions
+            ORDER BY created_at, action_id
+            """
+        ).fetchall()
+    assert len(rows) == 2
+    assert [row["status"] for row in rows] == ["scheduled", "resolved"]
+    assert json.loads(rows[1]["details_json"])["resolved_by"] == (
+        "duplicate_open_repair_action"
+    )
+
+
+def test_repair_once_compacts_stable_identity_duplicates_before_work(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    service.initialize()
+    details = {"decision_scope": "kis", "symbols": ["005930"]}
+    with service._connect() as conn:
+        for index in range(2):
+            conn.execute(
+                """
+                INSERT INTO wiki_repair_actions (
+                    action_id, finding_id, page_id, action_type, status,
+                    details_json, created_at, finished_at, error_message
+                ) VALUES (?, 'financials:005930', 'kis.symbol.005930',
+                    'refresh_financials', 'scheduled', ?, ?, '', '')
+                """,
+                (
+                    f"cycle-duplicate-{index}",
+                    json.dumps(details),
+                    f"2026-07-10T00:00:0{index}+00:00",
+                ),
+            )
+
+    result = service.repair_once(scope="kis")
+
+    assert result["stable_identity_duplicates"]["resolved_count"] == 1
+
+
+def test_clean_target_resolution_is_identity_wide_in_one_transaction(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service = _service(tmp_path)
+    service.initialize()
+    details = {
+        "decision_scope": "kis",
+        "symbols": ["005930"],
+        "repair_identity": "kis:financials:005930",
+        "quality_warnings": ["financials_missing"],
+        "impacted_page_ids": ["kis.symbol.005930"],
+    }
+    with service._connect() as conn:
+        for index in range(2):
+            conn.execute(
+                """
+                INSERT INTO wiki_repair_actions (
+                    action_id, finding_id, page_id, action_type, status,
+                    details_json, created_at, finished_at, error_message
+                ) VALUES (?, 'financials:005930', 'kis.symbol.005930',
+                    'refresh_financials', 'scheduled', ?, ?, '', '')
+                """,
+                (
+                    f"target-duplicate-{index}",
+                    json.dumps(details),
+                    f"2026-07-10T00:00:0{index}+00:00",
+                ),
+            )
+        checks = iter([True, False])
+        monkeypatch.setattr(
+            service,
+            "_repair_action_targets_are_clean",
+            lambda *_args, **_kwargs: next(checks),
+        )
+        service._resolve_repair_actions_for_clean_targets(
+            conn,
+            "2026-07-10T01:00:00+00:00",
+        )
+        statuses = conn.execute(
+            """
+            SELECT status
+            FROM wiki_repair_actions
+            ORDER BY created_at, action_id
+            """
+        ).fetchall()
+
+    assert [row["status"] for row in statuses] == ["resolved", "resolved"]
+
+
+def test_manager_evidence_recovery_is_identity_wide(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service = _service(tmp_path)
+    service.initialize()
+    details = {
+        "decision_scope": "kis",
+        "symbols": ["005930"],
+        "repair_identity": "kis:manager-evidence:005930",
+        "requires_manager_confirmation": True,
+        "manager_observed_at": "2026-07-10T00:00:00+00:00",
+        "quality_warnings": ["financials_missing"],
+    }
+    with service._connect() as conn:
+        for index in range(2):
+            conn.execute(
+                """
+                INSERT INTO wiki_repair_actions (
+                    action_id, finding_id, page_id, action_type, status,
+                    details_json, created_at, finished_at, error_message
+                ) VALUES (?, 'manager:005930', 'kis.symbol.005930',
+                    'refresh_manager_evidence', 'scheduled', ?, ?, '', '')
+                """,
+                (
+                    f"manager-duplicate-{index}",
+                    json.dumps(details),
+                    f"2026-07-10T00:00:0{index}+00:00",
+                ),
+            )
+    checks = iter([True, False])
+    monkeypatch.setattr(
+        service,
+        "_manager_observation_evidence_quality_is_clean",
+        lambda *_args, **_kwargs: next(checks),
+    )
+
+    resolved_count = service._resolve_manager_observation_repair_actions(
+        scope="kis",
+        observations_by_symbol={
+            "005930": [
+                {
+                    "observed_at": "2026-07-10T01:00:00+00:00",
+                    "manager_run_id": "manager:new",
+                    "wiki_evidence_quality_summary": "strong",
+                    "wiki_evidence_quality_status_counts": {"strong": 4},
+                }
+            ]
+        },
+    )
+
+    with service._connect() as conn:
+        statuses = conn.execute(
+            """
+            SELECT status
+            FROM wiki_repair_actions
+            ORDER BY created_at, action_id
+            """
+        ).fetchall()
+    assert resolved_count == 2
+    assert [row["status"] for row in statuses] == ["resolved", "resolved"]
 
 
 def test_status_repair_queue_open_symbols_include_impacted_and_target_symbols(
@@ -4571,7 +5052,7 @@ def test_status_repair_queue_open_symbols_include_impacted_and_target_symbols(
             """
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert status["repair_queue"]["open_symbols"] == ["000660", "402340"]
 
@@ -4597,7 +5078,7 @@ def test_status_repair_queue_batches_use_decision_scope_for_meta_actions(
             """
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert status["repair_queue"]["by_scope"] == {
         "kis": {"open_count": 1, "resolved_count": 0}
@@ -4669,7 +5150,7 @@ def test_repair_once_skips_and_resolves_repair_queue_evidence_shadow_actions(
         )
 
     result = service.repair_once(scope="kis")
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert result["evidence_quality_actions"] == []
     assert result["repair_queue_shadow_resolved_actions"][0]["action_id"] == (
@@ -4867,7 +5348,7 @@ def test_repair_once_resolves_quality_warning_action_without_impacted_pages(
         )
 
     result = service.repair_once(scope="kis")
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert result["quality_warning_effectiveness_actions"] == []
     assert result["quality_warning_effectiveness_resolved_actions"][0][
@@ -4977,7 +5458,7 @@ def test_status_exposes_configured_research_source_coverage(
         )
     )
 
-    status = service.status()
+    status = service.project_status_snapshot()
     coverage = status["research_coverage"]
     kis = coverage["by_scope"]["kis"]
 
@@ -5023,9 +5504,9 @@ def test_status_treats_current_daily_discovery_schema_as_covered(
         )
     )
 
-    daily_discovery = service.status()["research_coverage"]["by_scope"]["kis"][
-        "sources"
-    ]["daily_discovery"]
+    daily_discovery = service.project_status_snapshot()["research_coverage"][
+        "by_scope"
+    ]["kis"]["sources"]["daily_discovery"]
 
     assert daily_discovery["status"] == "ok"
     assert daily_discovery["warning"] is False
@@ -5087,7 +5568,7 @@ def test_repair_once_resolves_stale_research_coverage_actions(
         )
 
     result = service.repair_once(scope="kis")
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert result["research_coverage_actions"] == []
     resolved_ids = {
@@ -5179,7 +5660,7 @@ def test_repair_once_resolves_stale_research_coverage_shadow_chain(
         )
 
     result = service.repair_once(scope="kis")
-    status = service.status()
+    status = service.project_status_snapshot()
 
     resolved_ids = {
         row["action_id"] for row in result["research_coverage_resolved_actions"]
@@ -5200,7 +5681,7 @@ def test_ops_payload_warns_for_configured_unhealthy_wiki_research_sources(
             naver_reports_db_path=tmp_path / "missing_naver_reports.db",
         )
     )
-    status = service.status()
+    status = service.project_status_snapshot()
 
     payload = build_ops_jue_wiki_payload(
         enabled=True,
@@ -5240,7 +5721,7 @@ def test_repair_once_records_research_coverage_repair_actions(
     service.rebuild(scope="kis", force=True)
 
     result = service.repair_once(scope="kis")
-    status = service.status()
+    status = service.project_status_snapshot()
 
     actions = result["research_coverage_actions"]
     action_types = {row["action_type"] for row in actions}
@@ -5294,7 +5775,7 @@ def test_repair_once_records_table_level_research_coverage_warnings(
     service.rebuild(scope="kis", force=True)
 
     result = service.repair_once(scope="kis")
-    status = service.status()
+    status = service.project_status_snapshot()
 
     actions = result["research_coverage_actions"]
     daily_discovery = [
@@ -5379,7 +5860,7 @@ def test_status_preserves_latest_selection_requested_symbol_coverage(
         },
     )
 
-    status = service.status()
+    status = service.project_status_snapshot()
 
     budget_report = status["latest_selection"]["budget_report"]
     assert budget_report["requested_symbol_count"] == 3
@@ -5461,7 +5942,7 @@ def test_status_uses_full_selection_pressure_before_compact_selection(
             ("2026-06-28T01:05:00+00:00", "selection:compact"),
         )
 
-    status = service.status()
+    status = service.project_status_snapshot()
     payload = build_ops_jue_wiki_payload(
         enabled=True,
         status=status,
@@ -5524,7 +6005,7 @@ def test_write_page_records_frontmatter_sections_and_repository_row(
     assert "scope: kis" in page["content"]
     assert "## Current Stance" in page["content"]
     assert "## Next Context Pack Summary" in page["content"]
-    status = service.status()
+    status = service.project_status_snapshot()
     assert status["page_count"] == 1
     assert status["scopes"]["kis"] == 1
 
@@ -6717,7 +7198,7 @@ def test_rebuild_binance_symbols_resolves_manager_context_repair_after_strong_ev
     )
 
     result = service.rebuild(scope="binance", force=True)
-    status = service.status()
+    status = service.project_status_snapshot()
 
     assert result["status"] == "ok"
     assert status["repair_queue"]["open_count"] == 0
@@ -7256,9 +7737,12 @@ def test_rebuild_kis_symbols_attaches_symbol_fundamentals_source_refs(
     tmp_path: Path,
 ) -> None:
     fundamentals_db = tmp_path / "symbol_fundamentals.db"
+    observed_at = datetime.now(timezone.utc)
+    as_of = observed_at.date().isoformat()
+    crawled_at = observed_at.isoformat()
     with sqlite3.connect(fundamentals_db) as conn:
         conn.executescript(
-            """
+            f"""
             CREATE TABLE valuation_snapshots (
                 snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL,
@@ -7274,7 +7758,7 @@ def test_rebuild_kis_symbols_attaches_symbol_fundamentals_source_refs(
                 industry_name TEXT NOT NULL DEFAULT '',
                 as_of TEXT NOT NULL,
                 source_url TEXT NOT NULL DEFAULT '',
-                raw_json TEXT NOT NULL DEFAULT '{}',
+                raw_json TEXT NOT NULL DEFAULT '{{}}',
                 crawled_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'ok',
                 error_message TEXT NOT NULL DEFAULT '',
@@ -7304,7 +7788,7 @@ def test_rebuild_kis_symbols_attaches_symbol_fundamentals_source_refs(
                 roe REAL,
                 debt_ratio REAL,
                 operating_margin REAL,
-                raw_json TEXT NOT NULL DEFAULT '{}',
+                raw_json TEXT NOT NULL DEFAULT '{{}}',
                 crawled_at TEXT NOT NULL
             );
             INSERT INTO valuation_snapshots (
@@ -7314,15 +7798,15 @@ def test_rebuild_kis_symbols_attaches_symbol_fundamentals_source_refs(
             ) VALUES (
                 '005930', '삼성전자', 73000, 435000000000000, 13.4, 5450,
                 1.21, 60300, 1.9, 17.8, '반도체와반도체장비',
-                '2026-07-03',
-                'https://finance.naver.com/item/coinfo.naver?code=005930',
-                '2026-07-03T00:00:00+00:00', 'ok'
+                    '{as_of}',
+                    'https://finance.naver.com/item/coinfo.naver?code=005930',
+                    '{crawled_at}', 'ok'
             );
             INSERT INTO valuation_scores VALUES (
                 '005930', 72, 18, 81, 64, 24.7, 0.83, 'undervalued',
                 '["업종 PER 대비 할인", "PBR 부담 낮음"]',
                 '["메모리 사이클 변동성"]',
-                '2026-07-03T00:01:00+00:00'
+                    '{crawled_at}'
             );
             INSERT INTO financial_snapshots (
                 symbol, period_type, period, revenue, operating_profit,
@@ -7330,7 +7814,7 @@ def test_rebuild_kis_symbols_attaches_symbol_fundamentals_source_refs(
             ) VALUES (
                 '005930', 'annual', '2025', 300000000000000, 32000000000000,
                 26000000000000, 9.8, 27.5, 10.7,
-                '2026-07-03T00:02:00+00:00'
+                    '{crawled_at}'
             );
             """
         )
@@ -7358,7 +7842,7 @@ def test_rebuild_kis_symbols_attaches_symbol_fundamentals_source_refs(
     assert "annual:2025 revenue=300,000,000,000,000" in page["content"]
     assert any(
         row["source_type"] == "symbol_fundamentals"
-        and row["source_id"] == "005930:2026-07-03"
+        and row["source_id"] == f"005930:{as_of}"
         and row["quality_status"] == "strong"
         for row in sources["source_refs"]
     )
@@ -8750,3 +9234,315 @@ def test_lint_returns_ok_for_clean_pages(tmp_path: Path) -> None:
     assert result["status"] == "ok"
     assert result["scope"] == "all"
     assert result["open_findings"] == []
+
+
+def test_context_pack_adds_legacy_metadata_when_v3_tables_are_unavailable(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path, context_max_chars=1200)
+    service.write_page(
+        scope="kis",
+        page_type="symbol",
+        key="005930",
+        title="삼성전자",
+        symbols=["005930"],
+        content_sections={
+            "Current Stance": "current",
+            "Durable Facts": "facts",
+            "Evidence Links": "evidence",
+            "Trading History": "history",
+            "Lessons": "lessons",
+            "Contradictions": "none",
+            "Open Questions": "questions",
+            "Next Context Pack Summary": "legacy summary",
+        },
+        source_refs=[],
+        confidence=0.8,
+        freshness="fresh",
+    )
+
+    payload = service.context_pack(target_scope="kis", symbols=["005930"])
+
+    assert "legacy summary" in payload["content"]
+    assert payload["snapshot_id"] == ""
+    assert payload["read_mode"] == "shadow"
+    assert payload["coverage_status"] == "legacy"
+    assert payload["repair_required"] is False
+    assert payload["wiki_context_contract"]["status"] == "legacy"
+    assert payload["wiki_context_contract"]["selected_pages"] == ()
+
+
+def test_context_pack_adds_published_v3_snapshot_metadata(tmp_path: Path) -> None:
+    service = _service(tmp_path, context_max_chars=12_000)
+    service.initialize()
+    evidence = EvidenceRefV1(
+        evidence_id="naver-report:42",
+        source_type="naver_report",
+        source_id="42",
+        content_hash="a" * 64,
+        observed_at="2026-07-11T00:00:00+00:00",
+    )
+    claim = WikiClaimV3(
+        claim_id="claim:kis:005930:direction",
+        claim_type="interpretation",
+        text="Revision direction is supported.",
+        status="verified",
+        scope="kis",
+        evidence=(evidence,),
+        symbols=("005930",),
+        confidence=0.9,
+    )
+    page = JueWikiPageV3(
+        page_id="kis.symbol.005930.v3",
+        page_type="symbol",
+        scope="kis",
+        title="005930",
+        summary="Current verified V3 research.",
+        claims=(claim,),
+        relationships=(),
+        status="verified",
+        schema_version="jue_wiki_page_v3",
+        compiler_version="wiki_compiler_v1",
+    )
+    snapshot = WikiSnapshotV1(
+        snapshot_id="snapshot:kis:published",
+        scope="kis",
+        candidate_artifact_ids=(),
+        pages=(page,),
+        schema_version="jue_wiki_page_v3",
+        compiler_version="wiki_compiler_v1",
+        created_at="2026-07-11T00:00:00+00:00",
+    )
+    repository = service.repository()
+    repository.initialize()
+    repository.register_evidence(evidence)
+    repository.publish_snapshot(snapshot)
+
+    payload = service.context_pack(target_scope="kis", symbols=["005930"])
+
+    assert payload["snapshot_id"] == snapshot.snapshot_id
+    assert payload["read_mode"] == "shadow"
+    assert payload["coverage_status"] == "sufficient"
+    assert payload["repair_required"] is False
+    assert payload["wiki_context_contract"]["snapshot_id"] == snapshot.snapshot_id
+    assert payload["wiki_context_contract"]["selected_pages"] == (page.to_dict(),)
+
+
+def test_context_pack_reads_prior_v3_evidence_schema_without_writing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service = _service(tmp_path, context_max_chars=12_000)
+    service.write_page(
+        scope="kis",
+        page_type="symbol",
+        key="005930",
+        title="삼성전자",
+        symbols=["005930"],
+        content_sections={
+            "Current Stance": "current",
+            "Durable Facts": "facts",
+            "Evidence Links": "evidence",
+            "Trading History": "history",
+            "Lessons": "lessons",
+            "Contradictions": "none",
+            "Open Questions": "questions",
+            "Next Context Pack Summary": "legacy selection remains available",
+        },
+        source_refs=[],
+        confidence=0.8,
+        freshness="fresh",
+    )
+    evidence = EvidenceRefV1(
+        evidence_id="naver-report:prior-schema",
+        source_type="naver_report",
+        source_id="prior-schema",
+        content_hash="a" * 64,
+        observed_at="2026-07-11T00:00:00+00:00",
+    )
+    claim = WikiClaimV3(
+        claim_id="claim:kis:005930:prior-schema",
+        claim_type="fact",
+        text="Prior-schema evidence remains readable.",
+        status="verified",
+        scope="kis",
+        evidence=(evidence,),
+        symbols=("005930",),
+        confidence=0.9,
+    )
+    page = JueWikiPageV3(
+        page_id="kis.symbol.005930.prior-schema",
+        page_type="symbol",
+        scope="kis",
+        title="005930 prior schema",
+        summary="Prior-schema V3 snapshot.",
+        claims=(claim,),
+        relationships=(),
+        status="verified",
+        schema_version="jue_wiki_page_v3",
+        compiler_version="wiki_compiler_v1",
+    )
+    db_path = service.config.db_path
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE wiki_evidence_v1 (
+                evidence_id TEXT PRIMARY KEY,
+                source_type TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                source_path TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE wiki_snapshots_v1 (
+                snapshot_id TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                compiler_version TEXT NOT NULL,
+                candidate_ids_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                published INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE wiki_pages_v3 (
+                snapshot_id TEXT NOT NULL,
+                page_id TEXT NOT NULL,
+                page_json TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                PRIMARY KEY (snapshot_id, page_id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_evidence_v1 (
+                evidence_id, source_type, source_id, content_hash,
+                observed_at, source_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                evidence.evidence_id,
+                evidence.source_type,
+                evidence.source_id,
+                evidence.content_hash,
+                evidence.observed_at,
+                evidence.source_path,
+                "2026-07-11T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_snapshots_v1 (
+                snapshot_id, scope, schema_version, compiler_version,
+                candidate_ids_json, created_at, published
+            ) VALUES (?, ?, ?, ?, '[]', ?, 1)
+            """,
+            (
+                "snapshot:kis:prior-schema",
+                "kis",
+                "jue_wiki_page_v3",
+                "wiki_compiler_v1",
+                "2026-07-11T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_pages_v3 (
+                snapshot_id, page_id, page_json, content_hash
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                "snapshot:kis:prior-schema",
+                page.page_id,
+                json.dumps(page.to_dict(), ensure_ascii=False, sort_keys=True),
+                "b" * 64,
+            ),
+        )
+
+    monkeypatch.setattr(service, "initialize", lambda: {"status": "ok"})
+    before_bytes = db_path.read_bytes()
+    before_mtime_ns = db_path.stat().st_mtime_ns
+
+    payload = service.context_pack(target_scope="kis", symbols=["005930"])
+
+    assert db_path.read_bytes() == before_bytes
+    assert db_path.stat().st_mtime_ns == before_mtime_ns
+    assert payload["read_mode"] == "shadow"
+    assert payload["snapshot_id"] == "snapshot:kis:prior-schema"
+    assert payload["coverage_status"] == "sufficient"
+    assert payload["wiki_context_contract"]["selected_pages"] == (page.to_dict(),)
+
+
+@pytest.mark.parametrize(
+    ("configured_budget", "requested_budget", "expected_budget"),
+    [
+        pytest.param(1200, 1, 1, id="explicit-one"),
+        pytest.param(0, None, 0, id="zero-config"),
+    ],
+)
+def test_context_pack_tiny_legacy_budget_uses_legal_v3_probe_floor(
+    tmp_path: Path,
+    monkeypatch,
+    configured_budget: int,
+    requested_budget: int | None,
+    expected_budget: int,
+) -> None:
+    service = _service(tmp_path, context_max_chars=configured_budget)
+    service.write_page(
+        scope="kis",
+        page_type="symbol",
+        key="005930",
+        title="삼성전자",
+        symbols=["005930"],
+        content_sections={
+            "Current Stance": "current",
+            "Durable Facts": "facts",
+            "Evidence Links": "evidence",
+            "Trading History": "history",
+            "Lessons": "lessons",
+            "Contradictions": "none",
+            "Open Questions": "questions",
+            "Next Context Pack Summary": "tiny legacy budget",
+        },
+        source_refs=[],
+        confidence=0.8,
+        freshness="fresh",
+    )
+    fallback_packet = service._legacy_context_packet()
+    fallback_metadata = {
+        "wiki_context_contract": fallback_packet.to_dict(),
+        "snapshot_id": fallback_packet.snapshot_id,
+        "read_mode": fallback_packet.read_mode,
+        "coverage_status": fallback_packet.coverage_status,
+        "repair_required": fallback_packet.repair_required,
+    }
+    real_probe = service._context_pack_v3_metadata
+    monkeypatch.setattr(
+        service,
+        "_context_pack_v3_metadata",
+        lambda **_kwargs: fallback_metadata,
+    )
+    baseline = service.context_pack(
+        target_scope="kis",
+        symbols=["005930"],
+        max_chars=requested_budget,
+    )
+    monkeypatch.setattr(service, "_context_pack_v3_metadata", real_probe)
+
+    payload = service.context_pack(
+        target_scope="kis",
+        symbols=["005930"],
+        max_chars=requested_budget,
+    )
+
+    assert payload == baseline
+    assert payload["budget"] == expected_budget
+    assert payload["char_count"] <= expected_budget
+    assert payload["coverage_status"] == "legacy"
+    assert payload["read_mode"] == "shadow"
+    assert payload["snapshot_id"] == ""
+    assert payload["wiki_context_contract"]["status"] == "legacy"
+    assert payload["wiki_context_contract"]["char_count"] <= max(
+        expected_budget,
+        2,
+    )

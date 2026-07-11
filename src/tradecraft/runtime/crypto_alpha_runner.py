@@ -50,7 +50,7 @@ def build_crypto_alpha_service(settings: AppSettings) -> CryptoAlphaService:
             rate_limit_sec=float(_setting(settings, "crypto_alpha_rate_limit_sec", 2.0)),
             context_limit=int(_setting(settings, "crypto_alpha_context_limit", 12)),
             llm_model=str(
-                _setting(settings, "crypto_alpha_llm_model", "gpt-5.5")
+                _setting(settings, "crypto_alpha_llm_model", "gpt-5.6-luna")
             ),
             llm_reasoning_effort=str(
                 _setting(settings, "crypto_alpha_llm_reasoning_effort", "xhigh")

@@ -18,6 +18,7 @@ from tradecraft.services.codex_native import (
     CodexNativeRuntime,
     codex_native_thread_config_kwargs,
 )
+from tradecraft.services.llm_model_policy import llm_model_config_kwargs
 
 try:
     from tradecraft.runtime.process_status import (
@@ -238,16 +239,7 @@ def build_crypto_market_research_service(settings: AppSettings) -> Any:
             mode=settings.codex_runtime_mode,
             sdk_codex_bin=settings.codex_runtime_sdk_codex_bin,
             timeout_ms=settings.codex_runtime_timeout_ms,
-            model=str(
-                _setting(
-                    settings,
-                    "crypto_market_research_llm_model",
-                    "gpt-5.5",
-                )
-            ),
-            reasoning_effort=str(
-                _setting(settings, "crypto_market_research_llm_reasoning_effort", "xhigh")
-            ),
+            **llm_model_config_kwargs(settings, component="crypto_market_research"),
             usage_enabled=settings.llm_usage_enabled,
             usage_db_path=settings.llm_usage_db_path,
             usage_component="crypto_market_research",
@@ -267,7 +259,7 @@ def build_crypto_market_research_service(settings: AppSettings) -> Any:
             _setting(
                 settings,
                 "crypto_market_research_llm_model",
-                "gpt-5.5",
+                "gpt-5.6-terra",
             )
         ),
         llm_reasoning_effort=str(

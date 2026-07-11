@@ -197,6 +197,47 @@ class _FailingLLM:
         return {"ok": False, "error": self.error}
 
 
+def test_market_judge_budget_violation_skips_llm(tmp_path: Path) -> None:
+    class CountingLLM:
+        ready = True
+        resolved_model = "test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, payload, timeout_ms=None) -> dict:
+            _ = payload, timeout_ms
+            self.calls += 1
+            return {"ok": True, "content": '{"judgments": []}'}
+
+    llm = CountingLLM()
+    engine = MarketJudgmentEngine(
+        config=MarketJudgmentConfig(
+            db_path=str(tmp_path / "market_judgment.db"),
+            max_symbols=1,
+            llm_max_symbols=1,
+            prompt_target_chars=6_000,
+            prompt_warn_chars=8_000,
+            prompt_max_chars=10_000,
+        ),
+        kis=_FakeKIS(),  # type: ignore[arg-type]
+        codex_runtime=llm,  # type: ignore[arg-type]
+        strategy_engine=_FakeStrategy(),  # type: ignore[arg-type]
+        calendar=_OpenCalendar(),  # type: ignore[arg-type]
+    )
+    engine._build_prompt = lambda **_kwargs: {  # type: ignore[method-assign]
+        "account": {"irreducible": "x" * 20_000},
+        "symbols": [{"symbol": "005930"}],
+        "strategy_summary": {},
+    }
+
+    result = asyncio.run(engine.run_once(use_llm=True))
+
+    assert result["status"] == "error"
+    assert result["error_message"].startswith("prompt_budget_contract_violation")
+    assert llm.calls == 0
+
+
 class _ResearchRunnerGapLLM(_FakeLLM):
     async def complete(self, payload, timeout_ms=None) -> dict:
         _ = timeout_ms

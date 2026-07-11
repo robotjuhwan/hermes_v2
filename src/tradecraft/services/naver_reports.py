@@ -2174,7 +2174,7 @@ class NaverReportCrawlerConfig:
     codex_runtime_mode: str = "auto"
     codex_runtime_sdk_codex_bin: str = ""
     codex_runtime_timeout_ms: int = 60000
-    llm_model: str = "gpt-5.5"
+    llm_model: str = "gpt-5.6-luna"
     llm_reasoning_effort: str = "xhigh"
     llm_usage_enabled: bool = True
     llm_usage_db_path: str = ".runtime/llm_usage.db"
@@ -2425,6 +2425,7 @@ class NaverReportRepository:
                     symbol TEXT PRIMARY KEY,
                     company_name TEXT NOT NULL,
                     market TEXT NOT NULL DEFAULT '',
+                    asset_class TEXT NOT NULL DEFAULT 'stock',
                     status TEXT NOT NULL DEFAULT 'active',
                     source TEXT NOT NULL DEFAULT 'unknown',
                     confidence REAL NOT NULL DEFAULT 1.0,
@@ -2516,6 +2517,24 @@ class NaverReportRepository:
                 table="symbol_directory",
                 column="market",
                 definition="TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                conn=conn,
+                table="symbol_directory",
+                column="asset_class",
+                definition="TEXT NOT NULL DEFAULT 'stock'",
+            )
+            conn.execute(
+                """
+                UPDATE symbol_directory
+                SET asset_class = CASE
+                    WHEN UPPER(COALESCE(market, '')) = 'ETF' THEN 'etf'
+                    WHEN UPPER(COALESCE(market, '')) = 'ETN' THEN 'etn'
+                    ELSE asset_class
+                END
+                WHERE UPPER(COALESCE(market, '')) IN ('ETF', 'ETN')
+                  AND LOWER(COALESCE(NULLIF(asset_class, ''), 'stock')) = 'stock'
+                """
             )
             self._ensure_column(
                 conn=conn,
@@ -2923,25 +2942,32 @@ class NaverReportRepository:
         confidence: float,
         status: str,
         verified_at: str,
+        asset_class: str = "",
     ) -> None:
         code = str(symbol or "").strip()
         name = _clean_company_name(company_name)
         if not _is_six_digit_symbol(code) or not name:
             return
         now = str(verified_at or utc_now_iso())
+        market_text = str(market or "").strip()[:24]
+        asset_class_text = (
+            str(asset_class or "").strip().lower()
+            or _symbol_asset_class_from_market(market_text)
+        )[:24]
         conn.execute(
             """
             INSERT INTO symbol_directory(
                 symbol,
                 company_name,
                 market,
+                asset_class,
                 status,
                 source,
                 confidence,
                 first_seen_at,
                 updated_at,
                 last_verified_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 company_name=CASE
                     WHEN excluded.company_name <> ''
@@ -2971,6 +2997,16 @@ class NaverReportRepository:
                     WHEN excluded.market <> '' THEN excluded.market
                     ELSE symbol_directory.market
                 END,
+                asset_class=CASE
+                    WHEN excluded.asset_class <> ''
+                      AND (
+                        LOWER(excluded.asset_class) <> 'stock'
+                        OR excluded.market <> ''
+                        OR TRIM(COALESCE(symbol_directory.asset_class, '')) = ''
+                      )
+                    THEN excluded.asset_class
+                    ELSE symbol_directory.asset_class
+                END,
                 status=CASE
                     WHEN excluded.status <> '' THEN excluded.status
                     ELSE symbol_directory.status
@@ -2992,7 +3028,8 @@ class NaverReportRepository:
             (
                 code,
                 name,
-                str(market or "").strip()[:24],
+                market_text,
+                asset_class_text or "stock",
                 str(status or "active").strip()[:24],
                 str(source or "unknown").strip()[:40],
                 max(min(float(confidence), 1.0), 0.0),
@@ -3008,6 +3045,7 @@ class NaverReportRepository:
         symbol: str,
         company_name: str,
         market: str = "",
+        asset_class: str = "",
         source: str = "manual",
         confidence: float = 1.0,
         status: str = "active",
@@ -3023,6 +3061,7 @@ class NaverReportRepository:
                 confidence=confidence,
                 status=status,
                 verified_at=verified_at or utc_now_iso(),
+                asset_class=asset_class,
             )
         self._invalidate_status_cache()
 
@@ -3038,6 +3077,7 @@ class NaverReportRepository:
                 if not symbol or not name:
                     continue
                 market = str(item.get("market") or "").strip()
+                asset_class = str(item.get("asset_class") or "").strip()
                 source = str(item.get("source") or "configured_etf").strip()
                 self._upsert_symbol_directory_with_conn(
                     conn=conn,
@@ -3048,6 +3088,7 @@ class NaverReportRepository:
                     confidence=1.0,
                     status=str(item.get("status") or "active"),
                     verified_at=now,
+                    asset_class=asset_class,
                 )
                 updated += 1
         if updated:
@@ -3243,7 +3284,13 @@ class NaverReportRepository:
                 FROM report_symbol_links l
                 JOIN reports r ON r.report_id = l.report_id
                 WHERE l.symbol = ?
-                ORDER BY r.published_at DESC, r.updated_at DESC, l.confidence DESC
+                ORDER BY
+                  r.published_at DESC,
+                  r.updated_at DESC,
+                  l.confidence DESC,
+                  r.report_id DESC,
+                  l.symbol ASC,
+                  l.link_type ASC
                 LIMIT ?
                 """,
                 (code, max_rows),
@@ -3445,8 +3492,10 @@ class NaverReportRepository:
         market: str = "",
         limit: int = 100,
         exclude_symbols: set[str] | None = None,
+        asset_class: str = "stock",
     ) -> list[dict[str, Any]]:
         market_filter = str(market or "").strip().upper()
+        requested_asset_class = str(asset_class or "stock").strip().lower() or "stock"
         max_rows = max(int(limit), 1)
         excluded = {
             str(item or "").strip()
@@ -3463,21 +3512,31 @@ class NaverReportRepository:
                 return []
 
             select_columns = ["symbol", "company_name"]
-            for column in ("market", "source", "confidence", "updated_at"):
+            for column in ("market", "asset_class", "source", "confidence", "updated_at"):
                 if column in columns:
                     select_columns.append(column)
             where = ["TRIM(COALESCE(symbol, '')) <> ''"]
             where.append("TRIM(COALESCE(company_name, '')) <> ''")
             params: list[Any] = []
             if "market" in columns:
-                where.append("UPPER(COALESCE(market, '')) NOT IN ('ETF', 'ETN')")
-                if market_filter:
+                if requested_asset_class in {"etf", "etn"}:
                     where.append("UPPER(COALESCE(market, '')) = ?")
-                    params.append(market_filter)
+                    params.append(market_filter or requested_asset_class.upper())
+                else:
+                    where.append("UPPER(COALESCE(market, '')) NOT IN ('ETF', 'ETN')")
+                    if market_filter:
+                        where.append("UPPER(COALESCE(market, '')) = ?")
+                        params.append(market_filter)
             if "asset_class" in columns:
-                where.append(
-                    "LOWER(COALESCE(NULLIF(asset_class, ''), 'stock')) = 'stock'"
-                )
+                if requested_asset_class in {"etf", "etn"}:
+                    where.append(
+                        "LOWER(COALESCE(NULLIF(asset_class, ''), 'stock')) = ?"
+                    )
+                    params.append(requested_asset_class)
+                else:
+                    where.append(
+                        "LOWER(COALESCE(NULLIF(asset_class, ''), 'stock')) = 'stock'"
+                    )
             if "status" in columns:
                 where.append(
                     """
@@ -3517,7 +3576,14 @@ class NaverReportRepository:
                     "updated_at": (
                         str(row["updated_at"] or "") if "updated_at" in row.keys() else ""
                     ),
-                    "asset_class": "stock",
+                    "asset_class": (
+                        str(row["asset_class"] or "").strip().lower()
+                        if "asset_class" in row.keys()
+                        else _symbol_asset_class_from_market(
+                            str(row["market"] or "") if "market" in row.keys() else ""
+                        )
+                    )
+                    or requested_asset_class,
                 }
             )
             if len(out) >= max_rows:

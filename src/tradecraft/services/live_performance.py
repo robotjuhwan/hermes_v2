@@ -1774,9 +1774,34 @@ def classify_block_attribution(row: BlockPerformanceInput) -> dict[str, Any]:
         metadata.get("execution_defect_reason")
         or metadata.get("performance_exclusion_reason")
     )
+    raw_fill_provenance = _clean_key(
+        metadata.get("fill_provenance")
+        or metadata.get("fill_source")
+        or metadata.get("execution_source")
+    )
+    if "paper" in raw_fill_provenance:
+        fill_provenance = "paper_fill"
+    elif "exchange" in raw_fill_provenance or raw_fill_provenance == "live_fill":
+        fill_provenance = "exchange_fill"
+    elif bool(row.filled):
+        fill_provenance = "unknown_fill"
+    else:
+        fill_provenance = "not_filled"
+    pnl_state = (
+        "realized"
+        if bool(row.filled) and status in {"closed", "resolved", "exited"}
+        else "unrealized"
+        if bool(row.filled)
+        else "not_applicable"
+    )
+    provenance = {
+        "fill_provenance": fill_provenance,
+        "pnl_state": pnl_state,
+    }
 
     if bool(metadata.get("execution_defect")) or execution_defect_reason:
         return {
+            **provenance,
             "attribution": (
                 f"execution_defect_{execution_defect_reason}"
                 if execution_defect_reason
@@ -1789,6 +1814,7 @@ def classify_block_attribution(row: BlockPerformanceInput) -> dict[str, Any]:
 
     if created_by in {"existing_position", "wallet_adoption"}:
         return {
+            **provenance,
             "attribution": (
                 "adopted_existing_position"
                 if created_by == "existing_position"
@@ -1801,6 +1827,7 @@ def classify_block_attribution(row: BlockPerformanceInput) -> dict[str, Any]:
 
     if status == "error" and not bool(row.filled):
         return {
+            **provenance,
             "attribution": "operational_failure_pre_fill",
             "include_in_jue_alpha": False,
             "include_in_risk_management": False,
@@ -1809,6 +1836,7 @@ def classify_block_attribution(row: BlockPerformanceInput) -> dict[str, Any]:
 
     if not bool(row.filled):
         return {
+            **provenance,
             "attribution": "unfilled_or_unrealized",
             "include_in_jue_alpha": False,
             "include_in_risk_management": True,
@@ -1816,6 +1844,7 @@ def classify_block_attribution(row: BlockPerformanceInput) -> dict[str, Any]:
         }
 
     return {
+        **provenance,
         "attribution": "jue_created_live_or_paper",
         "include_in_jue_alpha": created_by in {"llm", "jue", "manager"},
         "include_in_risk_management": True,
@@ -1874,6 +1903,8 @@ class LivePerformanceRepository:
                     venue TEXT NOT NULL,
                     symbol TEXT NOT NULL,
                     attribution TEXT NOT NULL DEFAULT '',
+                    fill_provenance TEXT NOT NULL DEFAULT '',
+                    pnl_state TEXT NOT NULL DEFAULT '',
                     include_in_jue_alpha INTEGER NOT NULL DEFAULT 0,
                     include_in_risk_management INTEGER NOT NULL DEFAULT 0,
                     include_in_execution_quality INTEGER NOT NULL DEFAULT 0,
@@ -1938,6 +1969,8 @@ class LivePerformanceRepository:
             "entry_price_source",
             "exit_price_source",
             "entry_quality_label",
+            "fill_provenance",
+            "pnl_state",
         ):
             if column not in existing:
                 conn.execute(
@@ -2040,7 +2073,7 @@ class LivePerformanceRepository:
             conn.execute(
                 """
                 INSERT INTO live_block_performance (
-                    block_id, venue, symbol, attribution,
+                    block_id, venue, symbol, attribution, fill_provenance, pnl_state,
                     include_in_jue_alpha, include_in_risk_management,
                     include_in_execution_quality, gross_pnl, net_pnl,
                     cost_total, pnl_pct, entry_price, exit_price, qty,
@@ -2050,10 +2083,12 @@ class LivePerformanceRepository:
                     entry_quality_label, entry_quality_score,
                     strategy_revision_id, filled, source_json, computed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(venue, block_id) DO UPDATE SET
                     symbol=excluded.symbol,
                     attribution=excluded.attribution,
+                    fill_provenance=excluded.fill_provenance,
+                    pnl_state=excluded.pnl_state,
                     include_in_jue_alpha=excluded.include_in_jue_alpha,
                     include_in_risk_management=excluded.include_in_risk_management,
                     include_in_execution_quality=excluded.include_in_execution_quality,
@@ -2087,6 +2122,8 @@ class LivePerformanceRepository:
                     payload["venue"],
                     payload["symbol"],
                     payload["attribution"],
+                    payload["fill_provenance"],
+                    payload["pnl_state"],
                     int(bool(payload["include_in_jue_alpha"])),
                     int(bool(payload["include_in_risk_management"])),
                     int(bool(payload["include_in_execution_quality"])),
@@ -2196,6 +2233,15 @@ class LivePerformanceRepository:
                 row for row in lane_rows if int(row.get("include_in_jue_alpha") or 0)
             ]
             attribution_counts = _attribution_counts(lane_rows)
+            fill_provenance_counts: dict[str, int] = {}
+            pnl_state_counts: dict[str, int] = {}
+            for row in lane_rows:
+                fill_key = _clean_key(row.get("fill_provenance")) or "unknown"
+                fill_provenance_counts[fill_key] = (
+                    fill_provenance_counts.get(fill_key, 0) + 1
+                )
+                pnl_key = _clean_key(row.get("pnl_state")) or "unknown"
+                pnl_state_counts[pnl_key] = pnl_state_counts.get(pnl_key, 0) + 1
             non_alpha_count = len(lane_rows) - len(alpha_rows)
             execution_quality_count = sum(
                 1 for row in lane_rows if int(row.get("include_in_execution_quality") or 0)
@@ -2394,6 +2440,20 @@ class LivePerformanceRepository:
                     "sample_count": alpha_count,
                     "non_alpha_count": non_alpha_count,
                     "attribution_counts": attribution_counts,
+                    "fill_provenance_counts": fill_provenance_counts,
+                    "paper_fill_count": fill_provenance_counts.get(
+                        "paper_fill",
+                        0,
+                    ),
+                    "exchange_fill_count": fill_provenance_counts.get(
+                        "exchange_fill",
+                        0,
+                    ),
+                    "realized_pnl_count": pnl_state_counts.get("realized", 0),
+                    "unrealized_pnl_count": pnl_state_counts.get(
+                        "unrealized",
+                        0,
+                    ),
                     "unfilled_or_unrealized_count": attribution_counts.get(
                         "unfilled_or_unrealized",
                         0,

@@ -67,8 +67,8 @@ class CryptoAlphaConfig:
     source_ids: str = "binance_announcements,coinbase_blog,kraken_blog"
     rate_limit_sec: float = 2.0
     context_limit: int = 12
-    llm_model: str = "gpt-5.5"
-    llm_reasoning_effort: str = "xhigh"
+    llm_model: str = "gpt-5.6-luna"
+    llm_reasoning_effort: str = "medium"
 
 
 DEFAULT_SOURCES: dict[str, dict[str, Any]] = {

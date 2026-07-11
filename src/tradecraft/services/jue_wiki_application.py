@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
+import gzip
 import re
 import sqlite3
 import statistics
 import uuid
 from hashlib import sha256
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from tradecraft.services.jue_wiki import (
     JueWikiService,
@@ -17,6 +18,13 @@ from tradecraft.services.jue_wiki import (
 from tradecraft.services.jue_wiki_prompt_quality import (
     canonical_jue_wiki_status_counts,
     jue_wiki_quality_status_from_evidence,
+)
+from tradecraft.services.jue_wiki_context import wiki_eligibility_freshness_reason
+from tradecraft.services.ops_section_snapshot import (
+    OPS_SECTION_SNAPSHOT_VERSION,
+    OpsSectionSnapshotV1,
+    persist_ops_section_snapshot,
+    read_ops_section_snapshot,
 )
 
 
@@ -740,9 +748,21 @@ def _stable_id(*parts: Any) -> str:
     return sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
+class _ShadowEligibilityReader(Protocol):
+    def eligibility(self, venue: str) -> dict[str, Any]: ...
+
+
 class JueWikiApplicationService:
-    def __init__(self, wiki: JueWikiService) -> None:
+    OPS_SNAPSHOT_SECTION = "jue_wiki_application"
+
+    def __init__(
+        self,
+        wiki: JueWikiService,
+        *,
+        shadow_eligibility_reader: _ShadowEligibilityReader | None = None,
+    ) -> None:
         self.wiki = wiki
+        self.shadow_eligibility_reader = shadow_eligibility_reader
         self._page_summary_cache: dict[str, dict[str, Any]] | None = None
         self._effectiveness_map_cache: dict[
             tuple[str, tuple[str, ...]],
@@ -920,15 +940,7 @@ class JueWikiApplicationService:
         run_id = str(selection_run_id or "").strip()
         if not run_id or not self.wiki._table_exists(conn, "wiki_selection_pages"):
             return []
-        rows = conn.execute(
-            """
-            SELECT page_id, rank, score, reasons_json, penalties_json, char_count
-            FROM wiki_selection_pages
-            WHERE run_id = ? AND included = 1
-            ORDER BY rank ASC, page_id ASC
-            """,
-            (run_id,),
-        ).fetchall()
+        rows = self.wiki.selection_audit_store().included_pages(conn, run_id)
         prompt_pages: list[dict[str, Any]] = []
         for row in rows:
             page_id = str(row["page_id"] or "").strip()
@@ -1103,6 +1115,97 @@ class JueWikiApplicationService:
             }
             for row in rows
         ]
+
+    def archive_selection_outcomes(
+        self,
+        *,
+        retention_days: int = 30,
+        now_iso: str = "",
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Compress old raw outcome evidence after aggregate projection."""
+
+        self.wiki.initialize()
+        now_text = str(now_iso or _utc_now_iso())
+        try:
+            now = datetime.fromisoformat(now_text.replace("Z", "+00:00"))
+        except ValueError:
+            now = datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        cutoff = now.astimezone(timezone.utc) - timedelta(
+            days=max(int(retention_days), 1)
+        )
+        with self.wiki._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM wiki_selection_outcomes
+                WHERE computed_at < ?
+                ORDER BY computed_at, outcome_id
+                """,
+                (cutoff.isoformat(),),
+            ).fetchall()
+            if dry_run:
+                return {
+                    "status": "ok",
+                    "dry_run": True,
+                    "retention_days": max(int(retention_days), 1),
+                    "candidate_count": len(rows),
+                    "archived_count": 0,
+                }
+            compressed_bytes = 0
+            for row in rows:
+                evidence = str(row["evidence_json"] or "{}").encode("utf-8")
+                compressed = gzip.compress(evidence)
+                compressed_bytes += len(compressed)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO wiki_selection_outcomes_archive (
+                        outcome_id, link_id, selection_run_id, page_id,
+                        decision_scope, venue, symbol, block_id, horizon,
+                        outcome_kind, outcome_status, pnl_value, pnl_currency,
+                        return_pct, mfe_pct, mae_pct, holding_minutes,
+                        evidence_gzip, evidence_sha256, computed_at, archived_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(row["outcome_id"]),
+                        str(row["link_id"]),
+                        str(row["selection_run_id"]),
+                        str(row["page_id"]),
+                        str(row["decision_scope"]),
+                        str(row["venue"]),
+                        str(row["symbol"]),
+                        str(row["block_id"]),
+                        str(row["horizon"]),
+                        str(row["outcome_kind"]),
+                        str(row["outcome_status"]),
+                        float(row["pnl_value"] or 0.0),
+                        str(row["pnl_currency"]),
+                        float(row["return_pct"] or 0.0),
+                        float(row["mfe_pct"] or 0.0),
+                        float(row["mae_pct"] or 0.0),
+                        float(row["holding_minutes"] or 0.0),
+                        compressed,
+                        sha256(evidence).hexdigest(),
+                        str(row["computed_at"]),
+                        now.astimezone(timezone.utc).isoformat(),
+                    ),
+                )
+            if rows:
+                conn.executemany(
+                    "DELETE FROM wiki_selection_outcomes WHERE outcome_id = ?",
+                    [(str(row["outcome_id"]),) for row in rows],
+                )
+        return {
+            "status": "ok",
+            "dry_run": False,
+            "retention_days": max(int(retention_days), 1),
+            "candidate_count": len(rows),
+            "archived_count": len(rows),
+            "compressed_evidence_bytes": compressed_bytes,
+        }
 
     @classmethod
     def _selected_page_summaries_from_link(
@@ -5124,6 +5227,98 @@ class JueWikiApplicationService:
             ).fetchall()
         return [self._effectiveness_from_row(row) for row in rows]
 
+    def project_wiki_mode_recommendations(self) -> dict[str, Any]:
+        recommendations: list[dict[str, Any]] = []
+        for venue in ("binance", "kis"):
+            if self.shadow_eligibility_reader is None:
+                result: dict[str, Any] = {
+                    "venue": venue,
+                    "required_eligible": False,
+                    "complete_sample_count": 0,
+                    "blockers": ["eligibility_unavailable"],
+                    "reason": "eligibility_unavailable",
+                }
+            else:
+                try:
+                    result = self.shadow_eligibility_reader.eligibility(venue)
+                except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+                    result = {
+                        "venue": venue,
+                        "required_eligible": False,
+                        "complete_sample_count": 0,
+                        "blockers": ["eligibility_unavailable"],
+                        "reason": "eligibility_unavailable",
+                    }
+            invalid = not isinstance(result, dict)
+            if invalid:
+                result = {}
+            sample_value = result.get("complete_sample_count")
+            if type(sample_value) is not int or sample_value < 0:
+                invalid = True
+                sample_count = 0
+            else:
+                sample_count = sample_value
+            blocker_value = result.get("blockers")
+            if not isinstance(blocker_value, list):
+                invalid = True
+                blocker_value = []
+            if type(result.get("required_eligible")) is not bool:
+                invalid = True
+            version = str(result.get("version") or "")
+            if version != "wiki_shadow_eligibility_v1":
+                invalid = True
+            result_venue = str(result.get("venue") or "").strip().lower()
+            if invalid:
+                blockers = [
+                    "eligibility_version_invalid"
+                    if version != "wiki_shadow_eligibility_v1"
+                    else "eligibility_invalid"
+                ]
+            else:
+                blockers = sorted(
+                    str(value)
+                    for value in blocker_value
+                    if str(value)
+                )
+            if result_venue != venue:
+                blockers.append("eligibility_venue_mismatch")
+            if not invalid and not blockers:
+                freshness_reason = wiki_eligibility_freshness_reason(
+                    result,
+                    now=datetime.now(timezone.utc),
+                )
+                if freshness_reason:
+                    blockers.append(freshness_reason)
+            eligible = (
+                not invalid
+                and result_venue == venue
+                and result.get("required_eligible") is True
+                and sample_count >= 500
+                and not blockers
+            )
+            recommendations.append(
+                {
+                    "version": version,
+                    "venue": venue,
+                    "recommended_mode": "required_eligible" if eligible else "prefer",
+                    "required_eligible": eligible,
+                    "sample_count": sample_count,
+                    "blockers": sorted(set(blockers)),
+                    "reason": blockers[0]
+                    if blockers
+                    else str(result.get("reason") or "required_acceptance_gates_passed"),
+                    "evaluated_at": str(result.get("evaluated_at") or ""),
+                    "evaluated_through": str(
+                        result.get("evaluated_through") or ""
+                    ),
+                }
+            )
+        return {
+            "status": "ok",
+            "read_only": True,
+            "recommendations": recommendations,
+        }
+
     def project_mode_recommendations(
         self,
         *,
@@ -5728,6 +5923,20 @@ class JueWikiApplicationService:
         return projection
 
     def status(self) -> dict[str, Any]:
+        snapshot = read_ops_section_snapshot(
+            self.wiki.config.db_path,
+            section=self.OPS_SNAPSHOT_SECTION,
+        )
+        if snapshot is None:
+            return {
+                "status": "unavailable",
+                "snapshot_version": OPS_SECTION_SNAPSHOT_VERSION,
+                "snapshot_section": self.OPS_SNAPSHOT_SECTION,
+                "reason": "ops_snapshot_missing",
+            }
+        return dict(snapshot.payload)
+
+    def project_status_snapshot(self) -> dict[str, Any]:
         effectiveness_projection = self.project_page_effectiveness()
         self.project_mode_recommendations()
         cleanup_payload = {
@@ -5853,6 +6062,20 @@ class JueWikiApplicationService:
             )
         if cleanup_payload:
             status_payload["effectiveness_cleanup"] = cleanup_payload
+        generated_at = _utc_now_iso()
+        status_payload["ops_snapshot"] = {
+            "version": OPS_SECTION_SNAPSHOT_VERSION,
+            "section": self.OPS_SNAPSHOT_SECTION,
+            "generated_at": generated_at,
+        }
+        snapshot = OpsSectionSnapshotV1(
+            section=self.OPS_SNAPSHOT_SECTION,
+            generated_at=generated_at,
+            payload=status_payload,
+        )
+        self.wiki.initialize()
+        with self.wiki._connect() as conn:
+            persist_ops_section_snapshot(conn, snapshot)
         return status_payload
 
     def project_validation_repair_effectiveness(

@@ -408,6 +408,45 @@ def test_restart_runner_processes_terminates_existing_matching_pids(monkeypatch)
     assert "tmux new-session -d -s tradecraft-market-judge" in script
 
 
+def test_restart_runner_processes_can_terminate_current_watchdog_pid(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+    include_current_values: list[bool] = []
+
+    class FakeProcess:
+        pid = 2468
+
+    def fake_popen(
+        cmd: list[str],
+        cwd: str,
+        start_new_session: bool,
+        stdout: object,
+        stderr: object,
+    ) -> FakeProcess:
+        _ = (cwd, start_new_session, stdout, stderr)
+        calls.append({"cmd": cmd})
+        return FakeProcess()
+
+    def fake_matches(pattern: str, *, include_current: bool = False) -> list[dict[str, object]]:
+        include_current_values.append(include_current)
+        if include_current and "tradecraft-watchdog" in pattern:
+            return [
+                {"pid": 555, "command": ".venv/bin/python .venv/bin/tradecraft-watchdog"},
+            ]
+        return []
+
+    monkeypatch.setattr(process_status.os, "getpid", lambda: 555)
+    monkeypatch.setattr(process_status.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(process_status, "list_matching_processes", fake_matches)
+
+    result = process_status.restart_runner_processes(["watchdog"], delay_sec=0.1)
+
+    assert include_current_values == [True]
+    assert result["terminated_existing_pids"] == {"watchdog": [555]}
+    script = str(calls[0]["cmd"][2])
+    assert "kill -TERM 555" in script
+    assert "tmux new-session -d -s tradecraft-watchdog" in script
+
+
 def test_crypto_pattern_lab_runner_is_registered_for_ops_restart() -> None:
     assert process_status.RUNNER_PID_FILES["crypto_pattern_lab"] == (
         "tradecraft-crypto-pattern-lab.pid"
@@ -463,6 +502,46 @@ def test_restart_runner_processes_rejects_unknown_keys() -> None:
         assert "unknown runner key" in str(exc)
     else:
         raise AssertionError("unknown runner key was not rejected")
+
+
+def test_schedule_runner_recovery_uses_detached_safe_order(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeProcess:
+        pid = 7654
+
+    def fake_popen(
+        cmd: list[str],
+        cwd: str,
+        start_new_session: bool,
+        stdout: object,
+        stderr: object,
+    ) -> FakeProcess:
+        calls.append(
+            {
+                "cmd": cmd,
+                "cwd": cwd,
+                "start_new_session": start_new_session,
+                "stdout": stdout,
+                "stderr": stderr,
+            }
+        )
+        return FakeProcess()
+
+    monkeypatch.setattr(process_status.subprocess, "Popen", fake_popen)
+
+    result = process_status.schedule_runner_recovery(
+        ["control", "jue_wiki"],
+        state_path=".runtime/test-runner-recovery.json",
+    )
+
+    assert result["status"] == "scheduled"
+    assert result["keys"] == ["jue_wiki", "control"]
+    assert result["supervisor_pid"] == 7654
+    assert calls[0]["start_new_session"] is True
+    command = calls[0]["cmd"]
+    assert command[1:3] == ["-m", "tradecraft.runtime.runner_recovery"]
+    assert command[command.index("--keys") + 1] == "jue_wiki,control"
 
 
 def test_process_status_maps_are_generated_from_runner_manifest() -> None:

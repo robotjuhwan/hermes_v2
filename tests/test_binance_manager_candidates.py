@@ -998,3 +998,82 @@ def test_finalize_manager_candidates_annotates_ranks_and_summarizes_candidates()
     assert metadata["futures_shadow_candidate_count"] == 2
     assert metadata["upbit_shadow_candidate_count"] == 3
     assert len(metadata["skipped"]) == 8
+
+
+def test_finalize_manager_candidates_preserves_waiting_entry_base_gate_candidate() -> None:
+    candidates = [
+        {"symbol": "BTCUSDT", "market": "spot", "side": "long", "score": 95},
+        {"symbol": "ETHUSDT", "market": "futures", "side": "long", "score": 94},
+        {
+            "symbol": "SOLUSDT",
+            "market": "futures",
+            "side": "long",
+            "score": 10,
+            "waiting_entry_gate_hint": {
+                "status": "waiting_entry_base_gate_available",
+            },
+        },
+    ]
+
+    def annotate_same(
+        row: dict[str, Any],
+        *,
+        entry_gate_policy: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], bool]:
+        _ = entry_gate_policy
+        return row, False
+
+    def rank_rows(
+        rows: list[dict[str, Any]],
+        *,
+        entry_gate_policy: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        _ = entry_gate_policy
+        return sorted(rows, key=lambda row: row.get("score", 0), reverse=True)
+
+    def diversify(
+        rows: list[dict[str, Any]],
+        *,
+        max_items: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        return rows[:max_items], False
+
+    hooks = BinanceManagerCandidateFinalizeHooks(
+        candidate_near_duplicate_active_block_context=lambda row, active: {},
+        candidate_lane_authority_context=lambda authority, row: {},
+        manager_candidate_empirical_edge_score=lambda row, entry_gate_policy=None: row[
+            "score"
+        ],
+        candidate_execution_blocker_context=lambda row: {},
+        annotate_candidate_pattern_performance=annotate_same,
+        rank_manager_candidates_by_edge=rank_rows,
+        diversify_manager_candidates_by_lane=diversify,
+        lane_distribution=lambda rows: {
+            "count": len(rows),
+            "symbols": [row["symbol"] for row in rows],
+        },
+        manager_candidate_packets=lambda **kwargs: {},
+        manager_candidate_stage_counts=lambda **kwargs: {},
+        market_side_lane=lambda row: f"{row.get('market')}:{row.get('side')}",
+    )
+
+    selected, metadata = finalize_manager_candidates(
+        candidates=candidates,
+        hooks=hooks,
+        max_items=2,
+        active_blocks=[],
+        live_authority={},
+        entry_gate_policy={},
+        crypto_research={},
+        crypto_patterns={},
+        market_universe={"spot": ["BTCUSDT"], "futures": ["ETHUSDT", "SOLUSDT"]},
+        provided_candidate_count=0,
+        spot_shadow_count=0,
+        futures_shadow_count=0,
+        upbit_shadow_count=0,
+        skipped=[],
+    )
+
+    assert [row["symbol"] for row in selected] == ["BTCUSDT", "SOLUSDT"]
+    assert metadata["waiting_entry_base_gate_candidate_count"] == 1
+    assert metadata["waiting_entry_base_gate_candidate_preserved"] is True

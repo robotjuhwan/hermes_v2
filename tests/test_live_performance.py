@@ -49,6 +49,7 @@ def test_llm_filled_block_realized_pnl_is_cost_aware() -> None:
         taxes=25,
         slippage=10,
         filled=True,
+        metadata={"fill_provenance": "exchange_fill"},
     )
 
     pnl = compute_realized_pnl(row)
@@ -57,6 +58,29 @@ def test_llm_filled_block_realized_pnl_is_cost_aware() -> None:
     assert pnl["net_pnl"] == 2950
     assert pnl["cost_total"] == 50
     assert pnl["include_in_jue_alpha"] is True
+    assert pnl["fill_provenance"] == "exchange_fill"
+    assert pnl["pnl_state"] == "realized"
+
+
+def test_paper_fill_is_separate_from_exchange_fill_alpha_sample() -> None:
+    row = BlockPerformanceInput(
+        venue="binance",
+        block_id="paper-1",
+        symbol="BTCUSDT",
+        created_by="llm",
+        status="closed",
+        entry_price=100,
+        exit_price=105,
+        qty=1,
+        filled=True,
+        metadata={"fill_provenance": "paper_fill"},
+    )
+
+    classified = classify_block_attribution(row)
+
+    assert classified["fill_provenance"] == "paper_fill"
+    assert classified["pnl_state"] == "realized"
+    assert classified["include_in_jue_alpha"] is True
 
 
 def test_short_block_realized_pnl_uses_inverse_price_direction() -> None:
